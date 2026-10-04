@@ -49,7 +49,8 @@ app/sessions.manage
 app/tools.expose-to-model     把四个工具暴露给模型
 app/resources.read            管理器「选目录」
 app/ui.clipboard-write        卡片「复制路径」
-app/hooks.agent-pre-step      下载铁律注入
+app/hooks.agent-pre-step      下载铁律注入（对话消息入口，双保险）
+app/hooks.agent-before-start  下载铁律注入（systemPrompt 入口，主力；2026-10-04 起）
 ```
 
 **装完或改完代码都要重启宿主**（见「五、开发」）。
