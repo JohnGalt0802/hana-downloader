@@ -657,9 +657,102 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
       save: function (v) { patchSettings({ maxConcurrent: v }, v > 0 ? "已设置同时下载上限 " + v + " 个" : "已取消并发限制"); },
     });
 
+    // ── 代理启停控制（2026-10-04）─────────────────────────────
+    // 纪律：默认未授权；「使用现有代理」不受本开关影响（对齐裸 curl）。
+    // 这里只控「启停梯子」这类改环境的动作。
+    var optProxyCtl = el("button", "mgr-settings-opt", "代理启停：加载中…");
+    var proxyCtlState = { enabled: false, launcher: null };
+    function refreshProxyCtl() {
+      apiFetch("/proxy-control/status")
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (!d || d.error) return;
+          proxyCtlState.enabled = !!d.enabled;
+          proxyCtlState.launcher = d.launcher || null;
+          var nm = proxyCtlState.launcher ? proxyCtlState.launcher.name : "未配置梯子";
+          optProxyCtl.textContent = "代理启停：" + (proxyCtlState.enabled ? "已授权" : "未授权") + "（" + nm + "）";
+        })
+        .catch(function () {});
+    }
+    optProxyCtl.title = "是否允许 Agent 启停本机梯子。默认关；「使用」现有代理不受此开关影响（机器开着代理就正常用，与 curl 一致）。";
+    optProxyCtl.onclick = function (e) {
+      e.stopPropagation();
+      var next = !proxyCtlState.enabled;
+      apiFetch("/proxy-control/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: next }),
+      })
+        .then(function (r) { return r.json(); })
+        .then(function () {
+          refreshProxyCtl();
+          hint(next ? "已授权：Agent 可以启停梯子" : "已收回授权：Agent 不能再启停梯子");
+        })
+        .catch(function () { hint("设置失败：网络错误"); });
+    };
+    refreshProxyCtl();
+
+    // 扫描代理软件：找到候选后循环切换选哪个（与代理模式按钮同思路，不关菜单）
+    var scanIdx = -1;
+    var scanCache = [];
+    var optScan = el("button", "mgr-settings-opt", "扫描代理软件");
+    optScan.title = "在本机常见目录里找梯子（Clash / Verge / v2rayN 等）。多找到几个时再点一次切换。";
+    optScan.onclick = function (e) {
+      e.stopPropagation();
+      if (scanCache.length && scanIdx >= 0) { scanIdx = (scanIdx + 1) % scanCache.length; applyScanPick(); return; }
+      hint("扫描中…");
+      apiFetch("/proxy-control/scan")
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          scanCache = (d && d.candidates) || [];
+          if (!scanCache.length) { hint("没有扫描到已知梯子；可手工在 config.json 写 proxyControl.launcher。"); return; }
+          scanIdx = 0;
+          applyScanPick();
+        })
+        .catch(function () { hint("扫描失败：网络错误"); });
+    };
+    function applyScanPick() {
+      var c = scanCache[scanIdx];
+      if (!c) return;
+      apiFetch("/proxy-control/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ launcher: { id: c.id, name: c.name, exe: c.exe, workDir: c.workDir, processName: c.processName, processNames: c.processNames, port: c.port, note: c.note } }),
+      })
+        .then(function (r) { return r.json(); })
+        .then(function () {
+          refreshProxyCtl();
+          hint("已选：" + c.name + "（" + (scanIdx + 1) + "/" + scanCache.length + "）· " + c.exe);
+        })
+        .catch(function () { hint("保存失败：网络错误"); });
+    }
+
+    // 实测当前配置：起 → 探端口 → 停（恢复原状）；梯子已在跑时不动它
+    var optVerify = el("button", "mgr-settings-opt", "实测当前配置");
+    optVerify.title = "真起一次梯子、探端口、再停掉，验证配方可用。梯子已在运行时不会动它。";
+    optVerify.onclick = function (e) {
+      e.stopPropagation();
+      if (!proxyCtlState.launcher) { hint("先扫描/选择梯子再实测"); return; }
+      hint("实测中（最多 25 秒）…");
+      apiFetch("/proxy-control/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ launcher: proxyCtlState.launcher }),
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          hint((d && d.message) || (d && d.ok ? "实测通过" : "实测未通过"));
+          refreshProxyCtl();
+        })
+        .catch(function () { hint("实测失败：网络错误"); });
+    };
+
     menu.appendChild(opt1);
     menu.appendChild(opt2);
     menu.appendChild(optProxy);
+    menu.appendChild(optProxyCtl);
+    menu.appendChild(optScan);
+    menu.appendChild(optVerify);
     menu.appendChild(opt3);
     menu.appendChild(opt4);
     menu.appendChild(opt5);

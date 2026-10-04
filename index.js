@@ -716,6 +716,52 @@ export default defineApp(async (sdk) => {
     err(`download-cancel register ERR | ${e?.message || e}`);
   }
 
+  // ── 工具：proxy-control（代理启停，默认未授权）─────────────────
+  try {
+    await sdk.tools.register({
+      name: "proxy-control",
+      description:
+        "启停本机代理（梯子）——仅当用户在设置页授权后才可用；未授权时调用会被明确拒绝。"
+        + "action=status 查状态（代理是否在运行、端口、系统代理开关），随时可用。"
+        + "action=start / stop 启停梯子（需要「设置 → 代理启停」里的开关已打开）。"
+        + "注意：日常下载「使用」代理不需要本工具——如果机器本来就起着代理，下载会自动用它（与裸 curl 一致）；"
+        + "本工具只负责「启停」这类改环境的动作。",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["status", "start", "stop"], description: "status=查状态；start/stop=启停（需授权）" },
+        },
+        required: ["action"],
+      },
+      async execute({ action }) {
+        const a = String(action || "").trim();
+        if (!["status", "start", "stop"].includes(a)) {
+          return { content: [{ type: "text", text: "action 必须是 status / start / stop 之一" }], isError: true };
+        }
+        const engPath = a === "status" ? "/proxy-control/status" : `/proxy-control/${a}`;
+        let r;
+        try {
+          r = await callEngine(engPath, { method: a === "status" ? "GET" : "POST" });
+        } catch (e) {
+          return { content: [{ type: "text", text: `代理控制请求失败：${e?.message || e}` }], isError: true };
+        }
+        if (a === "status") {
+          const state = r?.running ? `运行中（端口 ${r.port}）` : `未运行（端口 ${r.port} 不通）`;
+          const sys = r?.systemProxy?.enabled ? `系统代理已开（${r.systemProxy.server || "地址未知"}）` : "系统代理未开";
+          const launcher = r?.launcher ? `梯子配置：${r.launcher.name}（${r.launcher.exe}）` : "尚未配置梯子（去设置页扫描）";
+          const auth = r?.enabled ? "已授权启停" : "未授权启停（只读）";
+          return { content: [{ type: "text", text: `代理状态：${state}；${sys}；${launcher}；${auth}。` }], details: { proxyControl: r } };
+        }
+        const ok = r?.ok !== false;
+        const text = ok ? (r?.message || "完成。") : `未执行：${r?.message || r?.error || "未知原因"}`;
+        return { content: [{ type: "text", text }], isError: !ok, details: { proxyControl: r } };
+      },
+    });
+    log("tool registered | proxy-control");
+  } catch (e) {
+    err(`proxy-control register ERR | ${e?.message || e}`);
+  }
+
   // ── 工具：download-command（git clone / pnpm install）────────────
   try {
     await sdk.tools.register({

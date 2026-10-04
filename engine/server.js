@@ -15,6 +15,14 @@ import { spawn } from "node:child_process";
 import { getTaskManager, resolveWingetBin } from "./dlcore.js";
 import { parseWingetSearch } from "./progress-parsers.js";
 import { ENGINE_PORT } from "./engine-port.js";
+import {
+  scanCandidates,
+  getStatus as getProxyControlStatus,
+  startProxy,
+  stopProxy,
+  verifyLauncher,
+  writeControlConfig,
+} from "./proxy-control.js";
 
 // 端口来源唯一：engine-port.js（index.js 与引擎共用一个常量）。
 // HD_ENGINE_PORT 只作本机调试覆盖；默认值不再在这里重复写一个数字。
@@ -485,6 +493,50 @@ const server = http.createServer(async (req, res) => {
         return send(200, { ok: true, settings: { ...next, proxyMode: normalizeProxyMode(loadUserCfg().proxy) } });
       } catch (e) { return send(500, { error: String(e?.message || e) }); }
     }
+  }
+
+  // ── 代理启停控制（2026-10-04）─────────────────────────────────
+  // 纪律：扫描/状态只读；start/stop 需 config.json 里 proxyControl.enabled=true。
+  // 「使用代理」不在这里管——那是 dlcore.resolveProxy 的事（对齐裸 curl 的隐式继承）。
+  if (u.pathname === "/proxy-control/status" && req.method === "GET") {
+    try { return send(200, { ok: true, ...(await getProxyControlStatus(DATA_DIR)) }); }
+    catch (e) { return send(500, { error: String(e?.message || e) }); }
+  }
+
+  if (u.pathname === "/proxy-control/scan" && req.method === "GET") {
+    try { return send(200, { ok: true, candidates: scanCandidates() }); }
+    catch (e) { return send(500, { error: String(e?.message || e) }); }
+  }
+
+  if (u.pathname === "/proxy-control/config" && req.method === "POST") {
+    const b = await readBody();
+    try {
+      const body = (b && typeof b === "object") ? b : {};
+      const patch = {};
+      if ("enabled" in body) patch.enabled = body.enabled === true;
+      if ("launcher" in body) patch.launcher = body.launcher;
+      writeControlConfig(DATA_DIR, patch);
+      return send(200, { ok: true, ...(await getProxyControlStatus(DATA_DIR)) });
+    } catch (e) { return send(500, { error: String(e?.message || e) }); }
+  }
+
+  if (u.pathname === "/proxy-control/verify" && req.method === "POST") {
+    const b = await readBody();
+    try {
+      const body = (b && typeof b === "object") ? b : {};
+      const r = await verifyLauncher(DATA_DIR, body.launcher);
+      return send(200, { ...r });
+    } catch (e) { return send(500, { error: String(e?.message || e) }); }
+  }
+
+  if (u.pathname === "/proxy-control/start" && req.method === "POST") {
+    try { return send(200, { ...(await startProxy(DATA_DIR)) }); }
+    catch (e) { return send(500, { error: String(e?.message || e) }); }
+  }
+
+  if (u.pathname === "/proxy-control/stop" && req.method === "POST") {
+    try { return send(200, { ...(await stopProxy(DATA_DIR)) }); }
+    catch (e) { return send(500, { error: String(e?.message || e) }); }
   }
 
   // 注意：不能使用 /download/* 前缀（“download” 会被宿主的运行时路由当成保留段，路径被截断）。
