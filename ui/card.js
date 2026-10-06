@@ -57,11 +57,15 @@ function measureH() {
 }
 
 var lastReportedH = 0;
-function reportSize() {
+var terminalReported = false; // 终态补报只触发一次
+function reportSize(force) {
   try {
     const h = measureH();
-    // 高度未变不重复上报（高频轮询下减负；宽度是常量，不参与变化判断）
-    if (h === lastReportedH) return;
+    // 高度未变不重复上报（高频轮询下减负；宽度是常量，不参与变化判断）。
+    // force=true 时无视去重强制补报 —— 2026-10-06 实测：宿主在卡片加载期可能丢弃上报，
+    // 若那一刻高度恰好已稳定，去重会让这张卡「永远不再上报」，尺寸就永久停在宿主
+    // 默认值（撑满 + 变高）。这是个单向门，启动期与终态各强制补报几轮把它拆掉。
+    if (!force && h === lastReportedH) return;
     lastReportedH = h;
     try { hana.ui?.resize?.({ height: h, width: CARD_WIDTH }); } catch { /* 老宿主没有这路 */ }
     try { window.parent.postMessage({ type: "hana.card-resize", height: h }, "*"); } catch { /* 同上 */ }
@@ -69,8 +73,20 @@ function reportSize() {
 }
 
 if (typeof ResizeObserver !== "undefined") {
-  try { new ResizeObserver(() => reportSize()).observe(root); } catch { /* 观察失败不影响主流程 */ }
+  try { new ResizeObserver(() => reportSize(false)).observe(root); } catch { /* 观察失败不影响主流程 */ }
 }
+
+// 启动期兜底：挂载后前 10 秒每秒强制补报一次（覆盖宿主加载期丢弃上报的窗口）
+(function bootReport() {
+  if (typeof setInterval !== "function") return;
+  reportSize(true); // 首帧立即来一次
+  let n = 0;
+  const timer = setInterval(() => {
+    n += 1;
+    reportSize(true);
+    if (n >= 10) clearInterval(timer);
+  }, 1000);
+})();
 
 // ── 任务绑定 ──
 let taskId = "";
@@ -322,6 +338,11 @@ function render(t) {
   const pending = state === "pending";
   const done = state === "done";
   const terminal = done || state === "failed" || state === "canceled" || state === "interrupted";
+  // 终态切换时强制补报几轮：最后一次上报若被宿主丢弃，靠这几轮兜住（2026-10-06）
+  if (terminal && !terminalReported) {
+    terminalReported = true;
+    [0, 1000, 2500].forEach((d) => setTimeout(() => reportSize(true), d));
+  }
   // winget / pip 是阶段式任务：输出里没有百分比与字节数据，数字区按需收起（2026-09-18）
   const pkgTask = isPkgTask(t);
   const pct = t.percent;
