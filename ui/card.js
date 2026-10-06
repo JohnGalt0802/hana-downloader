@@ -76,16 +76,26 @@ if (typeof ResizeObserver !== "undefined") {
   try { new ResizeObserver(() => reportSize(false)).observe(root); } catch { /* 观察失败不影响主流程 */ }
 }
 
-// 启动期兜底：挂载后前 10 秒每秒强制补报一次（覆盖宿主加载期丢弃上报的窗口）
-(function bootReport() {
+// 启动期收敛（轻量版，二稿）：不盲目补报，先做零成本自检——读 window.innerWidth 看
+// 宿主是否已把宽度采纳成 CARD_WIDTH（实测宿主取 min(想要,信封上限)-1，故容差 2）。
+// 已到位就立即停；未到位才补报。resize 事件作即时信号（宿主采纳时会触发）。
+// 典型收敛：1~3 次补报内完成，之后不再打扰通道。
+(function bootSettle() {
   if (typeof setInterval !== "function") return;
+  const adopted = () => {
+    try { return Math.abs(window.innerWidth - CARD_WIDTH) <= 2; } catch { return true; }
+  };
   reportSize(true); // 首帧立即来一次
+  try {
+    window.addEventListener("resize", () => { if (!adopted()) reportSize(true); });
+  } catch { /* 事件不可用不影响主流程 */ }
   let n = 0;
   const timer = setInterval(() => {
     n += 1;
+    if (adopted()) { clearInterval(timer); return; } // 宿主已采纳，停止打扰
     reportSize(true);
-    if (n >= 10) clearInterval(timer);
-  }, 1000);
+    if (n >= 6) clearInterval(timer); // 兜底上限：6 次检查（约 9 秒）
+  }, 1500);
 })();
 
 // ── 任务绑定 ──
