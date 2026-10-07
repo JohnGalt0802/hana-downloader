@@ -34,7 +34,7 @@ winget / pip）、聊天流内实时进度卡片、跨会话下载管理器。
 宿主 → 设置 → 应用 → 安装（来源选本地目录）：
 
 ```
-D:\HanakoWorks\HanaAgentAPPs\hana-downloader-app
+<hana-downloader-app 目录>
 ```
 
 首次安装需要在确认页批准。清单里声明的能力：
@@ -146,7 +146,7 @@ winget 走「先搜后装」——模糊词命中多个包时先把候选列表�
 - 每次启停写审计：`config.json` 的 `proxyControl.audit`（保留 200 条）
 - **已知限制**：内核以管理员权限运行时（如 Clash 服务模式的 `clash-win64`），App 只能停掉 GUI 并如实报告「未完全停止」——**不自行提权**（见踩坑记录第 41 条）
 
-运行数据目录：`C:\Users\John Galt\.hanako\app-data\hana-downloader\`
+运行数据目录：`<HANA_HOME>\app-data\hana-downloader\`
 
 ```
 tasks.json        任务记录（引擎 restore 用）
@@ -160,7 +160,7 @@ bindings.json     卡片绑定表：pending（待认领）/ bind（cardInstanceI
 ## 五、开发
 
 **改完代码必须重启宿主**（改工具逻辑时），v2 App 没有热重载通道。
-**宿主实际从副本目录运行**：`C:\Users\John Galt\.hanako\apps\hana-downloader`
+**宿主实际从副本目录运行**：`<HANA_HOME>\apps\hana-downloader`
 （2026-09-17 实测：app-host 进程授权路径与引擎入口都在副本目录，是普通目录、非链接）。
 开发目录（本仓库）的改动**不会自动同步过去**，改完必须把改动文件拷到副本；
 好消息是同步后**新挂载的卡片无需重启**即可生效（静态资源按请求读）。
@@ -291,7 +291,7 @@ hana-downloader-app/
 离线测试住在仓库里，一条命令跑完（不依赖网络、宿主与引擎）：
 
 ```powershell
-cd D:\HanakoWorks\HanaAgentAPPs\hana-downloader-app
+cd <hana-downloader-app 目录>
 node tests/run-tests.mjs
 ```
 
