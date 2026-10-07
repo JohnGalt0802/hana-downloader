@@ -504,7 +504,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (u.pathname === "/proxy-control/scan" && req.method === "GET") {
-    try { return send(200, { ok: true, candidates: scanCandidates() }); }
+    try { return send(200, { ok: true, candidates: scanCandidates({ dataDir: DATA_DIR }) }); }
     catch (e) { return send(500, { error: String(e?.message || e) }); }
   }
 

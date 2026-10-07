@@ -85,6 +85,11 @@ export function readControlConfig(dataDir) {
     enabled: pc.enabled === true,
     launcher: normalizeLauncher(pc.launcher),
     audit: Array.isArray(pc.audit) ? pc.audit.slice(-AUDIT_MAX) : [],
+    // 自定义扫描根（「扫描代理软件」用）：机器私有的软件存放目录放这里，不写进代码——
+    // 代码里的默认列表只含通用位置。
+    scanRoots: Array.isArray(pc.scanRoots)
+      ? pc.scanRoots.map((s) => (typeof s === "string" ? s.trim() : "")).filter(Boolean)
+      : [],
   };
 }
 
@@ -195,11 +200,11 @@ export function readSystemProxy() {
 // ── 扫描（只读）：找已知梯子的可执行文件 ─────────────────────────────────────
 const SKIP_DIR_RE = /^(node_modules|\.git|Windows|System32|SysWOW64|WinSxS|Installer|\$Recycle\.Bin)$/i;
 
-export function scanCandidates({ maxDepth = 3, maxFound = 60 } = {}) {
-  const home = os.homedir();
-  const roots = [
-    "D:\\syc",
-    "D:\\HanakoWorks",
+// 默认扫描根：只放通用位置。机器私有的软件存放目录不写死在代码里——
+// 需要时在 config.json 的 proxyControl.scanRoots 里加（自定义目录优先扫描，
+// 时间预算内先命中）。
+function defaultScanRoots(home) {
+  return [
     "D:\\Downloads",
     "D:\\",
     "C:\\Program Files",
@@ -207,7 +212,26 @@ export function scanCandidates({ maxDepth = 3, maxFound = 60 } = {}) {
     path.join(home, "Desktop"),
     path.join(home, "Downloads"),
     path.join(home, "AppData", "Local", "Programs"),
-  ].filter((r) => { try { return fs.existsSync(r); } catch { return false; } });
+  ];
+}
+
+// 扫描根组装（纯逻辑，可测）：自定义优先 + 默认跟随；去重；过滤不存在。
+export function buildScanRoots({ home = os.homedir(), custom = [], isDir = null } = {}) {
+  const existsFn = typeof isDir === "function"
+    ? isDir
+    : (r) => { try { return fs.existsSync(r); } catch { return false; } };
+  return [...custom, ...defaultScanRoots(home)]
+    .map((s) => String(s || "").trim())
+    .filter((r, i, a) => r && a.indexOf(r) === i)
+    .filter((r) => existsFn(r));
+}
+
+export function scanCandidates({ maxDepth = 3, maxFound = 60, dataDir = "" } = {}) {
+  let custom = [];
+  if (dataDir) {
+    try { custom = readControlConfig(String(dataDir)).scanRoots; } catch { custom = []; }
+  }
+  const roots = buildScanRoots({ custom });
 
   const deadline = Date.now() + SCAN_BUDGET_MS;
   const found = [];
