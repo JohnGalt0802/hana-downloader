@@ -3,7 +3,7 @@
   "id": "hana-downloader",
   "name": "Hana Downloader",
   "version": "1.1.2",
-  "description": "小花下载器（v2 App）：任意 URL 下载、命令型下载（git clone / pnpm install / winget / pip）与跨会话下载管理器。聊天流卡片走工具返回值 details.card，随工具调用实时内联。",
+  "description": "小花下载器（v2 App）：任意 URL 下载、命令型下载（git clone / pnpm install / winget / brew / pip）与跨会话下载管理器。Windows 装软件走 winget，macOS 走 Homebrew。聊天流卡片走工具返回值 details.card，随工具调用实时内联。",
   "entry": "index.js",
   "icon": "assets/icon.png",
   "minAppVersion": "0.978.0",

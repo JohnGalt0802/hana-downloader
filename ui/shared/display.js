@@ -13,9 +13,9 @@
 //   ui/card.js  → 聊天流进度卡
 //   ui/manager.js → 跨会话管理器
 
-/** 阶段标识 → 中文。git/pnpm 系与 winget/pip 系并存。 */
+/** 阶段标识 → 中文。git/pnpm 系与 winget/brew/pip 系并存。 */
 export const STAGE_TEXT = {
-  // winget / pip 链路（2026-09-18）
+  // winget / brew / pip 链路
   found: "查找包",
   downloading: "下载中",
   verifying: "校验哈希",
@@ -54,10 +54,10 @@ export function cmdTypeOf(task) {
   return task.cmdType || task.cmd?.type || null;
 }
 
-/** 包安装型：winget / pip。没有字节数据，只有阶段。 */
+/** 包安装型：winget / brew / pip。没有字节数据，只有阶段。 */
 export function isPkgTask(task) {
   const t = cmdTypeOf(task);
-  return t === "winget-install" || t === "pip-install";
+  return t === "winget-install" || t === "brew-install" || t === "pip-install";
 }
 
 /** git 克隆。 */

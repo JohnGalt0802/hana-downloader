@@ -171,9 +171,18 @@ async function poll() {
   try {
     const data = await engineFetch("wait", { taskId: taskId || null });
     if (!data || !data.ok) {
+      // 引擎瞬断（重启中）与「任务不存在」必须分开。App 路由在引擎不可达时回
+      // 502 {error:"engine unreachable: ..."}；旧逻辑一律当终态 stop()，于是一张卡会
+      // 永久卡死在错误文案上，引擎 30s 后自愈了它也不会再回来。判据：错误文案含
+      // engine unreachable 就保持快频重试，等引擎回来自己续上。
+      const emsg = data && typeof data.error === "string" ? data.error : "";
+      if (/engine unreachable/i.test(emsg)) {
+        schedule(FAST_MS);
+        return;
+      }
       // 任务真的不存在（被删除，或引擎重启后没这条记录）：停掉轮询。
       // 注意与「终态」区别：终态要留着慢查等重试，任务没了就没得等了。
-      renderFail((data && data.error) || "任务不存在");
+      renderFail(emsg || "任务不存在");
       stop();
       return;
     }
@@ -482,18 +491,23 @@ function render(t) {
   // 错误行已上移到信息行（2026-09-14），此处不再重复渲染。
   html += "</div>";
 
-  if (root.innerHTML !== html) root.innerHTML = html;
+  // 监听只在 DOM 真正重建时挂一次。原先把 on() 写在 if 外面，而 innerHTML 只在 html
+  // 变化时才替换：空闲期（终态 5s 轮询）html 恒定，getElementById 每次都拿到同一个节点，
+  // 于是每轮 render 都给同一个按钮再 addEventListener 一次（匿名箭头函数，不会去重）。
+  // 闲置两分钟攒下二十来个监听，点一次「打开」就触发十几次 reveal，一口气弹出十几个窗口。
+  if (root.innerHTML !== html) {
+    root.innerHTML = html;
+    const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", fn); };
+    on("dl-fold", toggleFold);
+    on("dl-all", toggleAll);
+    on("dl-cancel", cancel);
+    on("dl-open", () => reveal("open"));
+    on("dl-folder", () => reveal("select"));
+    on("dl-copy", () => copyPath(filePath));
+    on("dl-retry", retry);
+  }
 
   reportSize();
-
-  const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", fn); };
-  on("dl-fold", toggleFold);
-  on("dl-all", toggleAll);
-  on("dl-cancel", cancel);
-  on("dl-open", () => reveal("open"));
-  on("dl-folder", () => reveal("select"));
-  on("dl-copy", () => copyPath(filePath));
-  on("dl-retry", retry);
 }
 
 function renderFail(msg) {
