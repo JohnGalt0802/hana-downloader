@@ -17,6 +17,9 @@ import path from "node:path";
 import net from "node:net";
 import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
+import { readSystemProxyInfo } from "./dlcore.js";
+
+const IS_MAC = process.platform === "darwin";
 
 const AUDIT_MAX = 200;
 const SCAN_BUDGET_MS = 8000; // 扫描时间预算，防止深目录卡死
@@ -39,8 +42,10 @@ export const KNOWN_LAUNCHERS = [
     id: "clash-verge",
     name: "Clash Verge / Verge Rev",
     exeRe: /^(clash[- ]?verge|verge)[^/\\]*\.exe$/i,
+    macAppRe: /^clash[- ]?verge(\s*rev)?\.app$/i,
     processName: "clash-verge",
     processNames: ["clash-verge", "verge-mihomo", "clash-verge-service"],
+    macProcessNames: ["clash-verge", "verge-mihomo"],
     port: 7897,
     note: "GUI 应用；Verge 默认混合端口 7897，内核为 verge-mihomo。",
   },
@@ -50,6 +55,7 @@ export const KNOWN_LAUNCHERS = [
     exeRe: /^(mihomo|clash[.-]meta|clash-meta)[^/\\]*\.exe$/i,
     processName: "mihomo",
     processNames: ["mihomo"],
+    macProcessNames: ["mihomo"],
     port: 7890,
     note: "CLI 内核，需要配置目录；默认混合端口 7890。",
   },
@@ -68,6 +74,7 @@ export const KNOWN_LAUNCHERS = [
     exeRe: /^sing-box[^/\\]*\.exe$/i,
     processName: "sing-box",
     processNames: ["sing-box"],
+    macProcessNames: ["sing-box"],
     port: 2080,
     note: "CLI 内核；默认混合端口 2080。",
   },
@@ -175,26 +182,8 @@ async function waitPortGone(port, totalMs = 8000, stepMs = 500) {
 
 // ── 系统代理状态（只读，给状态卡展示用）────────────────────────────────────
 export function readSystemProxy() {
-  try {
-    const r1 = spawnSync(
-      "reg",
-      ["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "/v", "ProxyEnable"],
-      { encoding: "utf8", windowsHide: true, timeout: 5000 }
-    );
-    const m1 = /ProxyEnable\s+REG_DWORD\s+0x([0-9a-f]+)/i.exec(r1.stdout || "");
-    const r2 = spawnSync(
-      "reg",
-      ["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "/v", "ProxyServer"],
-      { encoding: "utf8", windowsHide: true, timeout: 5000 }
-    );
-    const m2 = /ProxyServer\s+REG_SZ\s+([^\r\n]+)/.exec(r2.stdout || "");
-    return {
-      enabled: m1 ? parseInt(m1[1], 16) === 1 : false,
-      server: m2 ? m2[1].trim() : "",
-    };
-  } catch {
-    return { enabled: false, server: "" };
-  }
+  // Windows 读注册表 / macOS 读 scutil --proxy，统一收在 dlcore.readSystemProxyInfo
+  return readSystemProxyInfo();
 }
 
 // ── 扫描（只读）：找已知梯子的可执行文件 ─────────────────────────────────────
@@ -204,6 +193,14 @@ const SKIP_DIR_RE = /^(node_modules|\.git|Windows|System32|SysWOW64|WinSxS|Insta
 // 需要时在 config.json 的 proxyControl.scanRoots 里加（自定义目录优先扫描，
 // 时间预算内先命中）。
 function defaultScanRoots(home) {
+  if (IS_MAC) {
+    return [
+      "/Applications",
+      path.join(home, "Applications"),
+      path.join(home, "Downloads"),
+      path.join(home, "Desktop"),
+    ];
+  }
   return [
     "D:\\Downloads",
     "D:\\",
@@ -237,6 +234,23 @@ export function scanCandidates({ maxDepth = 3, maxFound = 60, dataDir = "" } = {
   const found = [];
   const seen = new Set();
 
+  const pushHit = (k, full, exePath, procNames) => {
+    const key = full.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    found.push({
+      id: k.id,
+      name: k.name,
+      exe: exePath,
+      workDir: path.dirname(full),
+      processName: k.processName,
+      processNames: procNames,
+      port: k.port,
+      note: k.note,
+      matched: true,
+    });
+  };
+
   const walk = (dir, depth) => {
     if (found.length >= maxFound || Date.now() > deadline) return;
     let entries;
@@ -245,25 +259,22 @@ export function scanCandidates({ maxDepth = 3, maxFound = 60, dataDir = "" } = {
       if (found.length >= maxFound || Date.now() > deadline) return;
       const full = path.join(dir, e.name);
       if (e.isDirectory()) {
-        if (depth < maxDepth && !SKIP_DIR_RE.test(e.name)) walk(full, depth + 1);
-      } else if (e.isFile() && /\.exe$/i.test(e.name) && e.name.length < 80) {
-        for (const k of KNOWN_LAUNCHERS) {
-          if (k.exeRe.test(e.name)) {
-            const key = full.toLowerCase();
-            if (!seen.has(key)) {
-              seen.add(key);
-              found.push({
-                id: k.id,
-                name: k.name,
-                exe: full,
-                workDir: path.dirname(full),
-                processName: k.processName,
-                processNames: Array.isArray(k.processNames) ? k.processNames : [k.processName],
-                port: k.port,
-                note: k.note,
-                matched: true,
-              });
+        // mac：应用是 *.app 目录，名字匹配即命中（不再下钻）
+        if (IS_MAC && /\.app$/i.test(e.name) && e.name.length < 80) {
+          for (const k of KNOWN_LAUNCHERS) {
+            if (k.macAppRe && k.macAppRe.test(e.name)) {
+              const names = Array.isArray(k.macProcessNames) && k.macProcessNames.length
+                ? k.macProcessNames : [k.processName];
+              pushHit(k, full, full, names);
             }
+          }
+          continue;
+        }
+        if (depth < maxDepth && !SKIP_DIR_RE.test(e.name)) walk(full, depth + 1);
+      } else if (!IS_MAC && e.isFile() && /\.exe$/i.test(e.name) && e.name.length < 80) {
+        for (const k of KNOWN_LAUNCHERS) {
+          if (k.exeRe && k.exeRe.test(e.name)) {
+            pushHit(k, full, full, Array.isArray(k.processNames) ? k.processNames : [k.processName]);
           }
         }
       }
@@ -277,7 +288,13 @@ export function scanCandidates({ maxDepth = 3, maxFound = 60, dataDir = "" } = {
 // ── 启停原子操作 ────────────────────────────────────────────────────────────
 function startByLauncher(L) {
   try {
-    const child = spawn(L.exe, L.startArgs || [], {
+    let bin = L.exe, args = L.startArgs || [];
+    // mac：*.app 用 `open` 拉起（走 LaunchServices）；非 .app（CLI 内核）直接 spawn
+    if (IS_MAC && /\.app$/i.test(L.exe)) {
+      bin = "open";
+      args = [L.exe, ...(L.startArgs || [])];
+    }
+    const child = spawn(bin, args, {
       cwd: L.workDir || path.dirname(L.exe),
       detached: true,
       stdio: "ignore",
@@ -294,6 +311,11 @@ function startByLauncher(L) {
 //（中文 Windows 下 taskkill 的报错会因编码不匹配失效，2026-10-04 实测）
 function isProcessRunning(name) {
   try {
+    if (IS_MAC) {
+      // pgrep -x 精确匹配进程名；未命中再退到 -f（完整命令行）
+      if (spawnSync("pgrep", ["-x", name], { encoding: "utf8", timeout: 5000 }).status === 0) return true;
+      return spawnSync("pgrep", ["-f", name], { encoding: "utf8", timeout: 5000 }).status === 0;
+    }
     const r = spawnSync("tasklist", ["/FI", `IMAGENAME eq ${name}.exe`, "/NH"], { encoding: "utf8", windowsHide: true, timeout: 5000 });
     const out = String(r.stdout || "").toLowerCase();
     if (!out) return false;
@@ -312,7 +334,9 @@ async function stopByLauncher(L) {
   for (const n of names) {
     if (!isProcessRunning(n)) continue;
     await new Promise((resolve) => {
-      const p = spawn("taskkill", ["/IM", `${n}.exe`, "/F"], { windowsHide: true, stdio: "ignore" });
+      const p = IS_MAC
+        ? spawn("pkill", ["-x", n], { stdio: "ignore" })
+        : spawn("taskkill", ["/IM", `${n}.exe`, "/F"], { windowsHide: true, stdio: "ignore" });
       p.on("close", () => resolve());
       p.on("error", () => resolve());
     });

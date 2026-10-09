@@ -130,6 +130,43 @@ export function createWingetParser() {
   };
 }
 
+// ── brew（macOS；Windows 上 winget 的对应物）──
+// brew 输出（stdout+stderr 混合，英文，与系统语言无关），阶段式、无字节进度：
+//   ==> Downloading https://.../foo--1.2.tar.gz
+//   ==> Fetching dependencies for foo: bar
+//   ==> Installing dependencies for foo: bar
+//   ==> Pouring foo--1.2.arm64_sonoma.bottle.tar.gz
+//   ==> Caveats
+//   ==> Summary
+//   🍺  /opt/homebrew/Cellar/foo/1.2: 5 files, 1.2MB
+// 已安装且最新：Warning: foo 1.2 is already installed and up-to-date.
+const BREW_DOWNLOADING = /^==>\s+Downloading\s+(\S+)/;
+const BREW_FETCHING = /^==>\s+Fetching\s+/;
+const BREW_INSTALLING_DEPS = /^==>\s+Installing dependencies for\s+(.+?):/;
+const BREW_POURING = /^==>\s+Pouring\s+(\S+)/;
+const BREW_INSTALLING = /^==>\s+Installing\s+(\S+)/;
+const BREW_CAVEATS = /^==>\s+Caveats/;
+const BREW_SUMMARY = /^==>\s+Summary/;
+const BREW_DONE = /^🍺\s+/;
+const BREW_ALREADY = /already installed and up-to-date|is already installed/i;
+
+export function createBrewParser() {
+  return function (line) {
+    if (!line) return null;
+    let m;
+    if ((m = line.match(BREW_DOWNLOADING))) return { stage: "downloading", message: `下载 ${m[1]}`, meta: { installUrl: m[1] } };
+    if (BREW_FETCHING.test(line)) return { stage: "downloading", message: "获取依赖" };
+    if ((m = line.match(BREW_INSTALLING_DEPS))) return { stage: "installing", message: `安装依赖 ${m[1]}` };
+    if ((m = line.match(BREW_POURING))) return { stage: "installing", message: "解包安装" };
+    if ((m = line.match(BREW_INSTALLING))) return { stage: "installing", message: `安装 ${m[1]}` };
+    if (BREW_CAVEATS.test(line)) return { stage: "finalizing", message: "读取说明（Caveats）" };
+    if (BREW_SUMMARY.test(line)) return { stage: "finalizing", message: "生成摘要" };
+    if (BREW_DONE.test(line)) return { stage: "finalizing", message: "安装完成", note: line.replace(/^🍺\s*/, "").trim() };
+    if (BREW_ALREADY.test(line)) return { stage: "finalizing", message: "已安装（最新）", note: "已安装且最新" };
+    return null;
+  };
+}
+
 // ── pip（26.0 实测，英文输出不随系统语言）──
 // 输出样例（venv 内安装 six，stdout）：
 //   Collecting six

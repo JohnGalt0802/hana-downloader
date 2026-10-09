@@ -767,29 +767,30 @@ export default defineApp(async (sdk) => {
     await sdk.tools.register({
       name: "download-command",
       description:
-        "装软件、装依赖、clone 仓库必须用这个（git clone / npm / pnpm / pip / uv / winget 等安装类命令），不要裸跑这些命令。"
+        "装软件、装依赖、clone 仓库必须用这个（git clone / npm / pnpm / pip / uv / winget / brew 等安装类命令），不要裸跑这些命令。"
         + "裸命令会阻塞你直到结束（clone 大仓库、pnpm 冷启动可能几分钟），期间不能回复、不能取消、看不到进度。"
-        + "类型：git-clone / pnpm-install / winget-install / pip-install（仅这四种，不做任意命令）。"
-        + "winget 支持模糊词，多命中时返回候选列表，选定后以完整 ID 重调。"
+        + "类型：git-clone / pnpm-install / winget-install（Windows）/ brew-install（macOS）/ pip-install。"
+        + "winget 支持模糊词，多命中时返回候选列表，选定后以完整 ID 重调；brew 用 formula/cask 名。"
         + "查进度用 download-wait（返回的 taskId 是本 App 的，不在宿主的 wait_for_tasks 任务列表里）。",
       parameters: {
         type: "object",
         properties: {
-          kind: { type: "string", enum: ["git-clone", "pnpm-install", "winget-install", "pip-install"], description: "命令类型" },
+          kind: { type: "string", enum: ["git-clone", "pnpm-install", "winget-install", "brew-install", "pip-install"], description: "命令类型" },
           repo: { type: "string", description: "git-clone 专用：仓库地址（http/https/git@/本地路径）" },
           targetDir: { type: "string", description: "git-clone 专用：目标目录绝对路径（可选，默认取仓库名）" },
           workdir: { type: "string", description: "执行工作目录（pnpm-install 必填；git-clone 可选）" },
-          pkg: { type: "string", description: "winget-install / pip-install 专用：包 ID 或名称（winget 支持模糊词，多命中会返回候选列表供选定）" },
+          pkg: { type: "string", description: "winget-install / brew-install / pip-install 专用：包 ID 或名称（winget 支持模糊词，多命中会返回候选列表供选定；brew 用 formula/cask 名）" },
           scope: { type: "string", enum: ["user", "machine"], description: "winget-install 可选：安装范围" },
           source: { type: "string", description: "winget-install 可选：源名（默认用 winget 默认源）" },
-          pythonPath: { type: "string", description: "pip-install 可选：目标 Python 解释器（或 venv 里的 python.exe）绝对路径，默认系统 Python" },
+          cask: { type: "boolean", description: "brew-install 可选：装 GUI 应用（透传 --cask）" },
+          pythonPath: { type: "string", description: "pip-install 可选：目标 Python 解释器（或 venv 里的 python）绝对路径，默认系统 Python" },
           runner: { type: "string", enum: ["python", "uv"], description: "pip-install 可选：安装器，默认 python（python -m pip）；uv 则走 uv pip install" },
           upgrade: { type: "boolean", description: "pip-install 可选：升级到最新版（透传 --upgrade）" },
           label: { type: "string", description: "卡片显示名（可选）" },
         },
         required: ["kind"],
       },
-      async execute({ kind, repo, targetDir, workdir, pkg, scope, source, pythonPath, runner, upgrade, label, context }) {
+      async execute({ kind, repo, targetDir, workdir, pkg, scope, source, cask, pythonPath, runner, upgrade, label, context }) {
         const callToken = context?.callToken;
         const sessionPath = context?.sessionPath;
         const sessionId = await resolveSessionId(sessionPath);
@@ -801,7 +802,7 @@ export default defineApp(async (sdk) => {
           r = await callEngine("/command", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ kind, repo, targetDir, workdir, pkg, scope, source, pythonPath, runner, upgrade, label, sessionPath, sessionId, stallTaskId, messageId: context?.messageId || null }),
+            body: JSON.stringify({ kind, repo, targetDir, workdir, pkg, scope, source, cask, pythonPath, runner, upgrade, label, sessionPath, sessionId, stallTaskId, messageId: context?.messageId || null }),
           });
         } catch (e) {
           await closeUnusedStallTask(stallTaskId);
@@ -830,7 +831,8 @@ export default defineApp(async (sdk) => {
             const action = kind === "git-clone" ? `克隆 ${repo || ""}`
               : kind === "pnpm-install" ? `安装依赖 ${label || workdir || ""}`
                 : kind === "winget-install" ? `winget 安装 ${pkg || ""}`
-                  : `pip 安装 ${pkg || ""}`;
+                  : kind === "brew-install" ? `brew 安装 ${pkg || ""}`
+                    : `pip 安装 ${pkg || ""}`;
             task = await sdk.tasks.create({ callToken, label: action, delivery: "next-step" });
             log(`tasks.create OK | ${JSON.stringify(task)}`);
             if (task?.taskId) {
@@ -967,7 +969,7 @@ export default defineApp(async (sdk) => {
     if (sdk.hooks && typeof sdk.hooks.onDecision === "function") {
       const RULE =
         `${RULE_MARK}${RULE_TAG}下载文件、clone 仓库、装软件或依赖，必须用 ${DOWNLOAD_TOOL}`
-        + ` / ${COMMAND_TOOL}，禁止裸跑 curl / wget / Invoke-WebRequest / git clone / pip / npm / pnpm / winget。`
+        + ` / ${COMMAND_TOOL}，禁止裸跑 curl / wget / Invoke-WebRequest / git clone / pip / npm / pnpm / winget / brew。`
         + "注意：即使配合 ghproxy / hf-mirror / modelscope 等镜像站，也走本工具——镜像选择由本工具的自动路由负责，不要自己拼镜像 URL 后裸跑下载命令。"
         + "原因：裸命令会阻塞你直到跑完（大文件、冷启动依赖可能几分钟），期间无法取消、进度不可见、也不进统一任务记录。"
         + `判据：只要是要从网上取文件或装东西，就先用本工具（不确定耗时也先用）；中途用 ${APP_ID}_download-wait 看一次即可，不必反复查。`

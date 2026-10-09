@@ -12,7 +12,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { getTaskManager, resolveWingetBin } from "./dlcore.js";
+import { getTaskManager, resolveWingetBin, whichBin } from "./dlcore.js";
 import { parseWingetSearch } from "./progress-parsers.js";
 import { ENGINE_PORT } from "./engine-port.js";
 import {
@@ -37,6 +37,17 @@ const CFG_FILE = path.join(DATA_DIR, "engine-config.json");
 const USER_CFG_FILE = path.join(DATA_DIR, "config.json");
 
 const log = (s) => { try { console.log(`[hd-engine] ${s}`); } catch {} };
+
+// 全局未捕获异常兜底：引擎进程此前没有任何 uncaughtException 处理，任何一处漏挂
+// error 监听的异步失败（典型：spawn 一个本机不存在的命令）都会直接把进程带崩，
+// 宿主侧只看到「engine unreachable: fetch failed」，直到 30s 看门狗才重启。
+// 下载引擎宁可记一笔日志继续服务，也不该整进程消失。
+process.on("uncaughtException", (e) => {
+  log(`uncaughtException | ${e?.stack || e?.message || e}`);
+});
+process.on("unhandledRejection", (e) => {
+  log(`unhandledRejection | ${e?.stack || e?.message || e}`);
+});
 
 // 全局设置（engine-config.json）：defaultSaveDir / agentChooses / stallTimeoutMs。
 // 由管理器的设置菜单经 POST /settings 写入，下载时作为缺省值生效。
@@ -310,6 +321,9 @@ const server = http.createServer(async (req, res) => {
         unit = "packages";
         cmd = { type: "pnpm-install", args: [], workdir };
       } else if (kind === "winget-install") {
+        if (process.platform !== "win32") {
+          return send(200, { ok: false, error: "winget-install 仅适用于 Windows；macOS 请用 brew-install。" });
+        }
         const pkg = String(b.pkg || "").trim();
         if (!pkg) return send(400, { error: "winget-install 需要包名或 ID（pkg）" });
         if (pkg.startsWith("-")) return send(400, { error: "包名不能以 - 开头" });
@@ -338,6 +352,22 @@ const server = http.createServer(async (req, res) => {
           scope: b.scope === "user" || b.scope === "machine" ? b.scope : null,
           source: b.source ? String(b.source).trim() : null,
         };
+      } else if (kind === "brew-install") {
+        // macOS 原生：Homebrew 直接 install，无需 winget 那套「先 search 再按 ID 装」。
+        if (process.platform !== "darwin") {
+          return send(200, { ok: false, error: "brew-install 仅适用于 macOS；Windows 请用 winget-install。" });
+        }
+        const pkg = String(b.pkg || "").trim();
+        if (!pkg) return send(400, { error: "brew-install 需要包名（pkg）" });
+        if (pkg.startsWith("-")) return send(400, { error: "包名不能以 - 开头" });
+        if (!whichBin("brew", ["/opt/homebrew/bin", "/usr/local/bin"])) {
+          return send(200, { ok: false, error: "未找到 Homebrew：装系统软件需先安装 brew（https://brew.sh）。" });
+        }
+        fileName = b.label ? String(b.label).trim() : pkg;
+        filePath = "";
+        unit = "steps";
+        taskUrl = `brew:${pkg}`;
+        cmd = { type: "brew-install", pkg, cask: !!b.cask };
       } else if (kind === "pip-install") {
         const pkg = String(b.pkg || "").trim();
         if (!pkg) return send(400, { error: "pip-install 需要包名（pkg）" });
@@ -354,7 +384,7 @@ const server = http.createServer(async (req, res) => {
           upgrade: !!b.upgrade,
         };
       } else {
-        return send(400, { error: `不支持的命令类型：${kind}（支持 git-clone / pnpm-install / winget-install / pip-install）` });
+        return send(400, { error: `不支持的命令类型：${kind}（支持 git-clone / pnpm-install / winget-install / brew-install / pip-install）` });
       }
       mgr.applyConfig(loadCfg()); // 并发上限对命令型同样生效（2026-09-20）
       const t = await mgr.create({
@@ -425,8 +455,25 @@ const server = http.createServer(async (req, res) => {
     if (!p) return send(400, { error: "filePath required" });
     try {
       const { spawn } = await import("node:child_process");
-      spawn("explorer.exe", ["/select,", p], { detached: true, stdio: "ignore" }).unref();
-      log(`reveal ${p}`);
+      // 按平台选命令；原实现写死 Windows 的 explorer.exe，在 macOS/Linux 上 spawn 会触发
+      // ENOENT 的 'error' 事件，未捕获异常直接把整个引擎进程带崩。此处挂 error 监听兜底。
+      const mode = b.mode === "open" ? "open" : "select";
+      const plat = process.platform;
+      let bin, args;
+      if (plat === "darwin") {
+        bin = "open";
+        args = mode === "select" ? ["-R", p] : [p];
+      } else if (plat === "win32") {
+        bin = "explorer.exe";
+        args = mode === "select" ? ["/select,", p] : [p];
+      } else {
+        bin = "xdg-open";
+        args = [mode === "select" ? (p.replace(/\/[^/]*$/, "") || "/") : p];
+      }
+      const child = spawn(bin, args, { detached: true, stdio: "ignore" });
+      child.on("error", (e) => log(`reveal spawn error | ${bin} | ${e?.message || e}`));
+      child.unref();
+      log(`reveal ${mode} ${p} | ${bin}`);
       return send(200, { ok: true });
     } catch (e) {
       return send(500, { error: String(e?.message || e) });

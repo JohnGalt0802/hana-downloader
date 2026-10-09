@@ -9,6 +9,7 @@ import https from "node:https";
 import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
+import os from "node:os";
 import { startWingetProbe } from "./download-probe.js";
 import { createTunnelAgent } from "./tunnel-agent.js";
 
@@ -643,6 +644,9 @@ class TaskManager {
         cwd: task.cmd.workdir || process.cwd(),
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
+        // 非 Windows：子进程自成进程组（detached），取消时用 process.kill(-pid) 一次带走整棵树，
+        // 等价于 Windows 的 taskkill /T /F（git/pnpm 会再 fork 子进程）。
+        detached: process.platform !== "win32",
         env: childEnv,
       });
     } catch (err) {
@@ -800,7 +804,12 @@ class TaskManager {
           spawnSync("taskkill", ["/pid", String(t.child.pid), "/T", "/F"], { windowsHide: true });
         } catch { try { t.child.kill(); } catch { /* 忽略 */ } }
       } else {
-        try { process.kill(-t.child.pid, "SIGTERM"); } catch { try { t.child.kill(); } catch { /* 忽略 */ } }
+        // 非 Windows：子进程自成进程组（spawn 时 detached），负 pid 杀整组。
+        // SIGTERM 先礼后兵，5s 不退再 SIGKILL（git/pnpm 偶尔忽略 SIGTERM）。
+        const pid = t.child.pid;
+        try { process.kill(-pid, "SIGTERM"); } catch { try { t.child.kill(); } catch { /* 忽略 */ } }
+        const hardKill = setTimeout(() => { try { process.kill(-pid, "SIGKILL"); } catch { /* 已退出 */ } }, 5000);
+        if (typeof hardKill.unref === "function") hardKill.unref();
       }
       return { ok: true };
     }
@@ -1069,7 +1078,8 @@ const COMMAND_SPECS = {
     build: () => {
       const entry = findPnpmEntry();
       if (entry) return { bin: process.execPath, args: [entry, "install"] };
-      return { bin: "pnpm", args: ["install"] }; // 退化：PATH 上有 pnpm.exe 时可用
+      // 退化：直接跑 PATH / 常见目录里的 pnpm（mac 上 Homebrew 的 pnpm 是可执行脚本）
+      return { bin: whichBin("pnpm") || "pnpm", args: ["install"] };
     },
     makeParser: (pp) => pp.createPnpmParser(),
     classifyExit: null,
@@ -1078,6 +1088,13 @@ const COMMAND_SPECS = {
     build: (cmd) => ({ bin: resolveWingetBin(), args: buildWingetArgs(cmd) }),
     makeParser: (pp) => pp.createWingetParser(),
     classifyExit: (pp) => pp.classifyWingetExit,
+  },
+  "brew-install": {
+    // macOS 原生（Windows 上 winget 的对应物）。brew 是带 shebang 的脚本，
+    // 解析出绝对路径后直接 spawn 即可（不依赖精简 PATH）。
+    build: (cmd) => ({ bin: resolveBrewBin(), args: buildBrewArgs(cmd) }),
+    makeParser: (pp) => pp.createBrewParser(),
+    classifyExit: null, // brew 退出码没有稳定码表，走通用失败分支
   },
   "pip-install": {
     build: (cmd) => buildPipCommand(cmd),
@@ -1092,20 +1109,51 @@ const META_PROTECTED = new Set([
   "pendingTimer", "sessionId", "sessionPath", "kind", "cmd", "cancelRequested", "partPath",
 ]);
 
-// winget 可执行解析：where 优先，其次 WindowsApps 别名兜底（受管进程 PATH 不含用户别名时）。
-export function resolveWingetBin() {
+const IS_WIN = process.platform === "win32";
+
+// 通用可执行定位：先问 PATH（win: where.exe / 其它: which），再扫常见安装目录。
+// 受管进程的 PATH 往往是精简的（不含 shell rc 里的 ~/.local/bin、Homebrew 等），
+// 所以兜底目录清单对 macOS 尤其重要。
+export function whichBin(name, extraDirs = []) {
+  const names = Array.isArray(name) ? name : [name];
   try {
-    const r = spawnSync("where.exe", ["winget"], { encoding: "utf-8", windowsHide: true });
-    if (r.status === 0) {
-      for (const line of String(r.stdout || "").split(/\r?\n/)) {
-        const p = line.trim();
-        if (p && /winget\.exe$/i.test(p) && fs.existsSync(p)) return p;
-      }
+    const finder = IS_WIN ? "where.exe" : "which";
+    const r = spawnSync(finder, names, { encoding: "utf-8", windowsHide: true });
+    // 不看退出码：`which a b` 有一个命中就打印一个，但仍可能返回非 0。
+    for (const line of String(r.stdout || "").split(/\r?\n/)) {
+      const p = line.trim();
+      if (p && fs.existsSync(p)) return p;
     }
   } catch { /* 走兜底 */ }
+  const dirs = [
+    ...extraDirs,
+    ...String(process.env.PATH || "").split(path.delimiter),
+    "/opt/homebrew/bin", "/usr/local/bin",
+    path.join(os.homedir(), ".local", "bin"),
+    path.join(os.homedir(), "bin"),
+    "/usr/bin", "/bin",
+  ].filter(Boolean);
+  for (const d of dirs) {
+    for (const n of names) {
+      const p = path.join(d, n);
+      try { if (fs.existsSync(p)) return p; } catch { /* ignore */ }
+    }
+  }
+  return "";
+}
+
+// winget 可执行解析：which/where 优先，其次 WindowsApps 别名兜底（受管进程 PATH 不含用户别名时）。
+export function resolveWingetBin() {
+  const found = whichBin("winget");
+  if (found) return found;
   const guess = path.join(process.env.LOCALAPPDATA || "", "Microsoft", "WindowsApps", "winget.exe");
   if (fs.existsSync(guess)) return guess;
   return "winget"; // 退化：依赖 PATH
+}
+
+// Homebrew 可执行解析（macOS；Windows 上 winget 的对应物）。
+export function resolveBrewBin() {
+  return whichBin("brew", ["/opt/homebrew/bin", "/usr/local/bin"]) || "brew";
 }
 
 // winget install 参数（数组传参，无 shell）。--disable-interactivity 禁用交互提示，
@@ -1120,39 +1168,59 @@ function buildWingetArgs(cmd) {
   return args;
 }
 
-// Python 解释器解析：显式 pythonPath 优先（不存在则抛），否则 where python 第一个。
+// brew install 参数（数组传参，无 shell）。
+function buildBrewArgs(cmd) {
+  const args = ["install"];
+  if (cmd.cask) args.push("--cask");
+  args.push(String(cmd.pkg || ""));
+  return args;
+}
+
+// 系统代理（只读）：Windows 读注册表，macOS 读 `scutil --proxy`。
+// 返回 { enabled, server }；读不到一律当没有代理。
+export function readSystemProxyInfo() {
+  try {
+    if (process.platform === "win32") {
+      const en = spawnSync("reg",
+        ["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "/v", "ProxyEnable"],
+        { encoding: "utf8", windowsHide: true, timeout: 5000 });
+      const me = /ProxyEnable\s+REG_DWORD\s+0x([0-9a-f]+)/i.exec(en.stdout || "");
+      const sv = spawnSync("reg",
+        ["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "/v", "ProxyServer"],
+        { encoding: "utf8", windowsHide: true, timeout: 5000 });
+      const m = /ProxyServer\s+REG_SZ\s+([^\r\n]+)/.exec(sv.stdout || "");
+      return { enabled: me ? parseInt(me[1], 16) === 1 : false, server: m ? m[1].trim() : "" };
+    }
+    if (process.platform === "darwin") {
+      const out = spawnSync("scutil", ["--proxy"], { encoding: "utf8", timeout: 5000 });
+      const txt = String(out.stdout || "");
+      const pick = (proto) => {
+        const on = new RegExp(`${proto}Enable\\s*:\\s*1`).test(txt);
+        const host = (new RegExp(`${proto}Proxy\\s*:\\s*(\\S+)`).exec(txt) || [])[1] || "";
+        const port = (new RegExp(`${proto}Port\\s*:\\s*(\\d+)`).exec(txt) || [])[1] || "";
+        return on && host ? `http://${host}${port ? ":" + port : ""}` : "";
+      };
+      const server = pick("HTTPS") || pick("HTTP") || "";
+      return { enabled: !!server, server };
+    }
+  } catch { /* 读不到就算没有 */ }
+  return { enabled: false, server: "" };
+}
+
+// Python 解释器解析：显式 pythonPath 优先（不存在则抛），否则找 python3/python。
 function resolvePythonBin(pythonPath) {
   if (pythonPath) {
     const p = path.resolve(String(pythonPath));
     if (!fs.existsSync(p)) throw new Error(`指定的 Python 解释器不存在：${p}`);
     return p;
   }
-  try {
-    const r = spawnSync("where.exe", ["python"], { encoding: "utf-8", windowsHide: true });
-    if (r.status === 0) {
-      for (const line of String(r.stdout || "").split(/\r?\n/)) {
-        const p = line.trim();
-        if (p && /python[\d.]*(\.exe)?$/i.test(p) && fs.existsSync(p)) return p;
-      }
-    }
-  } catch { /* 走退化 */ }
-  return "python"; // 退化：依赖 PATH
+  // mac 上系统解释器叫 python3（python 可能不存在），故 mac 优先 python3。
+  return whichBin(IS_WIN ? ["python", "python3"] : ["python3", "python"]) || (IS_WIN ? "python" : "python3");
 }
 
-// uv 可执行解析：where 优先，其次 ~/.local/bin/uv.exe（官方安装器默认位置）。
+// uv 可执行解析：PATH 优先，其次 ~/.local/bin（官方安装器默认位置）。
 function resolveUvBin() {
-  try {
-    const r = spawnSync("where.exe", ["uv"], { encoding: "utf-8", windowsHide: true });
-    if (r.status === 0) {
-      for (const line of String(r.stdout || "").split(/\r?\n/)) {
-        const p = line.trim();
-        if (p && /uv(\.exe)?$/i.test(p) && fs.existsSync(p)) return p;
-      }
-    }
-  } catch { /* 走兜底 */ }
-  const guess = path.join(process.env.USERPROFILE || "", ".local", "bin", "uv.exe");
-  if (fs.existsSync(guess)) return guess;
-  return "uv"; // 退化：依赖 PATH
+  return whichBin("uv", [path.join(os.homedir(), ".local", "bin")]) || "uv";
 }
 
 // pip 安装命令构造（数组传参，无 shell）：
