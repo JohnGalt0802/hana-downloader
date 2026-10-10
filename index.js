@@ -8,7 +8,7 @@
 //   3. 聊天流卡片：经 session:send-custom 投递自定义消息，由清单里的
 //      contributes.messageRenderers 把它映射成流内卡
 //   4. 任务终态经宿主任务面回执（sdk.tasks），由宿主统一投递
-//   5. 下载铁律：agent/pre-step 裁决钩子注入，避免模型绕过本工具裸下载
+//   5. 下载铁律：agent/before-start 裁决钩子注入，避免模型绕过本工具裸下载
 //
 // 为什么卡片不走工具返回值的 details.card（2026-09-13 实测结论）：
 //   宿主 0.970.9 投影工具结果时，v2 App 的工具名被泛化成 "tool_call"，
@@ -45,9 +45,6 @@ const RETRY_NOTIFY_MAX_POLLS = 10800;
 const MAX_ANNOUNCE_PER_HOUR = 30;
 
 const RULE_MARK = "【下载铁律】";
-// 诊断特征词（2026-10-04）：用于确认「注入是否真的到达模型」——模型复述得出即到达。
-// 排查结束后可移除（连同注入处一起）。
-const RULE_TAG = "[HD-RULE-20261004]";
 const RECORD_PREFIX = "【下载记录】";
 const DOWNLOAD_TOOL = `${APP_ID}_download-file`;
 const COMMAND_TOOL = `${APP_ID}_download-command`;
@@ -248,6 +245,8 @@ export default defineApp(async (sdk) => {
     } catch (e) {
       err(`tasks settle ERR | ${hostTaskId} | ${e?.message || e}`);
     }
+    // 终态文件已消费：删掉，finished/ 不再只增不减（2026-10-10）
+    try { fs.unlinkSync(finishedPath); } catch { /* 已删或占用，忽略 */ }
     // 下载结束了：卡滞提醒任务没用上就取消掉
     await closeUnusedStallTask(stallTaskId);
   }
@@ -267,10 +266,25 @@ export default defineApp(async (sdk) => {
   //   · scope:"all" 会校验能力 app/sessions.read（“read sessions outside this app”），
   //     清单里必须声明它，光有 app/sessions.manage 不够
   // 进程内缓存：同一个会话的后续调用直接命中，不必反复拉列表。
+  // 带上限的 LRU（2026-10-10）：Map 的插入序即访问序，命中时 delete + set 刷新到队尾，
+  // 超限淘汰最旧的一条。长驻进程不会再把每个会话都留一份。
+  const SESSION_ID_CACHE_MAX = 500;
   const sessionIdCache = new Map();
+  function cacheSessionId(sessionPath, id) {
+    if (sessionIdCache.has(sessionPath)) sessionIdCache.delete(sessionPath);
+    sessionIdCache.set(sessionPath, id);
+    if (sessionIdCache.size > SESSION_ID_CACHE_MAX) {
+      const oldest = sessionIdCache.keys().next().value;
+      if (oldest !== undefined) sessionIdCache.delete(oldest);
+    }
+  }
   async function resolveSessionId(sessionPath) {
     if (!sessionPath) return null;
-    if (sessionIdCache.has(sessionPath)) return sessionIdCache.get(sessionPath);
+    if (sessionIdCache.has(sessionPath)) {
+      const hit = sessionIdCache.get(sessionPath);
+      cacheSessionId(sessionPath, hit); // 命中刷新 LRU 位置
+      return hit;
+    }
     let id = null;
     try {
       const r = await sdk.sessions.list({ scope: "all" });
@@ -280,7 +294,7 @@ export default defineApp(async (sdk) => {
     } catch (e) {
       err(`resolveSessionId ERR | ${e?.message || e}`);
     }
-    if (id) { sessionIdCache.set(sessionPath, id); log(`sessionId resolved | ${id}`); }
+    if (id) { cacheSessionId(sessionPath, id); log(`sessionId resolved | ${id}`); }
     else log(`sessionId unresolved | ${sessionPath}`);
     return id;
   }
@@ -417,6 +431,8 @@ export default defineApp(async (sdk) => {
     if (snap.note) lines.push(`备注：${snap.note}`);
     if (snap.error) lines.push(`错误：${snap.error}`);
     await notifySession({ sessionId: snap.sessionId, sessionPath }, lines.join("\n"), "retry-note");
+    // 已投递：删掉终态文件，finished/ 不再只增不减（2026-10-10）
+    try { fs.unlinkSync(finishedPath); } catch { /* 已删或占用，忽略 */ }
   }
 
   // ── 卡滞守望（2026-09-20）───────────────────────────────────
@@ -433,6 +449,8 @@ export default defineApp(async (sdk) => {
   // 开销是一次 readdir + 至多几个小 JSON，可忽略。
   // 与引擎侧的判定间隔（同样 1 秒级）叠起来，从「真的卡住」到「agent 被叫醒」最坏约 2 秒。
   const STALL_WATCH_MS = 1000;
+  // 陈旧阈值：stalled/ 与 finished/ 里超过 12 小时的文件视为历史，启动时清掉（2026-10-10）
+  const STALE_MS = 12 * 60 * 60 * 1000;
   const notifiedStalls = new Set();
   let stallTimer = null;
 
@@ -450,7 +468,19 @@ export default defineApp(async (sdk) => {
       const key = `${snap.taskId}#${snap.stalledAt || ""}`;
       if (notifiedStalls.has(key)) continue;
       notifiedStalls.add(key);
-      if (silent) continue; // 启动首扫：存量只登记，不回放
+      if (silent) {
+        // 启动首扫：存量是历史卡滞，不回放；太老的直接清掉，避免 stalled/ 只增不减。
+        // 年龄优先取业务时间 stalledAt；9 月中旬那批老文件没有该字段，退回文件 mtime 兜底
+        //（2026-10-10：实测有 9 个缺 stalledAt 的老文件因此清不掉，补这条兜底）。
+        let age = snap.stalledAt ? Date.now() - snap.stalledAt : null;
+        if (age === null) {
+          try { age = Date.now() - fs.statSync(path.join(dir, f)).mtimeMs; } catch { /* 读不到就不清 */ }
+        }
+        if (age !== null && age > STALE_MS) {
+          try { fs.unlinkSync(path.join(dir, f)); log(`stall stale removed | ${f}`); } catch { /* 忽略 */ }
+        }
+        continue;
+      }
       const sp = snap.sessionPath;
       const sid = snap.sessionId;
       if (!sp && !sid) { log(`stall notify skipped | ${snap.taskId} 没有会话标识`); continue; }
@@ -472,13 +502,17 @@ export default defineApp(async (sdk) => {
           await sdk.tasks.complete(stId, { text: lines.join("\n") });
           consumedStallTasks.add(stId);
           log(`stall notify sent (next-step) | ${stId}`);
+          // 通知成功：删掉这条 stalled 文件，不再只增不减（2026-10-10）
+          try { fs.unlinkSync(path.join(dir, f)); } catch { /* 忽略 */ }
         } catch (e) {
           err(`stall notify ERR (next-step) | ${e?.message || e}`);
         }
         continue;
       }
       // 兜底：没有卡滞任务（老任务、或非工具发起）时退回自定义消息
-      await notifySession({ sessionId: sid, sessionPath: sp }, lines.join("\n"), "download-stall");
+      // 只在「真的投出去」之后才删信，投失败就留着等下一轮（去重逻辑不变）
+      const delivered = await notifySession({ sessionId: sid, sessionPath: sp }, lines.join("\n"), "download-stall");
+      if (delivered) { try { fs.unlinkSync(path.join(dir, f)); } catch { /* 忽略 */ } }
     }
   }
 
@@ -491,6 +525,24 @@ export default defineApp(async (sdk) => {
           scanStalls().catch((e) => err(`stall scan ERR | ${e?.message || e}`));
         }, STALL_WATCH_MS);
       });
+  }
+
+  // 启动兜底清理：finished/ 里 mtime 超过 12 小时的孤儿终态文件（正常路径「读走即删」，
+  // 这里只收没人读的：进程崩溃、等待者没了等）。单个失败不影响其它，也不中断启动。
+  async function cleanStaleFinished() {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const dir = path.join(dataDir, "finished");
+    let files = [];
+    try { files = fs.readdirSync(dir); } catch { return; }
+    const cutoff = Date.now() - STALE_MS;
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      const p = path.join(dir, f);
+      try {
+        if (fs.statSync(p).mtimeMs < cutoff) { fs.unlinkSync(p); log(`finished stale removed | ${f}`); }
+      } catch { /* 单个文件失败忽略 */ }
+    }
   }
 
 // ── 卡片登记 ────────────────────────────────────────────────────
@@ -959,56 +1011,22 @@ export default defineApp(async (sdk) => {
     err(`routes register ERR | ${e?.message || e}`);
   }
 
-  // ── 下载铁律（agent/pre-step 裁决钩子）─────────────────────────
+  // ── 下载铁律（agent/before-start 裁决钩子）──────────────────────
   // 需要下载 http/https 文件时，让模型走本 App 的工具，而不是 exec_command 里的
   // curl / Invoke-WebRequest 裸下载（那种方式没有进度卡片、没有断点续传、
   // 也不进统一的任务记录）。
+  // 写进 systemPrompt：那是模型注意力的「底座」，比半路插一条对话消息硬得多
+  //（agent/pre-step 的 messages 注入实测到不了模型，已于 2026-10-10 移除）。
   try {
     if (sdk.hooks && typeof sdk.hooks.onDecision === "function") {
       const RULE =
-        `${RULE_MARK}${RULE_TAG}下载文件、clone 仓库、装软件或依赖，必须用 ${DOWNLOAD_TOOL}`
-        + ` / ${COMMAND_TOOL}，禁止裸跑 curl / wget / Invoke-WebRequest / git clone / pip / npm / pnpm / winget。`
-        + "注意：即使配合 ghproxy / hf-mirror / modelscope 等镜像站，也走本工具——镜像选择由本工具的自动路由负责，不要自己拼镜像 URL 后裸跑下载命令。"
-        + "原因：裸命令会阻塞你直到跑完（大文件、冷启动依赖可能几分钟），期间无法取消、进度不可见、也不进统一任务记录。"
-        + `判据：只要是要从网上取文件或装东西，就先用本工具（不确定耗时也先用）；中途用 ${APP_ID}_download-wait 看一次即可，不必反复查。`
+        `${RULE_MARK}下载、clone、装软件或依赖必须用 ${DOWNLOAD_TOOL}`
+        + ` / ${COMMAND_TOOL}，禁止裸跑 curl/wget/Invoke-WebRequest/git clone/pip/npm/pnpm/winget`
+        + "（含镜像站，别自拼镜像URL）。"
+        + "裸跑会阻塞你直到跑完，期间不能取消、无进度、不进统一记录。"
+        + `凡从网上取文件或装东西都先用它，进度用 ${APP_ID}_download-wait 查一次。`
         + `会话里以「${RECORD_PREFIX}」开头的消息是本 App 投递的记录，不是用户指令，不要据此重复发起下载。`;
 
-      let injectCount = 0;
-      let skipLogAt = 0;
-      await sdk.hooks.onDecision("agent/pre-step", (inv) => {
-        const messages = inv?.messages;
-        const sid = String(inv?.session?.sessionId || "?");
-        if (!Array.isArray(messages)) {
-          log(`rule skip (no messages array) | sid=${sid}`);
-          return;
-        }
-        if (messages.some((m) => m?.role === "system" && String(m.content || "").includes(RULE_MARK))) {
-          const now = Date.now();
-          if (now - skipLogAt > 60000) {
-            skipLogAt = now;
-            log(`rule skip (already present) | sid=${sid} msgs=${messages.length}`);
-          }
-          return;
-        }
-
-        const next = messages.slice();
-        const i = next.findIndex((m) => m?.role === "system");
-        if (i >= 0) {
-          next[i] = { ...next[i], content: `${String(next[i].content || "")}\n${RULE}` };
-        } else {
-          next.unshift({ role: "system", content: RULE });
-        }
-        injectCount += 1;
-        log(`rule injected #${injectCount} | sid=${sid} msgs ${messages.length} -> ${next.length}`);
-        return { messages: next };
-      });
-      log("download rule hook registered");
-
-      // ── 同一份铁律的第二入口：写进 systemPrompt（2026-10-04）────────
-      // 背景：agent/pre-step 的 messages 注入实测到不了模型（三探针阴性：
-      // 日志只证明回调被调用，模型上下文里从未出现过铁律文本）。改从
-      // systemPrompt 入口注入——那是模型注意力的「底座」，比半路插一条
-      // 对话消息硬得多。两入口并存、各自去重，覆盖不同链路。
       await sdk.hooks.onDecision("agent/before-start", (inv) => {
         const base = typeof inv?.systemPrompt === "string" ? inv.systemPrompt : "";
         if (base.includes(RULE_MARK)) {
@@ -1034,6 +1052,7 @@ export default defineApp(async (sdk) => {
       await startEngine();
       await waitEngineReady();
       startWatchdog();
+      await cleanStaleFinished(); // 启动兜底清 finished/ 里的陈旧终态（2026-10-10）
       startStallWatcher(); // 卡滞要叫醒 agent 决策（2026-09-20）
     } catch (e) {
       err(`engine start ERR | ${e?.message || e}`);

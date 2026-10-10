@@ -30,7 +30,6 @@
     "app/tools.expose-to-model",
     "app/resources.read",
     "app/ui.clipboard-write",
-    "app/hooks.agent-pre-step",
     "app/hooks.agent-before-start"
   ],
   "contributes": {

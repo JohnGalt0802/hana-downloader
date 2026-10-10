@@ -35,6 +35,9 @@ const CFG_FILE = path.join(DATA_DIR, "engine-config.json");
 // 与 engine-config.json 分开：前者是「运行行为」的开关（管理器设置菜单写），
 // 后者是「下载策略」的长期配置（可手工编辑，不至于被设置菜单覆盖掉）。
 const USER_CFG_FILE = path.join(DATA_DIR, "config.json");
+// 卡片绑定表：本引擎维护的 cardInstanceId/任务绑定与待认领队列（见下方 /bind、/register-card）。
+// 定义在文件上方：启动时的绑定表修剪（pruneBindings）要在模块顶层 early 调用到它。
+const BIND_FILE = path.join(DATA_DIR, "bindings.json");
 
 const log = (s) => { try { console.log(`[hd-engine] ${s}`); } catch {} };
 
@@ -59,12 +62,18 @@ function normalizeProxyMode(p) {
 
 const mgr = getTaskManager(DATA_DIR);
 try { mgr.restore(); } catch (e) { log(`restore ERR ${e?.message || e}`); }
+// 启动即对绑定表做一次保守修剪（pending / stable 各留最近 300 条，见 pruneBindings）。
+// 放在 restore 之后：此时 mgr.tasks 已就绪（当前不用它，只为后续可能的对账留位置）。
+try {
+  const db = loadBind();
+  pruneBindings(db);
+  saveBind(db);
+} catch (e) { log(`pruneBindings ERR ${e?.message || e}`); }
 // 启动即灌一次运行上限（并发与默认限速），改设置后每次发起前再灌一次
 try { mgr.applyConfig(loadCfg()); } catch (e) { log(`applyConfig ERR ${e?.message || e}`); }
 
 // ── 卡片绑定表（bindings.json）──
-// 见下方 /bind、/register-card 两个端点。
-const BIND_FILE = path.join(DATA_DIR, "bindings.json");
+// 见下方 /bind、/register-card 两个端点。BIND_FILE 在文件上方定义（启动修剪要用）。
 function loadBind() {
   try {
     const j = JSON.parse(fs.readFileSync(BIND_FILE, "utf8"));
@@ -88,6 +97,24 @@ function saveBind(db) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(BIND_FILE, JSON.stringify(db), "utf8");
   } catch (e) { log(`saveBind ERR ${e?.message || e}`); }
+}
+
+// 绑定表修剪（保守）：pending / stable 只增不减，按上限裁掉最陈旧的头部。
+// 只留最近 BIND_CAP 条（对象插入顺序即写入顺序，尾部最新，故删头部）；两表各自判定，
+// 条目数 ≤ 上限时原样不动。bind / assigned 不裁——它们是幂等与跨重载认人的关键，
+// 且 /bind 认领后仍要能命中，裁掉会把“已认领”误判成“新任务”再发一次卡。
+// 300 远大于当前活跃量（本机实测各表 146~151 条），启动这一次不会删掉仍在用的绑定。
+function pruneBindings(db) {
+  const BIND_CAP = 300
+  for (const key of ["pending", "stable"]) {
+    const tbl = db[key]
+    if (!tbl || typeof tbl !== "object") continue
+    const keys = Object.keys(tbl)
+    if (keys.length <= BIND_CAP) continue
+    for (const k of keys.slice(0, keys.length - BIND_CAP)) delete tbl[k]
+    log(`prune ${key} | ${keys.length} -> ${Object.keys(tbl).length}`)
+  }
+  return db
 }
 
 // ── 事件落盘（终态 / 停滞）──
@@ -172,6 +199,9 @@ const server = http.createServer(async (req, res) => {
       const tid = db.stable[cardId];
       db.bind[cardId] = tid;
       db.assigned[tid] = true;
+      // 认领即出队：与主流程同一语义。stable 路径才是实际流量所在（card.js 恒传稳定 id，
+      // 不会走到下面的 new/rotate），不在这里清的话 db.pending 会单调增长，只能靠重启修剪回落。
+      delete db.pending[tid]
       saveBind(db);
       log(`bind ${cardId} -> ${tid} (stable)`);
       return send(200, { ok: true, taskId: tid, matched: "stable" });
@@ -216,6 +246,9 @@ const server = http.createServer(async (req, res) => {
 
     db.bind[cardId] = hit.taskId;
     db.assigned[hit.taskId] = true;
+    // 认领即出队：任务归属已确定，从待认领池移除，避免后续卡片的 new 匹配再选中它。
+    // bind / assigned / stable 三表照旧保留（幂等与跨重载认人的依据），只清 pending 这一条队列项。
+    delete db.pending[hit.taskId]
     saveBind(db);
     log(`bind ${cardId} -> ${hit.taskId} (${matched})`);
     return send(200, { ok: true, taskId: hit.taskId, matched });
