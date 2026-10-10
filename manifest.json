@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "hana-downloader",
   "name": "Hana Downloader",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "description": "小花下载器（v2 App）：任意 URL 下载、命令型下载（git clone / pnpm install / winget / pip）与跨会话下载管理器。聊天流卡片走工具返回值 details.card，随工具调用实时内联。",
   "entry": "index.js",
   "icon": "assets/icon.png",
