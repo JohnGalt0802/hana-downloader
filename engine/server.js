@@ -28,6 +28,9 @@ import {
 // HD_ENGINE_PORT 只作本机调试覆盖；默认值不再在这里重复写一个数字。
 const PORT = Number(process.env.HD_ENGINE_PORT || ENGINE_PORT);
 const READY_MARKER = "HD_ENGINE_READY";
+// /reveal 去重窗口（issue #2）：同一路径在此时长内重复请求只 spawn 一次。
+const REVEAL_DEDUP_MS = 800;
+let lastReveal = { path: "", at: 0 };
 // dataDir 由 app 经 args 传入（受管程序的 cwd 不保证指向 app 数据目录）
 const DATA_DIR = process.argv[2] || process.env.HD_ENGINE_DATA_DIR || process.cwd();
 const CFG_FILE = path.join(DATA_DIR, "engine-config.json");
@@ -452,10 +455,18 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 在系统文件管理器中定位（local-machine 下可 spawn 本机程序）
+  // 第二道防线（issue #2）：同一路径在短窗口内只 spawn 一次。即便前端某条路径
+  // 仍意外重复调用（事件累加、重复渲染等），也不会一次炸出上百个资源管理器窗口。
   if (req.method === "POST" && u.pathname === "/reveal") {
     const b = await readBody();
     const p = b.filePath || b.path;
     if (!p) return send(400, { error: "filePath required" });
+    const now = Date.now();
+    if (lastReveal.path === p && now - lastReveal.at < REVEAL_DEDUP_MS) {
+      log(`reveal deduped ${p} (${now - lastReveal.at}ms)`);
+      return send(200, { ok: true, deduped: true });
+    }
+    lastReveal = { path: p, at: now };
     try {
       const { spawn } = await import("node:child_process");
       spawn("explorer.exe", ["/select,", p], { detached: true, stdio: "ignore" }).unref();

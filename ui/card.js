@@ -485,16 +485,29 @@ function render(t) {
   if (root.innerHTML !== html) root.innerHTML = html;
 
   reportSize();
-
-  const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", fn); };
-  on("dl-fold", toggleFold);
-  on("dl-all", toggleAll);
-  on("dl-cancel", cancel);
-  on("dl-open", () => reveal("open"));
-  on("dl-folder", () => reveal("select"));
-  on("dl-copy", () => copyPath(filePath));
-  on("dl-retry", retry);
+  // 按钮事件不在这里绑定——render 会被轮询反复调用，每次新建的箭头函数会让
+  // addEventListener 在同一节点上不断累加（终态 html 稳定、DOM 不重建，最终演变为
+  // 一点即触发 N 次，N 随卡片停留时间增长）。点击分发统一走下方模块级的事件委托。
 }
+
+// ── 事件委托（issue #2 修复）──
+// 模块加载时给 root 挂唯一一个 click 监听，按 closest("[id]") 分发到对应动作。
+// 为什么不用 render 内直接绑定：render 是轮询驱动的，终态下每 5 秒调一次；
+// 若每次 render 都 addEventListener(() => ...)，闭包函数每次都是新引用，
+// 浏览器不会去重，监听器随渲染次数线性累加——点一次就触发 N 次（N 随卡片寿命增长）。
+// 委托挂在 root 上，root 本身不随 innerHTML 重建而消失，因此永远只有一个监听。
+root.addEventListener("click", (e) => {
+  const el = e.target && e.target.closest ? e.target.closest("[id]") : null;
+  if (!el) return;
+  const id = el.id;
+  if (id === "dl-fold") toggleFold();
+  else if (id === "dl-all") toggleAll();
+  else if (id === "dl-cancel") cancel();
+  else if (id === "dl-open") reveal("open");
+  else if (id === "dl-folder") reveal("select");
+  else if (id === "dl-copy") copyPath(currentTask && currentTask.filePath);
+  else if (id === "dl-retry") retry();
+});
 
 function renderFail(msg) {
   root.innerHTML = '<div class="dl"><div class="dl-error">' + esc(msg) + "</div></div>";
