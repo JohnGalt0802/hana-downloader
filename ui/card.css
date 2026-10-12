@@ -1,228 +1,186 @@
-/* card.css — 下载进度条卡片（两行：信息行 + 进度条行；进度百分比/大小放信息行右上角）
-   主题跟随重建版：页面自包含两套色板（浅/深），只按 data-hana-theme 的明暗二态切换。
-   不依赖宿主 CSS 变量注入，颜色全部由本页面定义。
-   2026-08-27：进度条独占一行拉满；百分比+大小移到上一行（信息行）右侧，放在按钮左边。 */
+/* card.css — 聊天流内的下载卡片（2026-10-12 重设计）
+   结构：左侧格式徽章 + 右侧（文件名 / 状态标签 / 副行）+ 动作区；进行中在底部加一条细进度条。
+   主题跟随：页面自包含两套色板（浅/深），按 body.t-dark 切换，不依赖宿主注入变量。
+   设计意图：在聊天流里自洽地表达「下载了什么」。旧版把折叠箭头、全选框、6 行详情表
+   全塞进两行高的卡里，真正的实体（文件名）反而看不见（URL 占满首行且被截断）。 */
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
-
-/* 四周硬边界：任何内容溢出不外扩，杜绝高度瞬时拱高（滚动条抖动根因） */
-html, body { overflow: hidden; }
-
-/* 卡片宽度：撑满 iframe 视口。
-   实测 iframe 视口 937px，但 #dl-root 只有 347px（块级容器没占满），
-   导致卡片只用了宿主给的三分之一宽。这里把根容器与 body 显式拉满，
-   上限交给宿主信封（width flexible, max=卡壳 clientWidth）。 */
-html, body { width: 100%; font-size: 11.5px; line-height: 1.25; } /* 2026-09-14 压薄：根字号/行高必须显式设，否则吃浏览器默认 14px/16.8px，行高压不下来 */
+html, body { overflow: hidden; width: 100%; }
 #dl-root { width: 100%; display: block; }
 
-/* ── 浅色板（默认）── 自包含暖纸色（实测宿主不注入 iframe CSS 变量，不能 var(--color-*)） */
+/* ── 浅色板 ── */
 :root {
-  --dl-text: #101012;
-  --dl-muted: #45484D;
+  --dl-text: #1F2328;
+  --dl-muted: #6B7280;
   --dl-accent: #3B82F6;
-  --dl-accent2: #8B5CF6;
-  --dl-green: #22C55E;
-  --dl-danger: #EF4444;
+  --dl-green: #16A34A;
+  --dl-danger: #DC2626;
   --dl-warn: #B45309;
-  --dl-bg: #FCFAF5;
-  --dl-tool-bg: rgba(0, 0, 0, 0.06);
-  --dl-overlay: rgba(0, 0, 0, 0.08);
-  --dl-track: rgba(0, 0, 0, 0.07);
-  --dl-detail-bg: rgba(0, 0, 0, 0.045);
+  --dl-tool-bg: rgba(0, 0, 0, 0.05);
+  --dl-track: rgba(0, 0, 0, 0.08);
+  --dl-badge-bg: rgba(0, 0, 0, 0.05);
 }
-
-/* ── 深色板（body.t-dark）── 自包含青夜色 */
+/* ── 深色板 ── */
 body.t-dark {
-  --dl-text: #E1EAF0;
-  --dl-muted: #B7C5CE;
+  --dl-text: #E6EDF3;
+  --dl-muted: #9AA7B4;
   --dl-accent: #7C9BFF;
-  --dl-accent2: #A78BFA;
   --dl-green: #4ADE80;
   --dl-danger: #F87171;
   --dl-warn: #FBBF24;
-  --dl-bg: #445560;
   --dl-tool-bg: rgba(255, 255, 255, 0.08);
-  --dl-overlay: rgba(255, 255, 255, 0.1);
-  --dl-track: rgba(255, 255, 255, 0.1);
-  --dl-detail-bg: rgba(255, 255, 255, 0.06);
+  --dl-track: rgba(255, 255, 255, 0.12);
+  --dl-badge-bg: rgba(255, 255, 255, 0.08);
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
-  font-size: 11.5px; /* 2026-09-14 压薄：原 14px，且它后写会盖掉顶部 html,body 那条根字号 */
-  line-height: 1.25; /* 锁定行高因子：消除字体差异导致的隐式高度波动 */
-  color: var(--dl-text, #101012);
-  background: transparent; /* 聊天流内嵌：透明融入消息流，高度贴合内容 */
-  padding: 0; /* 顶部与底部归零（2026-09-14 压薄：原 padding 0 0 3px）；左右 padding 已移交 .dl 内部 */
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--dl-text);
+  background: transparent;
+  padding: 0;
   min-height: 0;
 }
 
-.dl { display: flex; flex-direction: column; gap: 0; overflow: hidden; width: 100%; max-width: 100%; box-sizing: border-box; padding: 0 10px; }
-
-/* ── 第一行：左侧折叠按钮组 图标 文件名 徽标 速度/剩余 右上角进度 按钮 ── */
-.dl-row { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 0; flex-wrap: wrap; }
-/* 2026-09-14：本行现同时承载 折叠按钮组 | 徽标 | 速度·剩余·阶段(.dl-meta) | 操作按钮 */
-
-/* 文件名行已撤（用户要薄）；.dl-name 改用下方 L92 那条历史规则 */
-.dl-left { display: flex; gap: 2px; flex-shrink: 0; align-items: center; }
-.dl-fold {
-  width: 18px; height: 18px; padding: 0; border: none; cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 12px; line-height: 1;
-  color: var(--dl-text, #3B3D3F); background: transparent; border-radius: 4px;
-  transition: transform 0.18s ease, background 0.15s ease, color 0.15s ease;
-}
-.dl-all {
-  width: 18px; height: 18px; padding: 0; border: none; cursor: pointer;
-  position: relative; top: -2px; /* 补偿 U+25A1 字形基线偏低 */
-  display: flex; align-items: center; justify-content: center;
-  font-size: 16px; line-height: 1;
-  color: var(--dl-text, #3B3D3F); background: transparent; border-radius: 4px;
-  transition: transform 0.18s ease, background 0.15s ease, color 0.15s ease;
-}
-.dl-fold:hover, .dl-all:hover { background: var(--dl-overlay, rgba(0, 0, 0, 0.08)); }
-.dl-fold.open { transform: rotate(90deg); }
-.dl-all.open { transform: rotate(45deg); color: var(--dl-accent, #3B82F6); }
-
-.dl-icon {
-  flex-shrink: 0; width: 18px; height: 18px; border-radius: 5px;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--dl-tool-bg, rgba(0, 0, 0, 0.05));
-}
-.dl-icon svg { width: 12px; height: 12px; stroke: var(--dl-text, #3B3D3F); }
-
-.dl-name {
-  flex: 0 1 auto; min-width: 0; max-width: 46%;
-  font-size: 13.5px; font-weight: 600;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.dl-badge {
-  flex-shrink: 0;
-  font-size: 10.5px; line-height: 1; padding: 2px 6px; border-radius: 999px;
-  background: var(--dl-tool-bg, rgba(0, 0, 0, 0.06));
-  color: var(--dl-text, #3B3D3F);
-}
-.dl-badge.b-running { color: var(--dl-accent, #3B82F6); background: rgba(59, 130, 246, 0.12); }
-.dl-badge.b-stalled { color: var(--dl-warn, #B45309); background: rgba(245, 158, 11, 0.16); }
-.dl-badge.b-pending { color: var(--dl-text, #3B3D3F); }
-.dl-badge.b-done { color: var(--dl-green, #22C55E); background: rgba(34, 197, 94, 0.14); }
-.dl-badge.b-failed, .dl-badge.b-canceled, .dl-badge.b-interrupted { color: var(--dl-danger, #EF4444); background: rgba(239, 68, 68, 0.14); }
-
-.dl-meta {
-  flex: 1; min-width: 0;
-  font-size: 11.5px; line-height: 1.3; color: var(--dl-muted, #6B6F73);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  text-align: right;
-}
-/* 失败/中断原因占用同一位置（2026-09-14 上移），只改颜色 */
-.dl-meta.err { color: var(--dl-danger, #EF4444); }
-
-/* 进度数据组：百分比 + 已下载/总大小 + 速度，推到信息行右侧、紧邻按钮之前。
-   2026-09-17：从「进度条右侧」上移到进度条上面那行（信息行），速度也从 .dl-meta 并入本组。 */
-.dl-progress-top {
-  flex-shrink: 0;
-  display: flex; align-items: center; gap: 7px;
-  white-space: nowrap;
-}
-
-/* 首行的操作按钮组：推到最右，把固定宽度的空间用满 */
-.dl-row > .dl-btn:first-of-type { margin-left: auto; }
-
-/* 元信息行已撤销（2026-09-14）：速度·剩余·阶段已并入 .dl-row 的 .dl-meta，卡片从三行减为两行 */
-
-/* ── 按钮 ── */
-.dl-btn {
-  flex-shrink: 0;
-  border: none; cursor: pointer;
-  font-size: 11px; line-height: 1; padding: 2px 8px; border-radius: 5px;
-  background: var(--dl-tool-bg, rgba(0, 0, 0, 0.06));
-  color: var(--dl-text, #3B3D3F);
-  transition: background 0.15s ease;
-  white-space: nowrap;
-}
-.dl-btn:hover { background: var(--dl-overlay, rgba(0, 0, 0, 0.1)); }
-.dl-btn.primary { background: var(--dl-accent, #3B82F6); color: #FFFFFF; }
-.dl-btn.primary:hover { filter: brightness(1.08); }
-.dl-btn.danger { color: var(--dl-danger, #EF4444); }
-
-/* 图标按钮：完成态三个操作去文字改图标，宽度从 ~200px 降到 ~78px */
-.dl-btn.ico {
-  padding: 0; width: 18px; height: 18px;
-  display: flex; align-items: center; justify-content: center;
-}
-.dl-btn.ico svg {
-  width: 14px; height: 14px;
-  fill: none; stroke: currentColor; stroke-width: 1.7;
-  stroke-linecap: round; stroke-linejoin: round;
-}
-.dl-btn.ico.primary svg { stroke: #FFFFFF; }
-.dl-btn.ico.ok { color: var(--dl-green, #22C55E); }
-/* 卡片上的重试（圈箭头，2026-09-21）：点一下箭头转圈，直到任务离开终态。
-   转圈的意义就是「已提交、正在等它翻身」，停了就是没在等了。 */
-@keyframes dl-retry-spin { to { transform: rotate(360deg); } }
-.dl-btn.retry.spinning svg { animation: dl-retry-spin 0.9s linear infinite; }
-.dl-btn.retry[disabled] { opacity: 0.6; cursor: default; }
-
-/* ── 第二行：进度条（独占一行，拉满）──
-   2026-09-17：数据组上移到信息行后，本行只剩条本身，给一点上边距避免贴成下划线 */
-.dl-row2 { display: flex; align-items: center; min-width: 0; min-height: 0; gap: 7px; margin-top: 3px; }
-.dl-track {
-  flex: 1 1 auto; width: 100%; min-width: 0;
-  position: relative; height: 4px; border-radius: 999px;
-  background: var(--dl-track, rgba(0, 0, 0, 0.07));
+/* 卡片外框：背景与边框保持透明（宿主已给插件卡套了一层容器，本层再画会双层嵌套、显凹陷，2026-10-12），
+   但**内边距与呼吸感要保留**——它是卡内元素的排版基准，砍掉就贴边显挤（实测踩过）。 */
+.dl {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 12px 14px;
+  border-radius: 9px;
+  background: transparent;
+  border: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
   overflow: hidden;
+}
+
+/* ── 主体行：徽章 | 信息 | 动作 ── */
+.dl-main { display: flex; align-items: center; gap: 12px; min-width: 0; }
+
+/* 格式徽章：40×40 方章，色随类型 */
+.dl-badge-icon {
+  flex: 0 0 auto;
+  width: 40px; height: 40px;
+  border-radius: 8px;
+  background: var(--dl-badge-bg);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 0;
+  color: var(--dl-muted);
+}
+.dl-badge-icon .dl-badge-svg { display: flex; }
+.dl-badge-icon .dl-badge-svg svg { width: 18px; height: 18px; }
+.dl-badge-icon .dl-badge-ext {
+  font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
+  margin-top: 1px; line-height: 1;
+}
+/* 类型配色（浅色板的值；深色下同族但更亮一点） */
+.dl-badge-icon.k-archive { background: rgba(2, 132, 199, 0.12); color: #0284C7; }
+.dl-badge-icon.k-exe     { background: rgba(217, 119, 6, 0.14); color: #D97706; }
+.dl-badge-icon.k-pdf     { background: rgba(220, 38, 38, 0.12); color: #DC2626; }
+.dl-badge-icon.k-img     { background: rgba(139, 92, 246, 0.13); color: #8B5CF6; }
+.dl-badge-icon.k-vid     { background: rgba(236, 72, 153, 0.12); color: #DB2777; }
+.dl-badge-icon.k-aud     { background: rgba(13, 148, 136, 0.13); color: #0D9488; }
+.dl-badge-icon.k-code    { background: rgba(59, 130, 246, 0.12); color: #2563EB; }
+.dl-badge-icon.k-txt     { background: rgba(107, 114, 128, 0.13); color: #4B5563; }
+.dl-badge-icon.k-model   { background: rgba(124, 58, 237, 0.12); color: #7C3AED; }
+body.t-dark .dl-badge-icon.k-archive { color: #38BDF8; }
+body.t-dark .dl-badge-icon.k-exe     { color: #FBBF24; }
+body.t-dark .dl-badge-icon.k-pdf     { color: #F87171; }
+body.t-dark .dl-badge-icon.k-img     { color: #A78BFA; }
+body.t-dark .dl-badge-icon.k-vid     { color: #F472B6; }
+body.t-dark .dl-badge-icon.k-aud     { color: #2DD4BF; }
+body.t-dark .dl-badge-icon.k-code    { color: #7C9BFF; }
+body.t-dark .dl-badge-icon.k-txt     { color: #9AA7B4; }
+body.t-dark .dl-badge-icon.k-model   { color: #A78BFA; }
+
+/* 信息区：文件名 + 状态标签 / 副行 */
+.dl-info { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.dl-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dl-name {
+  flex: 0 1 auto; min-width: 0;
+  font-size: 13.5px; font-weight: 600; color: var(--dl-text);
+  letter-spacing: -0.1px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dl-sub {
+  font-size: 11.5px; color: var(--dl-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+.dl-sub.err { color: var(--dl-danger); }
+
+/* 状态标签：唯一的状态信号 */
+.dl-tag {
+  flex: 0 0 auto;
+  font-size: 10px; font-weight: 600; line-height: 1;
+  padding: 3px 7px; border-radius: 999px;
+  white-space: nowrap;
+}
+.dl-tag.run  { color: var(--dl-accent); background: color-mix(in srgb, var(--dl-accent) 14%, transparent); }
+.dl-tag.ok   { color: var(--dl-green); background: color-mix(in srgb, var(--dl-green) 15%, transparent); }
+.dl-tag.err  { color: var(--dl-danger); background: color-mix(in srgb, var(--dl-danger) 14%, transparent); }
+.dl-tag.warn { color: var(--dl-warn); background: color-mix(in srgb, var(--dl-warn) 16%, transparent); }
+.dl-tag.idle { color: var(--dl-muted); background: var(--dl-tool-bg); }
+/* 不支持 color-mix 的老引擎：退化为中性底 */
+@supports not (background: color-mix(in srgb, red 10%, transparent)) {
+  .dl-tag.run, .dl-tag.ok, .dl-tag.err, .dl-tag.warn { background: var(--dl-tool-bg); }
+}
+
+/* ── 动作区：固定锚在右侧，不因状态文字长短而抖动 ── */
+.dl-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; margin-left: auto; }
+.dl-btn {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; gap: 4px;
+  border: 1px solid var(--dl-track);
+  background: transparent;
+  color: var(--dl-text);
+  font-family: inherit; font-size: 11px; font-weight: 500; line-height: 1;
+  padding: 5px 9px; border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  white-space: nowrap;
+}
+.dl-btn:hover { background: var(--dl-tool-bg); }
+.dl-btn svg { width: 13px; height: 13px; }
+.dl-btn.icon { padding: 5px; }
+.dl-btn.primary {
+  background: var(--dl-accent); border-color: var(--dl-accent); color: #FFFFFF;
+}
+.dl-btn.primary:hover { filter: brightness(1.08); }
+
+/* ── 进度条：进行中才显示，独占一行 ── */
+.dl-progress { margin-top: 10px; }
+.dl-track {
+  position: relative; width: 100%; height: 4px;
+  border-radius: 999px; background: var(--dl-track); overflow: hidden;
 }
 .dl-bar {
   position: absolute; inset: 0 auto 0 0; width: 0%;
   border-radius: 999px;
-  background: linear-gradient(90deg, var(--dl-accent, #3B82F6), var(--dl-accent2, #8B5CF6));
+  background: var(--dl-accent);
   transition: width 0.45s ease;
 }
 .dl-bar.indet {
   width: 40% !important;
-  background: linear-gradient(90deg, transparent, var(--dl-accent, #3B82F6) 45%, var(--dl-accent2, #8B5CF6) 55%, transparent);
+  background: linear-gradient(90deg, transparent, var(--dl-accent) 45%, transparent);
   background-size: 200% 100%;
-  animation: slide 1.4s linear infinite;
+  animation: dl-slide 1.4s linear infinite;
 }
-.dl-bar.done { background: var(--dl-green, #22C55E); }
-.dl-bar.failed, .dl-bar.canceled, .dl-bar.interrupted { background: var(--dl-danger, #EF4444); }
-@keyframes slide { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+.dl-bar.err { background: var(--dl-danger); }
+@keyframes dl-slide { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
-.dl-pct {
-  flex-shrink: 0;
-  min-width: 35px; text-align: right;
-  font-size: 11.5px; font-weight: 700;
-  font-variant-numeric: tabular-nums; letter-spacing: -0.3px; line-height: 1;
+/* 失败态的整行提示（任务不存在等） */
+.dl-error {
+  color: var(--dl-danger); font-size: 12px; line-height: 1.5;
+  word-break: break-all; padding: 2px 4px;
 }
-.dl-size {
-  flex-shrink: 0;
-  min-width: 0; text-align: right;
-  font-size: 11px; color: var(--dl-muted, #6B6F73);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
+/* 操作反馈（打开失败 / 复制结果）追加在卡片下方 */
+.dl-hint {
+  color: var(--dl-muted); font-size: 11px; line-height: 1.4;
+  word-break: break-all; padding: 3px 4px 0;
 }
-/* 2026-09-17：速度从 .dl-meta 移出，并入数据组，排在百分比/大小之后 */
-.dl-speed {
-  flex-shrink: 0;
-  font-size: 11px; color: var(--dl-muted, #6B6F73);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-/* ── 详情区（折叠展开）── */
-.dl-detail {
-  display: none;
-  margin-top: 2px; padding: 6px 9px; border-radius: 6px;
-  background: var(--dl-detail-bg, rgba(0, 0, 0, 0.045));
-  font-size: 11.5px; line-height: 1.6; color: var(--dl-text, #3B3D3F);
-  max-height: none; /* 2026-08-31 二轮：高度全自适应，详情不再内部滚动封顶（原 max-height:360px;overflow-y:auto） */
-}
-.dl.expanded .dl-detail { display: block; }
-.dl-d-row { display: flex; gap: 8px; min-width: 0; }
-.dl-d-label { flex-shrink: 0; min-width: 30px; color: var(--dl-muted, #6B6F73); }
-.dl-d-value { min-width: 0; word-break: break-all; color: var(--dl-text, #3B3D3F); }
-
-/* ── 底部小字（路径/错误）── */
-.dl-hint { color: var(--dl-muted, #6B6F73); font-size: 11.5px; line-height: 1.4; word-break: break-all; }
-.dl-error { color: var(--dl-danger, #EF4444); font-size: 12px; line-height: 1.4; word-break: break-all; }
