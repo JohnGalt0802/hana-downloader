@@ -160,6 +160,7 @@ var timer = null;
 var FAST_MS = 300;   // 活跃期（引擎侧数据源 500ms 更新一轮）
 var IDLE_MS = 5000;  // 终态后的慢查，只为等「重试」把任务唤起
 var FINAL_STATES = { done: 1, failed: 1, canceled: 1, interrupted: 1 };
+var lostNotified = false; // 任务被清理后只提示一次（保留最后快照时）
 
 function schedule(ms) {
   if (timer) { clearInterval(timer); timer = null; }
@@ -171,10 +172,18 @@ async function poll() {
   try {
     const data = await engineFetch("wait", { taskId: taskId || null });
     if (!data || !data.ok) {
-      // 任务真的不存在（被删除，或引擎重启后没这条记录）：停掉轮询。
+      // 任务真的不存在（被管理器「清空/删除记录」，或引擎重启后没这条记录）：停掉轮询。
       // 注意与「终态」区别：终态要留着慢查等重试，任务没了就没得等了。
-      renderFail((data && data.error) || "任务不存在");
+      // 2026-10-12：不再把引擎的英文原始错误（"not found"）回显到卡片上。
       stop();
+      if (currentTask) {
+        // 卡片已渲染过、任务后来被清理：保留最后快照（只读，仍可折叠/查看路径/打开文件），
+        // 而不是把整张卡清成一行错误——那会让折叠等按钮一起消失，用户看到的就是「按钮按不动」。
+        if (!lostNotified) { lostNotified = true; renderHint("该记录已被清理，以下为最后快照"); }
+      } else {
+        // 首帧就没有对应记录（清理后再打开这张卡）：给一句中文交代。
+        renderFail("找不到该下载记录");
+      }
       return;
     }
     const t = data.task || data.snap;

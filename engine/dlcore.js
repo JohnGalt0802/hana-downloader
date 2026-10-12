@@ -13,7 +13,7 @@ import { startWingetProbe } from "./download-probe.js";
 import { createTunnelAgent } from "./tunnel-agent.js";
 
 const TASKS_FILE = "tasks.json";
-const MAX_TASKS = 64;
+// 任务记录持久化（2026-10-12 John 定）：不再按条数自动裁剪，见 _createTask / _persist / restore。
 const DEFAULT_MAX_CONCURRENT = 3; // 同时运行的任务数上限（0=不限）；管理器设置里可改
 const SPEED_SAMPLE_MS = 700;   // 测速采样间隔
 const SPEED_SAMPLES_MAX = 5;   // 滑动窗口样本数（≈3.5s）
@@ -197,13 +197,9 @@ class TaskManager {
   }
 
   _createTask({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, stallTimeoutMs = 30000, sessionPath = null, kind = "url", cmd = null, unit = "bytes", filePath: explicitPath = null, resumable = true, expectedSha256 = null, stallTaskId = null }) {
-    if (this.tasks.size >= MAX_TASKS) {
-      // 清理最老的已结束任务
-      for (const [id, t] of this.tasks) {
-        if (t.state !== "running" && t.state !== "pending") { this.tasks.delete(id); if (this.tasks.size < MAX_TASKS) break; }
-      }
-      if (this.tasks.size >= MAX_TASKS) throw new Error("下载任务过多，请稍后再试");
-    }
+    // 2026-10-12 John 定：任务记录是持久资产，不因数量自动清理——只有用户主动「清空记录 / 删除记录」
+    // 才移除。原先这里在超过 MAX_TASKS 时会删掉最老的终态记录，等于把用户在管理器里看到的历史悄悄抹掉。
+    // 并发由 _maxConcurrent + 队列（_pumpQueue）治理，与记录条数无关，故不再设总量上限。
 
     const dir = saveDir || this.downloadDir;
     fs.mkdirSync(dir, { recursive: true });
@@ -972,46 +968,35 @@ class TaskManager {
           resumable: isCmd ? false : (m.resumable !== false),
         });
       } else {
-        // 已完成/失败/取消的旧任务：仅保留 1 天内，用于卡片回放
-        const age = now - (m.finishedAt || m.startedAt || 0);
-        if (age < 24 * 3600 * 1000) {
-          // 历史 done 任务若 total 缺失（chunked 下载时代遗留数据）：用 received 兜底，回放卡片进度/大小正确
-          const hisTotal = (m.state === "done" && m.total == null && m.received > 0) ? m.received : (m.total || null);
-          this.tasks.set(m.taskId, {
-            taskId: m.taskId, url: m.url || "", fileName: m.fileName || "",
-            filePath: m.filePath || "", saveDir: m.saveDir || this.downloadDir,
-            state: m.state || "interrupted", total: hisTotal, received: m.received || 0,
-            speed: 0, startedAt: m.startedAt || now, finishedAt: m.finishedAt || now,
-            elapsed: m.elapsed || 0, error: m.error || null, cancelRequested: false, speedLimit: m.speedLimit || 0,
-            sessionId: m.sessionId || null, sessionPath: m.sessionPath || null, sessionRef: null, controller: null, pendingTimer: null, _samples: [],
-            stalledAt: m.stalledAt || null, stallNotified: false, _lastProgressAt: now,
-            kind: m.kind || "url", cmd: m.cmd || null, unit: m.unit || "bytes", child: null, stage: null, note: m.note || null,
-            partPath: m.partPath || (m.filePath ? m.filePath + ".part" : null),
-            etag: m.etag || null,
-            lastModified: m.lastModified || null,
-            acceptRanges: m.acceptRanges === true,
-            expectedSha256: m.expectedSha256 || null,
-            resumable: m.kind === "command" ? false : (m.resumable !== false),
-          });
-        }
+        // 已完成/失败/取消的历史任务：全量恢复、永久保留，供卡片回放与管理器查阅。
+        // 2026-10-12 John 定：不再只保留 24 小时内（原实现配合 _persist 的裁剪，
+        // 会让老记录在下一次写盘时被永久抹掉，用户看到历史凭空消失）。
+        // 历史 done 任务若 total 缺失（chunked 下载时代遗留数据）：用 received 兜底，回放卡片进度/大小正确
+        const hisTotal = (m.state === "done" && m.total == null && m.received > 0) ? m.received : (m.total || null);
+        this.tasks.set(m.taskId, {
+          taskId: m.taskId, url: m.url || "", fileName: m.fileName || "",
+          filePath: m.filePath || "", saveDir: m.saveDir || this.downloadDir,
+          state: m.state || "interrupted", total: hisTotal, received: m.received || 0,
+          speed: 0, startedAt: m.startedAt || now, finishedAt: m.finishedAt || now,
+          elapsed: m.elapsed || 0, error: m.error || null, cancelRequested: false, speedLimit: m.speedLimit || 0,
+          sessionId: m.sessionId || null, sessionPath: m.sessionPath || null, sessionRef: null, controller: null, pendingTimer: null, _samples: [],
+          stalledAt: m.stalledAt || null, stallNotified: false, _lastProgressAt: now,
+          kind: m.kind || "url", cmd: m.cmd || null, unit: m.unit || "bytes", child: null, stage: null, note: m.note || null,
+          partPath: m.partPath || (m.filePath ? m.filePath + ".part" : null),
+          etag: m.etag || null,
+          lastModified: m.lastModified || null,
+          acceptRanges: m.acceptRanges === true,
+          expectedSha256: m.expectedSha256 || null,
+          resumable: m.kind === "command" ? false : (m.resumable !== false),
+        });
       }
     }
   }
 
-  // ── 持久化（仅状态转换时调用，进度不落盘；终态任务只保留最近 100 条，防文件无限膨胀）──
+  // ── 持久化（仅状态转换时调用，进度不落盘）──
+  // 2026-10-12 John 定：终态记录全量保留，不再按条数裁剪——只有用户主动清理才移除。
   _persist() {
     try {
-      const KEEP_FINAL = 100;
-      const finalList = [];
-      for (const t of this.tasks.values()) {
-        if (t.state === "running" || t.state === "pending") continue;
-        finalList.push(t);
-      }
-      // 终态按结束时间倒序，保留最近 KEEP_FINAL 条；超出部分从内存删除（防无限增长）
-      finalList.sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0));
-      const overflow = finalList.slice(KEEP_FINAL);
-      for (const t of overflow) this.tasks.delete(t.taskId);
-
       const meta = {
         version: 3,
         updatedAt: Date.now(),
