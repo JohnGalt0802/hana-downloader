@@ -43,15 +43,13 @@ body {
   min-height: 0;
 }
 
-/* 卡片外框：**不再自带背景与边框**（2026-10-12）。
-   宿主已给插件卡套了一层卡片容器，本层再画一层背景+边框就成了“双层嵌套”，
-   视觉上像是卡片被按进凹槽。这里改为透明无边框，内容直接落在宿主容器上；
-   只保留内边距与圆角规则，供无宿主编译（离线预览）时也不至于贴边。 */
+/* 卡片外框：背景与边框保持透明（宿主已给插件卡套了一层容器，本层再画会双层嵌套、显凹陷，2026-10-12），
+   但**内边距与呼吸感要保留**——它是卡内元素的排版基准，砍掉就贴边显挤（实测踩过）。 */
 .dl {
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
-  padding: 2px 2px;
+  padding: 12px 14px;
   border-radius: 9px;
   background: transparent;
   border: none;
@@ -62,12 +60,12 @@ body {
 }
 
 /* ── 主体行：徽章 | 信息 | 动作 ── */
-.dl-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.dl-main { display: flex; align-items: center; gap: 12px; min-width: 0; }
 
 /* 格式徽章：40×40 方章，色随类型 */
 .dl-badge-icon {
   flex: 0 0 auto;
-  width: 38px; height: 38px;
+  width: 40px; height: 40px;
   border-radius: 8px;
   background: var(--dl-badge-bg);
   display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -75,9 +73,9 @@ body {
   color: var(--dl-muted);
 }
 .dl-badge-icon .dl-badge-svg { display: flex; }
-.dl-badge-icon .dl-badge-svg svg { width: 17px; height: 17px; }
+.dl-badge-icon .dl-badge-svg svg { width: 18px; height: 18px; }
 .dl-badge-icon .dl-badge-ext {
-  font-size: 8.5px; font-weight: 700; letter-spacing: 0.4px;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.4px;
   margin-top: 1px; line-height: 1;
 }
 /* 类型配色（浅色板的值；深色下同族但更亮一点） */
@@ -101,15 +99,16 @@ body.t-dark .dl-badge-icon.k-txt     { color: #9AA7B4; }
 body.t-dark .dl-badge-icon.k-model   { color: #A78BFA; }
 
 /* 信息区：文件名 + 状态标签 / 副行 */
-.dl-info { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.dl-title-row { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.dl-info { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.dl-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .dl-name {
   flex: 0 1 auto; min-width: 0;
-  font-size: 13px; font-weight: 600; color: var(--dl-text);
+  font-size: 13.5px; font-weight: 600; color: var(--dl-text);
+  letter-spacing: -0.1px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .dl-sub {
-  font-size: 11px; color: var(--dl-muted);
+  font-size: 11.5px; color: var(--dl-muted);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   font-variant-numeric: tabular-nums;
 }
@@ -155,7 +154,7 @@ body.t-dark .dl-badge-icon.k-model   { color: #A78BFA; }
 .dl-btn.primary:hover { filter: brightness(1.08); }
 
 /* ── 进度条：进行中才显示，独占一行 ── */
-.dl-progress { margin-top: 8px; }
+.dl-progress { margin-top: 10px; }
 .dl-track {
   position: relative; width: 100%; height: 4px;
   border-radius: 999px; background: var(--dl-track); overflow: hidden;

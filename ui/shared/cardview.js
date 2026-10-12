@@ -8,7 +8,7 @@
 // 反而看不见。新版只保留三件事：文件是谁（格式徽章 + 文件名）、到哪一步了
 // （状态标签 + 体积/速度/原因）、能做什么（打开/文件夹/取消/重试）。
 
-import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask } from "./display.js";
+import { unitSuffix, isPkgTask, isCountTask } from "./display.js";
 
 // ── 转义 ──
 function esc(s) {
@@ -118,7 +118,7 @@ export function renderCardHTML(t) {
   // ── 状态标签（唯一的状态信号，不再与百分比/进度条重复三次）──
   let tagCls = "run";
   let tagText = "";
-  if (done) { tagCls = "ok"; tagText = "已完成"; }
+  if (done) { tagCls = "ok"; tagText = "✓ 已完成"; }
   else if (running) {
     if (t.stalled) { tagCls = "warn"; tagText = "停滞"; }
     else { tagCls = "run"; tagText = known && pct != null ? Math.round(pct) + "%" : "下载中"; }
@@ -134,6 +134,9 @@ export function renderCardHTML(t) {
   if (done) {
     const parts = [];
     if (known) parts.push(count ? t.total + unitSuffix(unit) : fmtBytes(t.total));
+    // 来源主机：设计稿里副行是「体积 · 来源」，给产物一个出处（轻量、不抢眼）
+    const host = hostOf(t.url);
+    if (host) parts.push(host);
     if (t.note) parts.push(t.note);
     subText = parts.join(" · ") || "已完成";
   } else if (running) {
@@ -146,8 +149,6 @@ export function renderCardHTML(t) {
       const eta = fmtDuration((t.total - t.received) / t.speed);
       if (eta) parts.push("剩" + eta);
     }
-    if (t.stageDetail) parts.push(t.stageDetail);
-    else if (t.stage && STAGE_TEXT[t.stage]) parts.push(STAGE_TEXT[t.stage]);
     subText = parts.join(" · ") || "下载中…";
   } else if (pending) {
     // 副行不重复标签文案：标签已说「排队中/准备中」，这里给来源主机（可用信息）

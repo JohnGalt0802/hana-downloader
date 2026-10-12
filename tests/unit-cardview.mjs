@@ -91,9 +91,11 @@ console.log("── 副行：体积 / 速度 / 剩余 / 原因 ──");
   check("进行中显示 已下载/总量", has(r, "16.9MB") && has(r, "24.8MB") && has(r, "/"));
   check("进行中显示速度", has(r, "3.20MB/s"));
   check("进行中显示剩余时间", has(r, "剩"));
-  check("进行中显示阶段明细", has(r, "aria2 传输中 · 16 连接"));
+  // 阶段明细不再进副行（占半行、显挤）；改用体积·速度·剩余
+  check("进行中不再显示阶段明细", !has(r, "aria2 传输中"));
   const d = renderCardHTML(DONE);
   check("完成显示总体积", has(d, "24.8MB"));
+  check("完成显示来源主机", has(d, "github.com"));
   const f = renderCardHTML(FAILED);
   check("失败显示原因（换行压成空格）", has(f, "请求被中止 连接超时"));
   check("失败副行标 err", has(f, "dl-sub err"));

@@ -39,7 +39,7 @@ try { hana.theme?.subscribe?.(() => syncTheme()); } catch { /* 订阅不可用�
 // ── 尺寸上报 ──
 // 高度走 SDK 的 ui.resize；同时保留 hana.card-resize 这条顶层消息作兜底——
 // 0.970.9 聊天流挂载位的卡壳只认这一条高度消息（实测），SDK 那条在这条路径上没人接。
-var CARD_WIDTH = 400;
+var CARD_WIDTH = 560; // 2026-10-12：400 → 560（文件名常被截断；宿主信封上限 774px）
 
 function measureH() {
   const dlEl = document.querySelector(".dl");
