@@ -38,6 +38,10 @@ html, body {
   margin: 0 !important;
   padding: 0;
   overflow: hidden; /* 外层不滚动，内容由 .mgr-list 内部滚动 */
+  /* 2026-10-12：body 必须撑满视口。否则 body 高度=内容高（列表为空时很短），
+     绝对定位的设置菜单逸出 body 的部分会被上面的 overflow:hidden 直接裁断
+     （实测只看得见前 3 项；诊断：innerH=1138 而 bodyH 仅等于内容高）。 */
+  min-height: 100vh;
 }
 
 #dl-root {
@@ -123,11 +127,17 @@ html, body {
 }
 .mgr-settings-btn:hover { border-color: var(--mgr-accent, #4A6CF7); }
 .mgr-settings-menu {
+  /* 2026-10-12：菜单从齿轮下方展开（约 360px）。裁剪根因是 body 只有内容高，
+     超出部分被 html,body{overflow:hidden} 裁掉（修复见上方 body 的 min-height:100vh）。
+     这里加一个高度上限 + 内部滚动作为兼底：项再多也能在菜单内滚动看全。 */
   position: absolute;
   top: 36px;
-  right: 0; /* 齿轮在最右，菜单向左展开 */
+  right: 0;
   z-index: 50;
   min-width: 260px;
+  max-height: 480px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   background: var(--mgr-bg, #FFFFFF);
   border: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.12));
   border-radius: 10px;
