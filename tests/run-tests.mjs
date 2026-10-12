@@ -20,6 +20,7 @@ const SUITES = [
   ["unit-proxy-control.mjs", "代理控制扫描根（自定义优先 / 去重 / 过滤不存在）"],
   ["unit-probe.mjs", "winget 下载进度探测（本地 HTTP + 伪造下载目录）"],
   ["unit-display.mjs", "展示层单一来源（阶段/单位文案、任务形态判定、进度文案）"],
+  ["unit-cardview.mjs", "卡片标记生成（文件名主实体 / 状态唯一信号 / 无折叠面板 / 动作按状态）"],
   ["unit-download.mjs", "下载内核端到端（落盘 / SHA-256 校验 / 限速 / 记录清理）"],
   ["unit-queue.mjs", "并发队列与重试（排队放行 / 失败重跑 / 默认限速）"],
   ["unit-stall.mjs", "卡滞快照的落盘契约（起真引擎，验 sessionPath/stalledAt 带到 App 侧）"],
