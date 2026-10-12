@@ -530,10 +530,33 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
       if (open) {
         loadSettings(function () {
           var menu = wrap.querySelector(".mgr-settings-menu");
-          if (menu) renderSettingsOptions(menu);
+          if (menu) { renderSettingsOptions(menu); placeSettingsMenu(menu); }
         });
       }
     };
+    // 2026-10-12：菜单 position:fixed（见 CSS），不受 body 的 overflow 裁剪。
+    // fixed 失去 top/right 静态锚点，需按齿轮实际位置摆放并夹在视口内。
+    function placeSettingsMenu(menu) {
+      if (!menu) return;
+      var r = btn.getBoundingClientRect();
+      var mw = menu.offsetWidth || 260;
+      var mh = menu.offsetHeight || 360;
+      var vw = window.innerWidth || 400;
+      var vh = window.innerHeight || 600;
+      var left = r.right - mw;               // 右对齐齿轮，向左展开
+      if (left < 8) left = 8;
+      if (left + mw > vw - 8) left = vw - 8 - mw;
+      var top = r.bottom + 6;
+      var avail = vh - top - 8;              // 到视口底的可用高
+      if (avail < 160) {                     // 下方放不下：改向上展开
+        var upTop = r.top - mh - 6;
+        top = upTop >= 8 ? upTop : Math.max(8, vh - 8 - mh);
+        avail = vh - top - 8;
+      }
+      menu.style.maxHeight = Math.max(140, Math.min(mh, avail)) + "px";
+      menu.style.left = Math.max(8, left) + "px";
+      menu.style.top = top + "px";
+    }
     var menu = el("div", "mgr-settings-menu");
     wrap.appendChild(btn);
     wrap.appendChild(menu);

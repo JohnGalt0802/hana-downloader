@@ -38,10 +38,6 @@ html, body {
   margin: 0 !important;
   padding: 0;
   overflow: hidden; /* 外层不滚动，内容由 .mgr-list 内部滚动 */
-  /* 2026-10-12：body 必须撑满视口。否则 body 高度=内容高（列表为空时很短），
-     绝对定位的设置菜单逸出 body 的部分会被上面的 overflow:hidden 直接裁断
-     （实测只看得见前 3 项；诊断：innerH=1138 而 bodyH 仅等于内容高）。 */
-  min-height: 100vh;
 }
 
 #dl-root {
@@ -127,15 +123,14 @@ html, body {
 }
 .mgr-settings-btn:hover { border-color: var(--mgr-accent, #4A6CF7); }
 .mgr-settings-menu {
-  /* 2026-10-12：菜单从齿轮下方展开（约 360px）。裁剪根因是 body 只有内容高，
-     超出部分被 html,body{overflow:hidden} 裁掉（修复见上方 body 的 min-height:100vh）。
-     这里加一个高度上限 + 内部滚动作为兼底：项再多也能在菜单内滚动看全。 */
-  position: absolute;
-  top: 36px;
-  right: 0;
-  z-index: 50;
+  /* 2026-10-12：改 position:fixed。实测诊断：iframe 视口高 594，但 body 内容高仅 150，
+     absolute 的菜单（42~401）超出 body 的部分被 html,body{overflow:hidden} 裁掉
+     （只看得见前 3 项）。fixed 元素的包含块是视口，不受 body 的 overflow 裁剪
+     ——同行内下拉 .mgr-row-menu 的做法。位置由 JS 按齿轮位置摆放（fixed 失去静态锚点）。 */
+  position: fixed;
+  z-index: 1000;
   min-width: 260px;
-  max-height: 480px;
+  max-height: calc(100vh - 60px); /* 视口内上限 + 内部滚动，项再多也能看全 */
   overflow-y: auto;
   overscroll-behavior: contain;
   background: var(--mgr-bg, #FFFFFF);

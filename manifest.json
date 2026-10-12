@@ -40,7 +40,7 @@
         "description": "跨会话统一管理所有下载任务",
         "route": "/manager.html",
         "cardForm": "flush",
-        "realization": "page",
+        "realization": "card",
         "face": {
           "image": "face.png"
         }
