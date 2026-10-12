@@ -651,6 +651,15 @@ class TaskManager {
       const eff = buildEffectiveUrl(task.url, cfg.ghProxy);
       task.effectiveUrl = eff !== task.url ? eff : null;
 
+      // 代理：aria2 是独立进程，不继承引擎的进程环境，必须显式下发。
+      // 回环目标永不走代理（与原生后端一致）；其余交给 resolveProxy 按域名分流。
+      let a2proxy = "";
+      try {
+        const u = new URL(eff);
+        const loop = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(u.hostname) || /^127\./.test(u.hostname);
+        if (!loop) a2proxy = resolveProxy(this.dataDir, eff) || "";
+      } catch { /* URL 异常时不可代理 */ }
+
       // 临时文件与最终文件分离：aria2 写 <filePath>.part
       const outDir = task.saveDir;
       const outName = path.basename(task.filePath) + ".part";
@@ -663,7 +672,7 @@ class TaskManager {
       let addErr = null;
       let accepted = false;
       try {
-        const r = await a2.addUri(this.dataDir, { url: eff, dir: outDir, out: outName, gid });
+        const r = await a2.addUri(this.dataDir, { url: eff, dir: outDir, out: outName, gid, proxy: a2proxy });
         accepted = !!r;
       } catch (e) {
         addErr = e;

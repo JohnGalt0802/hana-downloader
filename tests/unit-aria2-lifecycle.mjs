@@ -106,6 +106,40 @@ try {
     await cleanupDir(d);
   }
 
+  console.log("── 6) hasGid 语义：终态不算活跃（否则重试会被自己挡死）──");
+  {
+    // 用本地源下载一个小文件到 complete 终态，再断言 hasGid 返回 false（= 可安全重试）。
+    // 刻意不用不可达域名：aria2 在 addUri 阶段会校验并拒绝某些 URL（“No URI to download”）。
+    const localSrc = http.createServer((req, res) => {
+      res.writeHead(200, { "Content-Length": "32" });
+      res.end(Buffer.alloc(32, 7));
+    });
+    await new Promise((r) => localSrc.listen(0, "127.0.0.1", r));
+    const srcUrl = `http://127.0.0.1:${localSrc.address().port}/tiny.bin`;
+
+    const d = freshDir({ aria2: { enabled: true, port: 6892, ...binOpt } });
+    const up = await aria2.ensureDaemon(d);
+    if (!up.ok) {
+      console.log("  SKIP  aria2 不可用，跳过 hasGid 语义");
+      await cleanupDir(d);
+    } else {
+      const gid = await aria2.addUri(d, { url: srcUrl, dir: d, out: "tiny.part", gid: "a1b2c3d4e5f60718" });
+      let st = "";
+      for (let i = 0; i < 40; i++) {
+        await sleep(250);
+        try { const r = await aria2.rpc(d, "aria2.tellStatus", [gid, ["status"]]); st = String(r.status); } catch { break; }
+        if (st === "error" || st === "complete" || st === "removed") break;
+      }
+      check("任务已落终态（complete/error/removed）", ["error", "complete", "removed"].includes(st), true);
+      const has = await aria2.hasGid(d, gid);
+      check("hasGid 对终态 gid 返回 false（可安全重试）", has, false);
+      const hasMissing = await aria2.hasGid(d, "ffffffffffffffff");
+      check("hasGid 对不存在的 gid 返回 false", hasMissing, false);
+      await cleanupDir(d);
+    }
+    try { localSrc.close(); } catch { /* 忽略 */ }
+  }
+
   console.log("── 5) restore() 对 aria2 任务分流（不删文件、不用 .part 长度）──");
   {
     const d = freshDir();

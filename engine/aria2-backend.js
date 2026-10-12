@@ -266,7 +266,7 @@ export const aria2 = {
 
   // 提交下载。返回 gid。out 由上层指定（形如 "<name>.part"），保证临时文件与最终文件分离。
   // 指定 gid 必须放在 options 里（key: gid）——实测传位置参数会报 “The parameter at 2 has wrong type”。
-  async addUri(dataDir, { url, dir, out, split, maxConn, minSplit, gid, extra } = {}) {
+  async addUri(dataDir, { url, dir, out, split, maxConn, minSplit, gid, proxy, extra } = {}) {
     const cfg = loadAria2Config(dataDir);
     const opts = {
       dir,
@@ -277,6 +277,9 @@ export const aria2 = {
       "check-certificate": "false",
       "allow-overwrite": "true",
       "auto-file-renaming": "false",
+      // HTTP/HTTPS 代理（engine 按目标域名解析后传入）。aria2 是独立进程，
+      // 不继承引擎的进程代理，不显式传它就会裸直连——国外源会 SSL 握手失败。
+      ...(proxy ? { "all-proxy": String(proxy) } : {}),
       ...(gid ? { gid: String(gid) } : {}), // 预分配 gid：便于提交结果不明时按 gid 对账
       ...(extra || {}),
     };
@@ -294,10 +297,19 @@ export const aria2 = {
   async forceRemove(dataDir, gid) {
     try { return await rpcCall(dataDir, "aria2.forceRemove", [gid]); } catch (e) { throw e; }
   },
-  // gid 是否仍存在于 aria2 视野（用于取消/提交歧义对账）
+  // gid 是否仍在 aria2 视野**且仍活跃**（用于取消/提交歧义对账）。
+  // 注意：返回 true 的含义是「仍会写文件」，不是「存在」——
+  // aria2 的 tellStatus 对已终态（complete/error/removed）的 gid 依然可查，
+  // 若把「存在」当「仍在跑」，失败任务的重试会被自己永远挡住（实测踩过）。
   async hasGid(dataDir, gid) {
-    try { await rpcCall(dataDir, "aria2.tellStatus", [gid, ["gid"]], 5000); return true; }
-    catch (e) { if (/not found|is not found/i.test(String(e?.message || ""))) return false; return null; } // null = 无法判定
+    try {
+      const r = await rpcCall(dataDir, "aria2.tellStatus", [gid, ["gid", "status"]], 5000);
+      const st = String(r?.status || "").toLowerCase();
+      return ["active", "waiting", "paused"].includes(st);
+    } catch (e) {
+      if (/not found|is not found/i.test(String(e?.message || ""))) return false;
+      return null; // null = 无法判定
+    }
   },
 };
 
