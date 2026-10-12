@@ -129,6 +129,8 @@ function pruneBindings(db) {
 // 那条宿主任务通道要 callToken，用不了）。stalledAt 用于 app 侧去重（同一任务两次卡滞是两件事）。
 const summarize = (t) => t ? ({
   taskId: t.taskId, state: t.state || t.status, fileName: t.fileName, url: t.url,
+  // [aria2-backend] 带上后端身份，供管理器/列表区分传输后端
+  backend: t.backend || "native",
   total: t.total ?? null, received: t.received ?? 0, filePath: t.filePath || null,
   error: t.error || null, canceledBy: t.canceledBy || null,
   cmdType: t.cmd?.type || null, note: t.note || null,
