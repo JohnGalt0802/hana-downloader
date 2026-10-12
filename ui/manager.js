@@ -639,6 +639,33 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
         .catch(function () { hint("设置失败：网络错误"); });
     };
 
+    // ── aria2 多线程加速（2026-10-12）─────────────────────
+    // 默认关闭：开启后新发起的 URL 下载走专属 aria2 实例（多线程分段）。
+    // 命令型任务（git/pnpm/winget/pip）不受影响；改设置只影响新任务。
+    var optAria2 = el("button", "mgr-settings-opt" + (settings.aria2 && settings.aria2.enabled ? " active" : ""),
+      "aria2 加速：" + (settings.aria2 && settings.aria2.enabled ? "已开启" : "已关闭"));
+    optAria2.title = "开启后 URL 下载走 aria2 多线程分段；需本机 aria2c（可在 engine-config.json 配置 aria2.bin）";
+    optAria2.onclick = function (e) {
+      e.stopPropagation();
+      var cur = !!(settings.aria2 && settings.aria2.enabled);
+      var next = Object.assign({}, settings.aria2 || {}, { enabled: !cur });
+      apiFetch("/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ aria2: next }),
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (data.ok) {
+            settings = data.settings;
+            optAria2.textContent = "aria2 加速：" + (!cur ? "已开启" : "已关闭");
+            optAria2.className = "mgr-settings-opt" + (!cur ? " active" : "");
+            hint(!cur ? "已开启 aria2 加速（对新下载生效）" : "已关闭 aria2 加速（新下载回原生内核）");
+          } else hint("设置失败：" + (data.error || "未知错误"));
+        })
+        .catch(function () { hint("设置失败：网络错误"); });
+    };
+
     // 数值型设置：内嵌输入框（App 卡片跑在宿主的 iframe 里，window.prompt 被屏蔽，点了没反应）
     // 0 一律表示「不限」：限速 0 = 不限速，并发 0 = 不限个数
     var opt3 = numberRow({
@@ -750,6 +777,7 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
     menu.appendChild(opt1);
     menu.appendChild(opt2);
     menu.appendChild(optProxy);
+    menu.appendChild(optAria2);
     menu.appendChild(optProxyCtl);
     menu.appendChild(optScan);
     menu.appendChild(optVerify);

@@ -19,10 +19,13 @@ const SUITES = [
   ["unit-proxy.mjs", "代理解析（proxy:false 直连 / noProxy 白名单 / 优先级）"],
   ["unit-proxy-control.mjs", "代理控制扫描根（自定义优先 / 去重 / 过滤不存在）"],
   ["unit-probe.mjs", "winget 下载进度探测（本地 HTTP + 伪造下载目录）"],
+  ["unit-aria2.mjs", "aria2 后端（状态映射 / errorCode 陷阱 / 提交与取消对账语义）"],
+  ["unit-aria2-lifecycle.mjs", "aria2 生命周期契约（后端确定 / 持久化身份 / 降级不假报 / restore 分流）"],
   ["unit-display.mjs", "展示层单一来源（阶段/单位文案、任务形态判定、进度文案）"],
   ["unit-download.mjs", "下载内核端到端（落盘 / SHA-256 校验 / 限速 / 记录清理）"],
   ["unit-queue.mjs", "并发队列与重试（排队放行 / 失败重跑 / 默认限速）"],
   ["unit-stall.mjs", "卡滞快照的落盘契约（起真引擎，验 sessionPath/stalledAt 带到 App 侧）"],
+  ["e2e-aria2-endpoint.mjs", "aria2 后端端到端（真 daemon + 本地 HTTP 源，起不来则跳过）"],
 ];
 
 function run(file) {

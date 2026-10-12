@@ -11,6 +11,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import { startWingetProbe } from "./download-probe.js";
 import { createTunnelAgent } from "./tunnel-agent.js";
+// [aria2-backend] 可选传输后端：专属 aria2 实例 + 多线程分段。见 engine/aria2-backend.js。
+import { loadAria2Config } from "./aria2-backend.js";
 
 const TASKS_FILE = "tasks.json";
 const MAX_TASKS = 64;
@@ -20,7 +22,9 @@ const SPEED_SAMPLES_MAX = 5;   // 滑动窗口样本数（≈3.5s）
 const CHUNK_SLEEP_MIN_MS = 1;  // 限速时 chunk 间最小等待
 
 let _instance = null;
-const MGR_VER = 23; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试）
+const MGR_VER = 24; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=aria2 传输后端）
+// [aria2-backend] 轮询 aria2 传输状态的间隔。
+const A2_POLL_MS = 500;
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -43,6 +47,10 @@ export function getTaskManager(dataDir) {
 /** 主要供测试/重置 */
 export function _resetTaskManager() {
   _instance = null;
+  // 必须同时清 globalThis 句柄：否则同一进程内换 dataDir 时会命中
+  // getTaskManager 的 globalThis 快路径，复用上一个目录的实例（测试里表现为
+  // 新 dataDir 下没有 tasks.json，而旧目录已被清理）。
+  try { delete globalThis.__dlTaskMgr; } catch { /* 忽略 */ }
 }
 
 class TaskManager {
@@ -98,7 +106,16 @@ class TaskManager {
 
   // ── 创建任务（可能排队，见 applyConfig）──
   create({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, stallTimeoutMs, sessionPath, kind = "url", cmd = null, unit = "bytes", filePath, resumable = true, expectedSha256 = null, stallTaskId = null }) {
-    const task = this._createTask({ url, fileName, saveDir, speedLimit: speedLimit || this._defaultSpeedLimit, sessionId, sessionRef, stallTimeoutMs, sessionPath, kind, cmd, unit, filePath, resumable, expectedSha256, stallTaskId });
+    // [aria2-backend] 后端在创建时确定并持久化：改配置只影响新任务，不影响在途任务。
+    // 只有 URL 下载可走 aria2；命令型（git/pnpm/winget/pip）永远走原生进程管理。
+    let backend = "native";
+    if (kind === "url") {
+      try {
+        const a2cfg = loadAria2Config(this.dataDir);
+        if (a2cfg.enabled && /^https?:/i.test(String(url || ""))) backend = "aria2";
+      } catch { /* 配置读取失败 → 原生后端 */ }
+    }
+    const task = this._createTask({ url, fileName, saveDir, speedLimit: speedLimit || this._defaultSpeedLimit, sessionId, sessionRef, stallTimeoutMs, sessionPath, kind, cmd, unit, filePath, resumable, expectedSha256, stallTaskId, backend });
     this._enqueueOrStart(task);
     return task;
   }
@@ -147,7 +164,9 @@ class TaskManager {
     task.controller = new AbortController();
     task._lastProgressAt = Date.now();
     this._persist();
-    this._run(task); // 后台执行，不等待
+    // [aria2-backend] 唯一的后端分流接缝：aria2 任务走平行执行路径，原生/命令型不变。
+    if (task.backend === "aria2") this._runAria2(task);
+    else this._run(task); // 后台执行，不等待
   }
 
   // 队列泵：按排队先后补足槽位。任务终态（_fireFinal）与设置放宽时各调一次。
@@ -196,7 +215,7 @@ class TaskManager {
     return { ok: true, taskId: t.taskId, state: t.state, queued: t.queued === true };
   }
 
-  _createTask({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, stallTimeoutMs = 30000, sessionPath = null, kind = "url", cmd = null, unit = "bytes", filePath: explicitPath = null, resumable = true, expectedSha256 = null, stallTaskId = null }) {
+  _createTask({ url, fileName, saveDir, speedLimit, sessionId, sessionRef, stallTimeoutMs = 30000, sessionPath = null, kind = "url", cmd = null, unit = "bytes", filePath: explicitPath = null, resumable = true, expectedSha256 = null, stallTaskId = null, backend = "native" }) {
     if (this.tasks.size >= MAX_TASKS) {
       // 清理最老的已结束任务
       for (const [id, t] of this.tasks) {
@@ -258,6 +277,13 @@ class TaskManager {
       acceptRanges: false,
       expectedSha256: expectedSha256 || null,
       resumable: kind === "command" ? false : (resumable !== false),
+      // [aria2-backend] 后端身份与传输身份。gid 在提交时分配；generation 每次执行自增，
+      // 用于拒绝上一轮迟到的轮询结果（避免旧 complete 污染重试后的状态）。
+      backend: kind === "command" ? "command" : (backend === "aria2" ? "aria2" : "native"),
+      gid: null,
+      generation: 0,
+      effectiveUrl: null,
+      transferPhase: null,
       _lastPersistAt: 0,
     };
     this.tasks.set(taskId, task);
@@ -581,6 +607,211 @@ class TaskManager {
     }
   }
 
+  // ── [aria2-backend] aria2 传输后端（URL 下载的多线程加速路径）──
+  //
+  // 边界（按评审定的档位）：
+  //   - 引擎决定谁能运行（槽位在 TaskManager），aria2 只负责传输与分段，不参与调度。
+  //   - 提交结果不明 / RPC 失联 / 取消未确认 → 停住并标 interrupted，交人工重试；
+  //     不自动降级、不假报成功（防止双写与误交付）。
+  //   - 传输写入 <filePath>.part，交付前做整文件校验，再改名；绝不按 .part 长度报进度。
+  async _runAria2(task) {
+    const a2 = (await import("./aria2-backend.js")).aria2;
+    const cfg = a2.config(this.dataDir);
+    // 提交前确认专属实例可用——此刻尚未提交任何东西，可安全降级到原生后端。
+    const up = await a2.ensureDaemon(this.dataDir, { log: (s) => { try { console.log(`[hd-engine] ${s}`); } catch {} } });
+    if (!up.ok) {
+      task.backend = "native";
+      this._persist();
+      return this._run(task); // 降级：交给原生后端（未产生任何 aria2 侧副作用）
+    }
+    return this._runAria2Transfer(task, a2, cfg);
+  }
+
+  async _runAria2Transfer(task, a2, cfg) {
+    task.generation = (task.generation || 0) + 1;
+    const myGen = task.generation;
+    task.transferPhase = "submitting";
+    task.cancelRequested = false;
+    task._lastProgressAt = Date.now();
+    task.acceptRanges = true;
+    this._startStallMonitor(task);
+    try {
+      // 重试场景：先确认上一轮 aria2 任务确实停了，否则并行写同一目标。
+      if (task.gid) {
+        const has = await a2.hasGid(this.dataDir, task.gid);
+        if (has === true) {
+          task.state = "interrupted";
+          task.error = "上一轮 aria2 任务仍在运行，未重新提交（请先取消或等待结束）";
+          task.finishedAt = Date.now();
+          return;
+        }
+      }
+
+      // gh-proxy 加速前缀（可选，仅 GitHub 直链；未配置则不启用）
+      const eff = buildEffectiveUrl(task.url, cfg.ghProxy);
+      task.effectiveUrl = eff !== task.url ? eff : null;
+
+      // 临时文件与最终文件分离：aria2 写 <filePath>.part
+      const outDir = task.saveDir;
+      const outName = path.basename(task.filePath) + ".part";
+      const partPath = path.join(outDir, outName);
+      const gid = randomUUID().replace(/-/g, "").slice(0, 16);
+      task.gid = gid;
+      task.partPath = partPath;
+      this._persist(); // 先落提交意图与预分配 gid，再调 addUri（提交结果不明时可按 gid 对账）
+
+      let addErr = null;
+      let accepted = false;
+      try {
+        const r = await a2.addUri(this.dataDir, { url: eff, dir: outDir, out: outName, gid });
+        accepted = !!r;
+      } catch (e) {
+        addErr = e;
+      }
+      if (!accepted) {
+        // 提交结果不明：先按 gid 对账，禁止立即重提交或降级。
+        const has = await a2.hasGid(this.dataDir, gid);
+        if (has !== true) {
+          task.state = "interrupted";
+          task.error = has === false
+            ? `aria2 未受理该任务：${addErr?.message || "提交失败"}`
+            : `提交结果不明，需人工确认后重试：${addErr?.message || "RPC 超时"}`;
+          task.finishedAt = Date.now();
+          return;
+        }
+        // has === true：其实已受理，继续轮询。
+      }
+
+      // ── 轮询传输 ──
+      task.transferPhase = "transferring";
+      const outcome = await this._pollAria2(task, a2, myGen);
+      if (outcome !== "transfer-complete") return; // 已在轮询/取消中定终态
+
+      // ── 交付：校验 → 改名 ──
+      task.transferPhase = "verifying";
+      task.stageDetail = "传输完成，校验中";
+      this._persist();
+      if (task.generation !== myGen) return; // 已被新尝试取代
+
+      if (task.expectedSha256) {
+        const digest = sha256File(partPath);
+        if (digest !== task.expectedSha256) {
+          task.state = "failed";
+          task.error = `SHA-256 校验失败：期望 ${task.expectedSha256}，实际 ${digest}`;
+          task.finishedAt = Date.now();
+          return;
+        }
+      }
+      task.transferPhase = "delivering";
+      try {
+        if (fs.existsSync(task.filePath)) {
+          // 不静默覆盖：另存并改写交付路径
+          let alt = task.filePath + ".1";
+          let n = 1;
+          while (fs.existsSync(alt)) { n += 1; alt = task.filePath + "." + n; }
+          fs.renameSync(partPath, alt);
+          task.filePath = alt;
+          task.fileName = path.basename(alt);
+        } else {
+          fs.renameSync(partPath, task.filePath);
+        }
+        task.state = "done";
+        task.error = null;
+      } catch (e) {
+        task.state = "failed";
+        task.error = "交付失败（改名）：" + friendlyError(e);
+      }
+      task.finishedAt = Date.now();
+    } catch (e) {
+      task.state = "interrupted";
+      task.error = "aria2 传输异常，需人工确认后重试：" + friendlyError(e);
+      task.finishedAt = Date.now();
+    } finally {
+      this._stopStallMonitor(task);
+      task.elapsed = (task.finishedAt || Date.now()) - (task.startedAt || Date.now());
+      task.speed = 0;
+      this._persist();
+      this._fireFinal(task);
+    }
+  }
+
+  // 轮询 aria2 传输状态，写回任务字段（snapshot 无需改动）。
+  // 返回 "transfer-complete" | "failed" | "canceled" | "interrupted" | "stale"。
+  async _pollAria2(task, a2, myGen) {
+    let rpcErrors = 0;
+    for (;;) {
+      if (task.generation !== myGen) return "stale"; // 已被新尝试取代，停止写入
+      if (task.cancelRequested) return this._doCancelAria2(task, a2);
+
+      let raw;
+      try {
+        raw = await a2.tellStatus(this.dataDir, task.gid);
+        rpcErrors = 0;
+      } catch (e) {
+        if (/not found/i.test(String(e?.message || ""))) {
+          task.state = "interrupted";
+          task.error = "aria2 任务已消失，无法确认结果，请重试";
+          task.finishedAt = Date.now();
+          return "interrupted";
+        }
+        rpcErrors += 1;
+        if (rpcErrors >= 3) {
+          task.state = "interrupted";
+          task.error = "与 aria2 通信中断，任务状态未确认，请重试";
+          task.finishedAt = Date.now();
+          return "interrupted";
+        }
+        await sleep(1000);
+        continue;
+      }
+
+      const st = a2.mapStatus(raw);
+      if (st.total != null) task.total = st.total;
+      task.received = st.received;
+      task.speed = st.speed;
+      task.stageDetail = st.connections > 1 ? `aria2 传输中 · ${st.connections} 连接` : "aria2 传输中";
+      task._lastProgressAt = Date.now();
+      if (task.stalledAt != null) { task.stalledAt = null; task.stallNotified = false; }
+      if (Date.now() - (task._lastPersistAt || 0) >= 1500) { task._lastPersistAt = Date.now(); this._persist(); }
+
+      if (st.transferState === "transfer-complete") return "transfer-complete";
+      if (st.transferState === "failed") {
+        task.state = "failed";
+        task.error = `aria2 传输失败（code ${st.errorCode}）${st.errorMessage ? "：" + st.errorMessage : ""}`;
+        task.finishedAt = Date.now();
+        return "failed";
+      }
+      if (st.transferState === "canceled") {
+        task.state = "canceled";
+        task.error = "已取消";
+        task.finishedAt = Date.now();
+        return "canceled";
+      }
+      await sleep(A2_POLL_MS);
+    }
+  }
+
+  // 取消 aria2 任务：请求移除 → 有界等待确认。未确认则停住（不假报取消成功）。
+  async _doCancelAria2(task, a2) {
+    try { await a2.remove(this.dataDir, task.gid); } catch { /* 可能已终态 */ }
+    try { await a2.forceRemove(this.dataDir, task.gid); } catch { /* 同上 */ }
+    const t0 = Date.now();
+    while (Date.now() - t0 < 5000) {
+      const has = await a2.hasGid(this.dataDir, task.gid);
+      if (has === false) {
+        task.state = "canceled";
+        task.error = "已取消";
+        task.finishedAt = Date.now();
+        return "canceled";
+      }
+      await sleep(400);
+    }
+    task.state = "interrupted";
+    task.error = "取消未确认：aria2 任务可能仍在运行，请检查后重试";
+    task.finishedAt = Date.now();
+    return "interrupted";
+  }
+
   // ── 命令型任务（git-clone / pnpm-install / winget-install / pip-install）──
   // 各链路的差异收在 COMMAND_SPECS 里（build / makeParser / classifyExit），这里只跑框架。
   async _runCommand(task) {
@@ -793,6 +1024,9 @@ class TaskManager {
     if (t.state !== "running") return { ok: false, error: "任务已结束" };
     t.canceledBy = source;
     t.cancelRequested = true;
+    // [aria2-backend] aria2 任务没有本地 AbortController：置取消意图后由轮询循环发起 remove
+    // 并等待确认（见 _doCancelAria2）。此处不假报成功。
+    if (t.backend === "aria2") return { ok: true };
     if (t.kind === "command" && t.child && t.child.pid) {
       // Windows 杀进程树；非 Windows 信号
       if (process.platform === "win32") {
@@ -832,6 +1066,7 @@ class TaskManager {
       elapsed: t.elapsed,
       error: t.error,
       kind: t.kind || "url",
+      backend: t.backend || "native",
       cmd: t.cmd || null,
       cmdType: t.cmd?.type || null,
       unit: t.unit || "bytes",
@@ -938,6 +1173,29 @@ class TaskManager {
     for (const m of meta.tasks) {
       const t = this.tasks.get(m.taskId);
       if (t) continue; // 内存中已有（create/prepare 后立即持久化过）
+      // [aria2-backend] aria2 任务重启后无法确认传输状态 → 停住待人工重试。
+      // 关键：绝不删除最终文件，也不用 .part 长度推算进度（多段下载会预分配到完整长度）。
+      if (m.backend === "aria2" && (m.state === "running" || m.state === "pending")) {
+        this.tasks.set(m.taskId, {
+          taskId: m.taskId, url: m.url || "", fileName: m.fileName || "",
+          filePath: m.filePath || "", saveDir: m.saveDir || this.downloadDir,
+          state: "interrupted", total: m.total || null, received: m.received || 0,
+          speed: 0, startedAt: m.startedAt || now, finishedAt: now, elapsed: 0,
+          error: "应用重启，aria2 任务状态未确认，请重试",
+          cancelRequested: false, speedLimit: m.speedLimit || 0,
+          sessionId: m.sessionId || null, sessionPath: m.sessionPath || null, sessionRef: null,
+          controller: null, pendingTimer: null, _samples: [],
+          stalledAt: null, stallNotified: false, _lastProgressAt: now,
+          kind: m.kind || "url", cmd: m.cmd || null, unit: m.unit || "bytes",
+          child: null, stage: null, note: null,
+          partPath: m.partPath || (m.filePath ? m.filePath + ".part" : null),
+          etag: null, lastModified: null, acceptRanges: true,
+          expectedSha256: m.expectedSha256 || null, resumable: true,
+          backend: "aria2", gid: m.gid || null, generation: m.generation || 0,
+          effectiveUrl: m.effectiveUrl || null, transferPhase: null,
+        });
+        continue;
+      }
       if (m.state === "running" || m.state === "pending") {
         const isCmd = m.kind === "command" && m.cmd?.type;
         if (isCmd) {
@@ -1023,6 +1281,10 @@ class TaskManager {
           error: t.error,
           canceledBy: t.canceledBy || null,
           kind: t.kind || "url",
+          backend: t.backend || "native",
+          gid: t.gid || null,
+          generation: t.generation || 0,
+          effectiveUrl: t.effectiveUrl || null,
           cmd: t.cmd || null,
           unit: t.unit || "bytes",
           note: t.note || null,
@@ -1241,6 +1503,36 @@ function uniquePath(p) {
     if (!fs.existsSync(candidate)) return candidate;
   }
   return path.join(dir, `${base} (${Date.now()})${ext}`);
+}
+
+// [aria2-backend] 整文件 SHA-256：aria2 由外部进程乱序写入，不能套用原生流式哈希。
+function sha256File(p) {
+  const h = createHash("sha256");
+  const fd = fs.openSync(p, "r");
+  try {
+    const buf = Buffer.alloc(1 << 20);
+    let n;
+    while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n));
+  } finally {
+    fs.closeSync(fd);
+  }
+  return h.digest("hex");
+}
+
+// [aria2-backend] gh-proxy 前缀：仅对可识别的 GitHub 直链启用，且不重复套用。
+// 未配置前缀（默认）时原样返回，代理始终是可选项而非必需依赖。
+function buildEffectiveUrl(url, ghProxy) {
+  const pre = String(ghProxy || "").trim();
+  if (!pre) return url;
+  const s = String(url || "");
+  if (s.startsWith(pre)) return s; // 防重复套
+  try {
+    const u = new URL(s);
+    if (!/^(github\.com|objects\.githubusercontent\.com|raw\.githubusercontent\.com)$/i.test(u.hostname)) return s;
+    return pre + s;
+  } catch {
+    return s;
+  }
 }
 
 function friendlyError(e) {
