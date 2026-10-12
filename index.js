@@ -659,7 +659,9 @@ export default defineApp(async (sdk) => {
               aspectRatio: "8:1",
               cardForm: "flush",
               preferredWidthPx: 400, // 2026-09-17：450 → 400
-              titlebar: null,
+              // 隐藏宿主给卡片画的标题栏（用户反馈：顶部那条「下载 https://...」不好看）。
+              // titleMode 是宿主 v2 的标题策略，合法值 auto / show / hide。
+              titleMode: "hide",
             },
             download: {
               taskId: r.taskId,
@@ -920,7 +922,8 @@ export default defineApp(async (sdk) => {
               aspectRatio: "8:1",
               cardForm: "flush",
               preferredWidthPx: 400, // 2026-09-17：450 → 400
-              titlebar: null,
+              // 与 download-file 一致：隐藏宿主卡片头（见上方说明）
+              titleMode: "hide",
             },
             download: {
               taskId: r.taskId,

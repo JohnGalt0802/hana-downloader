@@ -18,9 +18,7 @@ html, body { overflow: hidden; width: 100%; }
   --dl-warn: #B45309;
   --dl-tool-bg: rgba(0, 0, 0, 0.05);
   --dl-track: rgba(0, 0, 0, 0.08);
-  --dl-card-bg: rgba(0, 0, 0, 0.025);
-  --dl-card-border: rgba(0, 0, 0, 0.08);
-  --dl-badge-bg: rgba(0, 0, 0, 0.045);
+  --dl-badge-bg: rgba(0, 0, 0, 0.05);
 }
 /* ── 深色板 ── */
 body.t-dark {
@@ -32,8 +30,6 @@ body.t-dark {
   --dl-warn: #FBBF24;
   --dl-tool-bg: rgba(255, 255, 255, 0.08);
   --dl-track: rgba(255, 255, 255, 0.12);
-  --dl-card-bg: rgba(255, 255, 255, 0.05);
-  --dl-card-border: rgba(255, 255, 255, 0.10);
   --dl-badge-bg: rgba(255, 255, 255, 0.08);
 }
 
@@ -47,15 +43,18 @@ body {
   min-height: 0;
 }
 
-/* 卡片外框：低调的卡面色，跟随主题；圆角收敛，融进消息流 */
+/* 卡片外框：**不再自带背景与边框**（2026-10-12）。
+   宿主已给插件卡套了一层卡片容器，本层再画一层背景+边框就成了“双层嵌套”，
+   视觉上像是卡片被按进凹槽。这里改为透明无边框，内容直接落在宿主容器上；
+   只保留内边距与圆角规则，供无宿主编译（离线预览）时也不至于贴边。 */
 .dl {
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
-  padding: 9px 11px;
+  padding: 2px 2px;
   border-radius: 9px;
-  background: var(--dl-card-bg);
-  border: 1px solid var(--dl-card-border);
+  background: transparent;
+  border: none;
   display: flex;
   flex-direction: column;
   gap: 0;
@@ -138,7 +137,7 @@ body.t-dark .dl-badge-icon.k-model   { color: #A78BFA; }
 .dl-btn {
   flex: 0 0 auto;
   display: inline-flex; align-items: center; gap: 4px;
-  border: 1px solid var(--dl-card-border);
+  border: 1px solid var(--dl-track);
   background: transparent;
   color: var(--dl-text);
   font-family: inherit; font-size: 11px; font-weight: 500; line-height: 1;

@@ -315,7 +315,12 @@ const server = http.createServer(async (req, res) => {
         kind: "url",
       });
       log(`created ${t?.taskId} | ${b.url}`);
-      return send(200, { ok: true, taskId: t?.taskId, state: t?.state || t?.status });
+      // 返回 fileName / filePath：App 侧用 filename 作卡片标题与描述。
+      // 不返回的话 index.js 的 displayName 会落到 url（实测顶栏显示成一长串 URL）。
+      return send(200, {
+        ok: true, taskId: t?.taskId, state: t?.state || t?.status,
+        fileName: t?.fileName || null, filePath: t?.filePath || null, saveDir: t?.saveDir || null,
+      });
     } catch (e) {
       log(`create ERR ${e?.message || e}`);
       return send(500, { error: String(e?.message || e) });
