@@ -28,9 +28,9 @@ import {
 // HD_ENGINE_PORT 只作本机调试覆盖；默认值不再在这里重复写一个数字。
 const PORT = Number(process.env.HD_ENGINE_PORT || ENGINE_PORT);
 const READY_MARKER = "HD_ENGINE_READY";
-// /reveal 去重窗口（issue #2）：同一路径在此时长内重复请求只 spawn 一次。
+// /reveal 去重窗口（issue #2）：同一路径 + 同一动作在此时长内重复请求只 spawn 一次。
 const REVEAL_DEDUP_MS = 800;
-let lastReveal = { path: "", at: 0 };
+let lastReveal = { path: "", mode: "", at: 0 };
 // dataDir 由 app 经 args 传入（受管程序的 cwd 不保证指向 app 数据目录）
 const DATA_DIR = process.argv[2] || process.env.HD_ENGINE_DATA_DIR || process.cwd();
 const CFG_FILE = path.join(DATA_DIR, "engine-config.json");
@@ -461,16 +461,23 @@ const server = http.createServer(async (req, res) => {
     const b = await readBody();
     const p = b.filePath || b.path;
     if (!p) return send(400, { error: "filePath required" });
+    // 2026-10-12：mode 分流。前端早就传了 mode，但引擎先前忽略它、恒走 /select，
+    // 导致卡片「打开」与「文件夹」两个按钮行为完全相同（都只打开文件夹并选中文件）。
+    //   open   → 用默认关联程序打开文件本身（explorer 单参数即 shell-execute）
+    //   select → 在文件管理器中定位并选中文件（默认）
+    const mode = b.mode === "open" ? "open" : "select";
     const now = Date.now();
-    if (lastReveal.path === p && now - lastReveal.at < REVEAL_DEDUP_MS) {
-      log(`reveal deduped ${p} (${now - lastReveal.at}ms)`);
+    // 去重键含 mode：同一路径的不同动作（打开文件 / 定位文件夹）互不吞并
+    if (lastReveal.path === p && lastReveal.mode === mode && now - lastReveal.at < REVEAL_DEDUP_MS) {
+      log(`reveal deduped ${mode} ${p} (${now - lastReveal.at}ms)`);
       return send(200, { ok: true, deduped: true });
     }
-    lastReveal = { path: p, at: now };
+    lastReveal = { path: p, mode, at: now };
     try {
       const { spawn } = await import("node:child_process");
-      spawn("explorer.exe", ["/select,", p], { detached: true, stdio: "ignore" }).unref();
-      log(`reveal ${p}`);
+      const args = mode === "open" ? [p] : ["/select,", p];
+      spawn("explorer.exe", args, { detached: true, stdio: "ignore" }).unref();
+      log(`reveal ${mode} ${p}`);
       return send(200, { ok: true });
     } catch (e) {
       return send(500, { error: String(e?.message || e) });
