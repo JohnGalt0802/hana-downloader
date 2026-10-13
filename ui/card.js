@@ -58,15 +58,29 @@ function measureH() {
 
 var lastReportedH = 0;
 var terminalReported = false; // 终态补报只触发一次
+// 3.1（2026-10-13）：宽度探查窗口的截止时刻。>0 且未过期 = 窗口开着。
+// 0 = 关闭，此时去重行为与改动前完全一致（零额外开销）。窗口有上限，不会永久纠缠。
+var widthProbeUntil = 0;
+// 2026-10-13 补：探测放行的最小间隔。活跃期每 300ms 一次 render→reportSize，
+// 若无节流，窗口内宽度始终不对时会连发约 40 条同内容上报。这里限「探测最多每秒一次」。
+// 只约束 probing 放行的非 force 上报；force=true 完全不走这条路。
+var lastProbeSentAt = 0;
 function reportSize(force) {
   try {
     const h = measureH();
-    // 高度未变不重复上报（高频轮询下减负；宽度是常量，不参与变化判断）。
+    // 高度未变不重复上报（高频轮询下减负）。
     // force=true 时无视去重强制补报 —— 2026-10-06 实测：宿主在卡片加载期可能丢弃上报，
     // 若那一刻高度恰好已稳定，去重会让这张卡「永远不再上报」，尺寸就永久停在宿主
     // 默认值（撑满 + 变高）。这是个单向门，启动期与终态各强制补报几轮把它拆掉。
-    if (!force && h === lastReportedH) return;
+    // 2026-10-13：去重键纳入「宿主是否已采纳宽度」——切会话/iframe 重建后宿主尺寸 state
+    // 归零，而内容高度往往早已是稳定的终态值，只按高度去重会把纠正窗口白白吃掉。
+    // 探查窗内且宽度还不达标时照发；宿主采纳（宽度到位）或窗口过期后自动回到零开销。
+    const now = Date.now();
+    const widthOk = Math.abs(window.innerWidth - CARD_WIDTH) <= 2;
+    const probing = now < widthProbeUntil && !widthOk && (now - lastProbeSentAt >= 1000);
+    if (!force && h === lastReportedH && !probing) return;
     lastReportedH = h;
+    lastProbeSentAt = now;
     try { hana.ui?.resize?.({ height: h, width: CARD_WIDTH }); } catch { /* 老宿主没有这路 */ }
     try { window.parent.postMessage({ type: "hana.card-resize", height: h }, "*"); } catch { /* 同上 */ }
   } catch { /* 忽略 */ }
@@ -82,21 +96,45 @@ if (typeof ResizeObserver !== "undefined") {
 // 典型收敛：1~3 次补报内完成，之后不再打扰通道。
 (function bootSettle() {
   if (typeof setInterval !== "function") return;
+  // 3.2：启动期开探查窗（12s 上限）。重建/重载时这段重跑，窗口自然重开。
+  widthProbeUntil = Date.now() + 12000;
   const adopted = () => {
     try { return Math.abs(window.innerWidth - CARD_WIDTH) <= 2; } catch { return true; }
   };
-  reportSize(true); // 首帧立即来一次
+  let sent = 0; // 本轮已真实发出的强制上报次数（3.4 收兵判据之一）
+  reportSize(true); sent += 1; // 首帧立即来一次
   try {
     window.addEventListener("resize", () => { if (!adopted()) reportSize(true); });
   } catch { /* 事件不可用不影响主流程 */ }
   let n = 0;
   const timer = setInterval(() => {
     n += 1;
-    if (adopted()) { clearInterval(timer); return; } // 宿主已采纳，停止打扰
-    reportSize(true);
+    // 3.4（方案甲）：收兵需「宽度达标」且「已真实发出 ≥2 次上报」。
+    // 只看 |innerWidth-400|<=2 会误判：宽度可能是宿主上一轮的残留/巧合（窄列恰好≈400），
+    // 而本次上报其实没落地，一收兵就再无纠正机会。多发一次确认，代价仍在秒级。
+    if (adopted() && sent >= 2) { clearInterval(timer); return; } // 宿主已采纳，停止打扰
+    reportSize(true); sent += 1;
     if (n >= 6) clearInterval(timer); // 兜底上限：6 次检查（约 9 秒）
   }, 1500);
 })();
+
+// 3.3：re-show 强制补报（纯事件监听，零轮询）。覆盖「隐藏再显示」这条路径——
+// 宿主把卡片 park 后移回时 iframe 不重载，bootSettle 不会重跑，得靠这里重新开窗补报。
+var lastReshowAt = 0; // 连续触发（快速切会话）时合并，避免叠加 pending 的一次性定时器
+function onReshow() {
+  try {
+    if (document.visibilityState && document.visibilityState !== "visible") return;
+    const now = Date.now();
+    if (now - lastReshowAt < 400) return;
+    lastReshowAt = now;
+    widthProbeUntil = Date.now() + 12000;
+    [0, 400, 1500].forEach((d) => setTimeout(() => reportSize(true), d)); // 三个一次性定时器
+  } catch { /* 事件不可用不影响主流程 */ }
+}
+try {
+  document.addEventListener("visibilitychange", onReshow);
+  window.addEventListener("pageshow", onReshow);
+} catch { /* 事件不可用不影响主流程 */ }
 
 // ── 任务绑定 ──
 let taskId = "";
