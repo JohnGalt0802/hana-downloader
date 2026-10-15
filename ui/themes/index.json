@@ -1,0 +1,15 @@
+[
+  {
+    "id": "minimal",
+    "name": "极简",
+    "description": "默认主题。默认收起详情，信息行 + 一条进度，适合聊天流内快速扫读",
+    "author": "内置"
+  },
+  {
+    "id": "detail",
+    "name": "详细",
+    "description": "信息常驻，一眼看全；格式徽章 + 文件名 + 状态标签，适合文件管理场景",
+    "author": "onceblue59",
+    "planned": true
+  }
+]

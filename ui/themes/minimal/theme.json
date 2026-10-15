@@ -1,0 +1,54 @@
+{
+  "id": "minimal",
+  "name": "极简",
+  "description": "默认主题。默认收起详情，信息行 + 一条进度；取值逐条对应 ui/card.js 的 render() 与 ui/card.css 现值，是主题系统的回归基准",
+  "author": "内置",
+  "version": 1,
+
+  "layout": {
+    "fold": true,
+    "icon": "none",
+    "primary": "badge",
+    "fields": ["eta", "stage", "note"],
+    "fieldSep": " · ",
+    "progress": "row",
+    "progressWhenDone": true,
+    "density": "compact",
+    "actions": {
+      "active": ["cancel"],
+      "done": ["open", "folder"],
+      "failed": ["retry"]
+    }
+  },
+
+  "palette": {
+    "light": {
+      "text": "#101012",
+      "muted": "#45484D",
+      "accent": "#3B82F6",
+      "green": "#22C55E",
+      "danger": "#EF4444",
+      "warn": "#B45309",
+      "track": "rgba(0, 0, 0, 0.07)",
+      "surface": "rgba(0, 0, 0, 0.06)"
+    },
+    "dark": {
+      "text": "#E1EAF0",
+      "muted": "#B7C5CE",
+      "accent": "#7C9BFF",
+      "green": "#4ADE80",
+      "danger": "#F87171",
+      "warn": "#FBBF24",
+      "track": "rgba(255, 255, 255, 0.1)",
+      "surface": "rgba(255, 255, 255, 0.08)"
+    }
+  },
+
+  "metrics": {
+    "width": 400,
+    "radius": 0,
+    "padding": "0 10px",
+    "gap": 8,
+    "fontSize": 11.5
+  }
+}

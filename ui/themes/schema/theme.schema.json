@@ -1,0 +1,184 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://hana-downloader.local/theme.schema.json",
+  "title": "hana-downloader 卡片主题",
+  "description": "声明式卡片主题规范：主题是数据，不是代码。字段与取值集严格对应 docs/方案-声明式卡片主题系统-20261015.md 第四节。未知字段一律拒收（不静默忽略）；主题只能改 token 值，不能写任意 CSS 规则，不能引用外部资源。本文件不声明 default 关键字——生效默认值由 ui/shared/theme.js 的 DEFAULTS 提供（等于内置基线 minimal 的取值），避免两处默认值打架。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "name"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "主题唯一标识，kebab-case，本包内唯一"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "显示名（管理器里给用户看）"
+    },
+    "description": {
+      "type": "string",
+      "description": "一句话说明"
+    },
+    "author": {
+      "type": "string",
+      "description": "贡献者"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "主题自身版本，从 1 起"
+    },
+    "basedOn": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "基线主题 id，继承其未覆盖的字段"
+    },
+    "layout": { "$ref": "#/definitions/layout" },
+    "palette": { "$ref": "#/definitions/palette" },
+    "metrics": { "$ref": "#/definitions/metrics" }
+  },
+
+  "definitions": {
+    "layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "结构层：显示什么、怎么排、要不要折叠",
+      "properties": {
+        "fold": {
+          "type": "boolean",
+          "description": "是否启用折叠 + 详情面板"
+        },
+        "icon": {
+          "type": "string",
+          "enum": ["badge", "dot", "none"],
+          "description": "左侧图标形态：40×40 格式徽章 / 小状态徽章 / 不显示"
+        },
+        "primary": {
+          "type": "string",
+          "enum": ["name", "badge"],
+          "description": "主行首元素：文件名当主实体 / 状态徽章打头"
+        },
+        "fields": {
+          "type": "array",
+          "uniqueItems": true,
+          "description": "副行显示的附加字段，可调顺序；核心的状态与失败原因不受本数组控制",
+          "items": {
+            "type": "string",
+            "enum": ["size", "speed", "eta", "stage", "host", "note", "error"]
+          }
+        },
+        "fieldSep": {
+          "type": "string",
+          "minLength": 1,
+          "description": "字段间分隔符"
+        },
+        "progress": {
+          "type": "string",
+          "enum": ["row", "inline", "none"],
+          "description": "进度条位置：独占一行 / 与信息同行 / 不显示"
+        },
+        "progressWhenDone": {
+          "type": "boolean",
+          "description": "完成态是否保留进度条"
+        },
+        "density": {
+          "type": "string",
+          "enum": ["compact", "comfortable"],
+          "description": "间距与字号档"
+        },
+        "actions": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "各状态下显示哪些动作按钮；只能从各状态的允许集合里挑，不能新增动作",
+          "properties": {
+            "active": {
+              "type": "array",
+              "uniqueItems": true,
+              "description": "活跃态（排队 / 下载中）",
+              "items": { "type": "string", "enum": ["cancel"] }
+            },
+            "done": {
+              "type": "array",
+              "uniqueItems": true,
+              "description": "完成态",
+              "items": { "type": "string", "enum": ["open", "folder", "copy"] }
+            },
+            "failed": {
+              "type": "array",
+              "uniqueItems": true,
+              "description": "失败 / 取消 / 中断态",
+              "items": { "type": "string", "enum": ["retry"] }
+            }
+          }
+        }
+      }
+    },
+
+    "palette": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "样式层：明暗各一套 token，卡片按宿主明暗自动选一套；未给的 token 继承基线",
+      "properties": {
+        "light": { "$ref": "#/definitions/tokens" },
+        "dark": { "$ref": "#/definitions/tokens" }
+      }
+    },
+
+    "tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "text": { "$ref": "#/definitions/color" },
+        "muted": { "$ref": "#/definitions/color" },
+        "accent": { "$ref": "#/definitions/color" },
+        "green": { "$ref": "#/definitions/color" },
+        "danger": { "$ref": "#/definitions/color" },
+        "warn": { "$ref": "#/definitions/color" },
+        "track": { "$ref": "#/definitions/color" },
+        "surface": { "$ref": "#/definitions/color" }
+      }
+    },
+
+    "color": {
+      "type": "string",
+      "description": "只允许十六进制或 rgb/rgba/hsl/hsla 函数式颜色，不允许外部资源与任意 CSS",
+      "pattern": "^(#[0-9a-fA-F]{3,8}|(rgb|rgba|hsl|hsla)\\([^()]*\\))$"
+    },
+
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "尺寸层：卡片宽度、圆角、间距、字号",
+      "properties": {
+        "width": {
+          "type": "number",
+          "minimum": 320,
+          "maximum": 720,
+          "description": "卡片宽度 px（clamp 到 [320,720]，宿主信封上限 774）"
+        },
+        "radius": {
+          "type": "number",
+          "minimum": 0,
+          "description": "卡片外层圆角 px"
+        },
+        "padding": {
+          "type": "string",
+          "pattern": "^\\d+(\\.\\d+)?(px|em|rem|%|vh|vw)?( \\d+(\\.\\d+)?(px|em|rem|%|vh|vw)?){0,3}$",
+          "description": "CSS 内边距（1~4 个长度）"
+        },
+        "gap": {
+          "type": "number",
+          "minimum": 0,
+          "description": "主元素间距 px"
+        },
+        "fontSize": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "根字号 px"
+        }
+      }
+    }
+  }
+}

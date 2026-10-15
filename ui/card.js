@@ -7,11 +7,15 @@
 //   3. 任务身份不再靠「无参回退到最近任务」：加载后向引擎 /bind 认领本卡对应的任务，
 //      键是宿主铸造的 cardInstanceId（重新投影后不变，所以会话重载不会串）。
 //
-// 视觉层（配色板、类结构、图标、文案、折叠联动）沿用旧版，未改。
+// 视觉层（配色板、类结构、图标、文案、折叠联动）沿用旧版未改；
+// 自 P0（2026-10-15）起，HTML 内容生成改由声明式主题驱动（见 shared/cardview.js + shared/theme.js）。
 
 import { hana } from "./assets/sdk.js";
-// 阶段文案、计数单位与任务形态判定都有唯一来源（Node 侧 index.js 同用这个模块）
-import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask } from "./shared/display.js";
+// 渲染层（P0）：卡片内容由主题数据驱动的纯函数生成。
+// 阶段文案、计数单位与任务形态判定的唯一来源（display.js）随渲染逻辑一起收进了 cardview.js，
+// 本模块不再直接依赖它——免得同一条文案在两处各存一份。
+import { renderCardHTML } from "./shared/cardview.js";
+import { resolveTheme, DEFAULT_THEME_ID } from "./shared/theme.js";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -34,6 +38,63 @@ function syncTheme() {
 }
 syncTheme();
 try { hana.theme?.subscribe?.(() => syncTheme()); } catch { /* 订阅不可用就只保留首帧 */ }
+
+// ── 卡片主题（P0：声明式主题系统）──
+// 主题 = 数据（theme.json），由 ./shared/theme.js 合并继承成完整主题对象后交给 cardview 画。
+// 主题 id 的唯一来源是引擎设置里的 cardSkin；P0 阶段该字段通常不存在，
+// 此时回落内置默认（minimal）——即与改动前完全一致的现状。
+// 任一环节失败（设置读不到 / index.json 取不到 / theme.json 404 / JSON 解析报错）
+// 都静默回落内置 minimal，绝不白屏、绝不把异常抛给调用方：卡片外观是次要的，
+// 把任务状态渲染出来才是它的功能底线。
+var theme = resolveTheme({ id: DEFAULT_THEME_ID }, []); // 兜底：内置 minimal 的默认取值
+var allRawThemes = []; // 全部候选主题的原始定义（basedOn 继承链的查找表）
+
+/** 取一份 theme.json：先走相对 card.html 的包内路径，失败再试资产基址方式。 */
+async function fetchThemeJSON(relPath) {
+  // 包内相对路径（ui/ 快照随包分发，这条是主路径）
+  try {
+    const res = await fetch(new URL(relPath, import.meta.url).href, { cache: "no-store" });
+    if (res.ok) return await res.json();
+  } catch { /* 落到下一路 */ }
+  // 宿主经 hana-asset-base 暴露 ui 目录时的取法（老宿主/特殊挂载环境）
+  try {
+    const url = hana.assets?.url?.(relPath.replace(/^\.\//, ""));
+    if (url) {
+      const res = await fetch(url, { cache: "no-store" });
+      if (res.ok) return await res.json();
+    }
+  } catch { /* 两路都不可用 */ }
+  throw new Error("theme fetch failed: " + relPath);
+}
+
+/** 加载并解析当前主题；全部异常在此吞掉并回落内置 minimal（见上方说明）。 */
+async function loadTheme() {
+  // ① 取主题 id：设置读不到 / 字段缺失 / 老引擎没有该字段，一律用默认 id
+  let id = DEFAULT_THEME_ID;
+  try {
+    const res = await hana.api.fetch("/engine/settings");
+    const j = await res.json();
+    const skin = j && j.ok && j.settings ? j.settings.cardSkin : null;
+    if (typeof skin === "string" && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(skin)) id = skin;
+  } catch { /* 回落默认 id */ }
+
+  try {
+    // ② index.json 是全部候选主题清单，同时当 basedOn 继承链的查找表
+    const index = await fetchThemeJSON("./themes/index.json");
+    const ids = Array.isArray(index)
+      ? index.map((e) => e && e.id).filter((v) => typeof v === "string" && v)
+      : [];
+    // 逐个取原始主题（主题不多，且继承链可能指向清单里的任意一个）；单个取不到就跳过
+    const raws = await Promise.all(ids.map(async (tid) => {
+      try { return await fetchThemeJSON("./themes/" + tid + "/theme.json"); }
+      catch { return null; }
+    }));
+    allRawThemes = raws.filter(Boolean);
+    // ③ 交给 resolveTheme 合并继承；目标缺失（设置里的 id 包内不存在）则保持内置 minimal
+    const target = allRawThemes.find((r) => r && r.id === id);
+    if (target) theme = resolveTheme(target, allRawThemes);
+  } catch { /* 静默回落：theme 仍是内置 minimal */ }
+}
 
 // ── 尺寸上报 ──
 // 高度走 SDK 的 ui.resize；同时保留 hana.card-resize 这条顶层消息作兜底——
@@ -334,6 +395,17 @@ if (BC) {
       schedule(FAST_MS);
       poll();
     }
+    // P0 预留（为 P1 切主题铺路，P0 阶段没人发这条消息，因此零影响）：
+    // 管理器选定新主题后广播 skinChanged，在屏卡片重载主题并重绘。
+    if (d.type === "skinChanged") {
+      (async () => {
+        try {
+          await loadTheme();
+          render(currentTask);
+        } catch { /* 重载失败沿用旧主题，不打扰已渲染的卡片 */ }
+      })();
+      return;
+    }
   };
 }
 
@@ -359,7 +431,9 @@ function toggleAll() {
 // ── 渲染 ──
 var currentTask = null;
 
-// 阶段文案与计数单位来自 ui/shared/display.js（唯一来源），这里不再各存一份。
+// 阶段文案 / 计数单位 / 字节与时长格式化 / 状态徽标 / HTML 拼接，已全部搬到
+// ui/shared/cardview.js（由主题数据驱动的纯函数）。本模块只留一份 esc —— renderFail/renderHint
+// 是「找不到记录」这类旁路提示，不走 cardview，而 cardview 未导出 esc。
 
 function esc(s) {
   return String(s == null ? "" : s)
@@ -367,170 +441,26 @@ function esc(s) {
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-function fmtBytes(n) {
-  if (n == null) return "—";
-  if (n < 1024) return n + "B";
-  const units = ["KB", "MB", "GB", "TB"];
-  let v = n; let i = -1;
-  do { v /= 1024; i += 1; } while (v >= 1024 && i < units.length - 1);
-  return v.toFixed(v >= 100 ? 0 : v >= 10 ? 1 : 2) + units[i];
-}
-
-function fmtDuration(sec) {
-  if (sec < 60) return Math.max(1, Math.round(sec)) + "s";
-  if (sec < 3600) return Math.round(sec / 60) + "m";
-  return (sec / 3600).toFixed(1) + "h";
-}
-
-function stateBadge(s) {
-  return { running: "下载中", pending: "准备中", done: "完成", failed: "失败", canceled: "已取消", interrupted: "已中断", stalled: "停滞" }[s] || s;
-}
-
+// 渲染：状态判断、终态补报与 DOM 写入留在本模块（它们是行为，不是样式），
+// HTML 内容交给纯函数 renderCardHTML 按当前主题（theme）生成。
 function render(t) {
+  // ★硬约束：poll() 可能拿到 falsy 的 t（引擎回 ok 但没带任务快照）。
+  // renderCardHTML(null, …) 返回空串，若直接写 DOM 会把整张卡清空；
+  // 保留上一帧才是原行为（旧 render 也是这里的 if (!t) return）。
   if (!t) return;
   currentTask = t;
 
-  const state = t.state;
-  const running = state === "running";
-  const pending = state === "pending";
-  const done = state === "done";
-  const terminal = done || state === "failed" || state === "canceled" || state === "interrupted";
   // 终态切换时强制补报几轮：最后一次上报若被宿主丢弃，靠这几轮兜住（2026-10-06）
+  const terminal = FINAL_STATES[t.state] === 1;
   if (terminal && !terminalReported) {
     terminalReported = true;
     [0, 1000, 2500].forEach((d) => setTimeout(() => reportSize(true), d));
   }
-  // winget / pip 是阶段式任务：输出里没有百分比与字节数据，数字区按需收起（2026-09-18）
-  const pkgTask = isPkgTask(t);
-  const pct = t.percent;
-  const known = t.total != null && t.total > 0;
-  // 计数型单位（objects / packages / files）在 total 未知时不报 100%：分母本来就不存在（2026-09-19）
-  const pctText = done
-    ? (known || !isCountTask(t) ? "100%" : "—")
-    : (known ? (pct == null ? "0" : pct.toFixed(pct >= 100 ? 0 : 1)) + "%" : "—");
-  const unit = t.unit;
-  const sizeText = pending ? "—" : isCountTask(t)
-    ? (t.received != null ? t.received : 0) + (known ? "/" + t.total : "") + unitSuffix(unit)
-    : (done && known ? fmtBytes(t.total) : fmtBytes(t.received) + (known ? "/" + fmtBytes(t.total) : ""));
-  const speedText = running && t.speed > 0 ? fmtBytes(t.speed) + "/s" : "";
 
-  let etaText = "";
-  if (running && known && t.speed > 0) {
-    etaText = "剩" + fmtDuration(Math.max(0, (t.total - t.received) / t.speed));
-  }
-
-  const badge = stateBadge(state);
-  const badgeState = state === "running" && t.stalled ? "stalled" : state;
-  const barClass = "dl-bar"
-    + (pending || (!known && !terminal) ? " indet" : "")
-    + (done ? " done" : "")
-    + (state === "failed" || state === "canceled" || state === "interrupted" ? " failed" : "");
-  const barWidth = done ? 100 : (known && pct != null ? Math.min(100, pct) : 0);
-  const filePath = t.filePath || "";
-
-  // 2026-09-17：速度从 meta 里移出，与百分比/大小合成「数据组」，统一放到进度条上面那行。
-  const metaParts = [];
-  if (t.stalled && !terminal) metaParts.push("连接停滞，等待 Agent 决策");
-  if (etaText) metaParts.push(etaText);
-  if (pending) metaParts.push(t.queued ? "排队中…" : "准备中…");
-  // 计数型任务（pnpm 等）：优先显示真实计数明细，没有明细才退回阶段名（2026-09-19）
-  if (running && t.stageDetail) metaParts.push(t.stageDetail);
-  else if (running && t.stage && STAGE_TEXT[t.stage]) metaParts.push(STAGE_TEXT[t.stage]);
-  if (done && t.note) metaParts.push(t.note);
-  const metaText = metaParts.join(" · ");
-
-  let html = "";
-  html += '<div class="dl' + (expanded ? " expanded" : "") + '">';
-  html += '<div class="dl-row"><span class="dl-left">';
-  html += '<button class="dl-fold' + (expanded ? " open" : "") + '" id="dl-fold" title="展开/收起详情">❯</button>';
-  html += '<button class="dl-all' + (allExpanded ? " open" : "") + '" id="dl-all" title="展开/收起所有下载">□</button>';
-  html += "</span>";
-  html += '<span class="dl-badge b-' + badgeState + '">' + badge + "</span>";
-
-  // 失败/中断原因：放在进度条上面那行（信息行）里，红色短文本，超长省略；
-  // 全文在展开区的「状态」行。2026-09-14：原本独占卡片底部一行。
-  const errText = (state === "failed" || state === "canceled" || state === "interrupted")
-    ? (t.error || "下载失败") : "";
-  // 信息行：错误优先、其次阶段/备注；与徽标文案重复时省略（如 winget 下载阶段两处都是「下载中」）；
-  // 错误里的换行压成空格，避免撑破单行布局（全文仍在 title 里）
-  let lineText = errText ? errText.replace(/\s*\n\s*/g, " ") : metaText;
-  if (lineText === badge) lineText = "";
-  if (lineText) {
-    html += '<span class="dl-meta' + (errText ? " err" : "") + '"'
-      + (errText ? ' title="' + esc(errText) + '"' : "") + ">" + esc(lineText) + "</span>";
-  }
-
-  // 进度数据组（百分比 · 已下载/总量 · 速度）：2026-09-17 从进度条右侧上移到这一行（进度条上面那行），
-  // 紧邻操作按钮之前；进度条自己独占下面一行。
-  html += '<span class="dl-progress-top">';
-  // 阶段式任务（winget/pip）默认收起数字区；一旦有真实字节数据（下载探测到的进度）就照常显示
-  if (!pkgTask || done || known) html += '<span class="dl-pct">' + esc(pctText) + "</span>";
-  if (!pkgTask || known) html += '<span class="dl-size">' + esc(sizeText) + "</span>";
-  if (speedText) html += '<span class="dl-speed">' + esc(speedText) + "</span>";
-  html += "</span>";
-
-  if (pending || running) {
-    html += '<button class="dl-btn danger" id="dl-cancel">取消</button>';
-  } else if (done) {
-    if (pkgTask) {
-      // winget / pip 没有可打开的产物：完成态不给打开按钮
-    } else if (t.kind === "command") {
-      html += '<button class="dl-btn primary" id="dl-folder" title="打开目标目录">打开文件夹</button>';
-    } else {
-      html += '<button class="dl-btn primary" id="dl-open">打开</button>'
-        + '<button class="dl-btn" id="dl-folder" title="打开所在文件夹">文件夹</button>';
-    }
-  } else if (FINAL_STATES[t.state]) {
-    // 终态（失败 / 取消 / 中断）给一个圈箭头重试（2026-09-21）。
-    // 箭头转圈 = 已提交，等它翻身；停止由 poll 驱动，状态一变这个分支就不再走。
-    html += '<button class="dl-btn ico retry' + (retrying ? " spinning" : "") + '" id="dl-retry"'
-      + ' title="' + (retrying ? "重试中…" : "重试下载") + '"'
-      + (retrying ? " disabled" : "")
-      + '><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">'
-      + '<path d="M21 12a9 9 0 1 1-3.2-6.9"/><polyline points="21 4 21 10 15 10"/></svg>'
-      + "</button>";
-  }
-  html += "</div>";
-
-  // 进度条独占一行（2026-09-17）：数据组已上移，这里只留条本身。
-  html += '<div class="dl-row2">';
-  html += '<div class="dl-track"><div class="' + barClass + '" style="width:' + barWidth + '%"></div></div>';
-  html += "</div>";
-
-  // 第三行已撤销（2026-09-14）：metaText 已并入上方信息行。
-
-  html += '<div class="dl-detail">';
-  html += '<div class="dl-d-row"><span class="dl-d-label">文件</span><span class="dl-d-value">' + esc(t.fileName || "—") + "</span></div>";
-  if (filePath) html += '<div class="dl-d-row"><span class="dl-d-label">路径</span><span class="dl-d-value">' + esc(filePath) + "</span></div>";
-  html += '<div class="dl-d-row"><span class="dl-d-label">操作</span><span class="dl-d-value">'
-    + '<button class="dl-btn dl-copy" id="dl-copy">复制路径</button></span></div>';
-  if (known) {
-    const count = isCountTask(t);
-    let sizeDetail = count
-      ? t.total + unitSuffix(unit)
-      : fmtBytes(t.total);
-    if (running && t.received != null) {
-      sizeDetail += (count ? "（已完成 " + t.received + "）" : "（已下载 " + fmtBytes(t.received) + "）");
-    }
-    // 计数型（packages/objects/files）的“大小”其实是计数，标签跟着改（2026-09-19）
-    html += '<div class="dl-d-row"><span class="dl-d-label">' + (count ? "数量" : "大小") + '</span><span class="dl-d-value">' + esc(sizeDetail) + "</span></div>";
-  }
-  html += '<div class="dl-d-row"><span class="dl-d-label">任务</span><span class="dl-d-value">' + esc(t.taskId || taskId) + "</span></div>";
-  html += '<div class="dl-d-row"><span class="dl-d-label">状态</span><span class="dl-d-value">' + esc(badge) + (metaText ? "（" + esc(metaText) + "）" : "") + "</span></div>";
-  if (running && known && t.speed > 0 && t.received < t.total) {
-    const remainSec = Math.max(0, (t.total - t.received) / t.speed);
-    const etaAbs = new Date(Date.now() + remainSec * 1000);
-    html += '<div class="dl-d-row"><span class="dl-d-label">预计</span><span class="dl-d-value">'
-      + String(etaAbs.getHours()).padStart(2, "0") + ":" + String(etaAbs.getMinutes()).padStart(2, "0")
-      + " 完成（剩" + fmtDuration(remainSec) + "）</span></div>";
-  }
-  html += "</div>";
-
-  // 错误行已上移到信息行（2026-09-14），此处不再重复渲染。
-  html += "</div>";
-
+  // 折叠态 / 重试态 / 任务 id 由本模块持有（render 每次重写 DOM，状态得留在外面），
+  // 经 opts 传给纯函数，使其不读任何全局状态。
+  const html = renderCardHTML(t, theme, { expanded, allExpanded, retrying, taskId });
   if (root.innerHTML !== html) root.innerHTML = html;
-
   reportSize();
   // 按钮事件不在这里绑定——render 会被轮询反复调用，每次新建的箭头函数会让
   // addEventListener 在同一节点上不断累加（终态 html 稳定、DOM 不重建，最终演变为
@@ -583,6 +513,8 @@ window.addEventListener("load", () => setTimeout(reportSize, 60));
 //         留着它等于自己给通道加负担。
 
 (async () => {
-  await bindTask();
+  // 主题加载与 bindTask 并行（两者互不依赖），主题就在 bindTask 内部那段等待里抓好，
+  // 不给首帧增加额外延迟；失败已在 loadTheme 内部吸掉，theme 仍是内置 minimal。
+  await Promise.all([bindTask(), loadTheme()]);
   await poll(); // poll 内部按任务状态排好后续节奏，这里不再另起 setInterval
 })();

@@ -1,0 +1,139 @@
+{
+  "note": "改动前基准：由 tests/tools/make-golden.mjs 从 git show main:ui/card.js 的 render() 机械提取后，对 cardview-cases.json 全部 fixture 冻结的 HTML 快照。时间冻结在 2026-10-15 20:58:00。opts 为各 fixture 首帧默认态（taskId 取 task.taskId）。",
+  "frozenNow": "2026-10-15T20:58:00+08:00",
+  "source": "main:ui/card.js",
+  "cases": [
+    {
+      "id": "running-known",
+      "desc": "下载中·总量已知（有百分比/大小/速度，且触发详情面板的预计完成时刻）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-run-known"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-running\">下载中</span><span class=\"dl-meta\">剩4s</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">50.0%</span><span class=\"dl-size\">512KB/1.00MB</span><span class=\"dl-speed\">128KB/s</span></span><button class=\"dl-btn danger\" id=\"dl-cancel\">取消</button></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar\" style=\"width:50%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">ubuntu-24.04.iso</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">路径</span><span class=\"dl-d-value\">D:\\Downloads\\ubuntu-24.04.iso</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">大小</span><span class=\"dl-d-value\">1.00MB（已下载 512KB）</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-run-known</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">下载中（剩4s）</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">预计</span><span class=\"dl-d-value\">20:58 完成（剩4s）</span></div></div></div>"
+    },
+    {
+      "id": "running-unknown",
+      "desc": "下载中·总量未知（无百分比，进度条走 indeterminate）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-run-unknown"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-running\">下载中</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">—</span><span class=\"dl-size\">3.00MB</span><span class=\"dl-speed\">256KB/s</span></span><button class=\"dl-btn danger\" id=\"dl-cancel\">取消</button></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar indet\" style=\"width:0%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">big-file.bin</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">路径</span><span class=\"dl-d-value\">D:\\Downloads\\big-file.bin</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-run-unknown</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">下载中</span></div></div></div>"
+    },
+    {
+      "id": "running-stalled",
+      "desc": "下载中·停滞（徽标转为 b-stalled，信息行给出停滞交代）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-run-stalled"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-stalled\">下载中</span><span class=\"dl-meta\">连接停滞，等待 Agent 决策</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">25.0%</span><span class=\"dl-size\">256KB/1.00MB</span></span><button class=\"dl-btn danger\" id=\"dl-cancel\">取消</button></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar\" style=\"width:25%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">slow.zip</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">路径</span><span class=\"dl-d-value\">D:\\Downloads\\slow.zip</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">大小</span><span class=\"dl-d-value\">1.00MB（已下载 256KB）</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-run-stalled</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">下载中（连接停滞，等待 Agent 决策）</span></div></div></div>"
+    },
+    {
+      "id": "pending-queued",
+      "desc": "准备中·排队（size 显示 —，信息行给排队中）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-pending-queued"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-pending\">准备中</span><span class=\"dl-meta\">排队中…</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">—</span><span class=\"dl-size\">—</span></span><button class=\"dl-btn danger\" id=\"dl-cancel\">取消</button></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar indet\" style=\"width:0%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">queued.iso</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-pending-queued</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">准备中（排队中…）</span></div></div></div>"
+    },
+    {
+      "id": "done-url",
+      "desc": "完成·普通下载（有 filePath 与 total，终态进度条 100% 且带 done 类，给打开+文件夹）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-done-url"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-done\">完成</span><span class=\"dl-meta\">来自 example.com</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">100%</span><span class=\"dl-size\">5.00MB</span></span><button class=\"dl-btn primary\" id=\"dl-open\">打开</button><button class=\"dl-btn\" id=\"dl-folder\" title=\"打开所在文件夹\">文件夹</button></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar done\" style=\"width:100%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">report.pdf</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">路径</span><span class=\"dl-d-value\">D:\\Downloads\\report.pdf</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">大小</span><span class=\"dl-d-value\">5.00MB</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-done-url</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">完成（来自 example.com）</span></div></div></div>"
+    },
+    {
+      "id": "done-command",
+      "desc": "完成·命令型（kind=command，只给打开文件夹、不给打开文件）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-done-command"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-done\">完成</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">100%</span><span class=\"dl-size\">0B</span></span><button class=\"dl-btn primary\" id=\"dl-folder\" title=\"打开目标目录\">打开文件夹</button></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar done\" style=\"width:100%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">myrepo</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">路径</span><span class=\"dl-d-value\">D:\\Downloads\\myrepo</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-done-command</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">完成</span></div></div></div>"
+    },
+    {
+      "id": "done-pkg-winget",
+      "desc": "完成·包安装（winget，无产物：打开/文件夹都不给；数字区按阶段收起）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-done-pkg-winget"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-done\">完成</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">100%</span></span></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar done\" style=\"width:100%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">Notepad++.Notepad++</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-done-pkg-winget</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">完成</span></div></div></div>"
+    },
+    {
+      "id": "done-pkg-pip",
+      "desc": "完成·包安装（pip，同上，且阶段文案走 STAGE_TEXT）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-done-pkg-pip"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-done\">完成</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">100%</span></span></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar done\" style=\"width:100%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">requests</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-done-pkg-pip</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">完成</span></div></div></div>"
+    },
+    {
+      "id": "done-count-objects",
+      "desc": "完成·计数型（unit=objects，大小行标签改为「数量」并带单位后缀）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-done-count-objects"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-done\">完成</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">100%</span><span class=\"dl-size\">9/9 对象</span></span><button class=\"dl-btn primary\" id=\"dl-folder\" title=\"打开目标目录\">打开文件夹</button></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar done\" style=\"width:100%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">big-repo</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">路径</span><span class=\"dl-d-value\">D:\\Downloads\\big-repo</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">数量</span><span class=\"dl-d-value\">9 对象</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-done-count-objects</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">完成</span></div></div></div>"
+    },
+    {
+      "id": "failed-error",
+      "desc": "失败·带 error（信息行红色 + title 存全文，换行压成空格；给重试圈箭头）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-failed-error"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-failed\">失败</span><span class=\"dl-meta err\" title=\"网络超时\n连接被重置\">网络超时 连接被重置</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">0.1%</span><span class=\"dl-size\">1.00KB/1.00MB</span></span><button class=\"dl-btn ico retry\" id=\"dl-retry\" title=\"重试下载\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 12a9 9 0 1 1-3.2-6.9\"/><polyline points=\"21 4 21 10 15 10\"/></svg></button></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar failed\" style=\"width:0.1%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">broken.zip</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">大小</span><span class=\"dl-d-value\">1.00MB</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-failed-error</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">失败</span></div></div></div>"
+    },
+    {
+      "id": "canceled",
+      "desc": "已取消·无 error（信息行回落到默认「下载失败」文案，给重试）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-canceled"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-canceled\">已取消</span><span class=\"dl-meta err\" title=\"下载失败\">下载失败</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">25.0%</span><span class=\"dl-size\">256KB/1.00MB</span></span><button class=\"dl-btn ico retry\" id=\"dl-retry\" title=\"重试下载\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 12a9 9 0 1 1-3.2-6.9\"/><polyline points=\"21 4 21 10 15 10\"/></svg></button></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar failed\" style=\"width:25%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">stopped.iso</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">路径</span><span class=\"dl-d-value\">D:\\Downloads\\stopped.iso</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">大小</span><span class=\"dl-d-value\">1.00MB</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-canceled</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">已取消</span></div></div></div>"
+    },
+    {
+      "id": "interrupted",
+      "desc": "已中断·带 error（重试态：spinning + disabled，由 opts.retrying 驱动）",
+      "opts": {
+        "expanded": false,
+        "allExpanded": false,
+        "retrying": false,
+        "taskId": "t-interrupted"
+      },
+      "html": "<div class=\"dl\"><div class=\"dl-row\"><span class=\"dl-left\"><button class=\"dl-fold\" id=\"dl-fold\" title=\"展开/收起详情\">❯</button><button class=\"dl-all\" id=\"dl-all\" title=\"展开/收起所有下载\">□</button></span><span class=\"dl-badge b-interrupted\">已中断</span><span class=\"dl-meta err\" title=\"引擎重启，任务中断\">引擎重启，任务中断</span><span class=\"dl-progress-top\"><span class=\"dl-pct\">25.0%</span><span class=\"dl-size\">512KB/2.00MB</span></span><button class=\"dl-btn ico retry\" id=\"dl-retry\" title=\"重试下载\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M21 12a9 9 0 1 1-3.2-6.9\"/><polyline points=\"21 4 21 10 15 10\"/></svg></button></div><div class=\"dl-row2\"><div class=\"dl-track\"><div class=\"dl-bar failed\" style=\"width:25%\"></div></div></div><div class=\"dl-detail\"><div class=\"dl-d-row\"><span class=\"dl-d-label\">文件</span><span class=\"dl-d-value\">half.bin</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">路径</span><span class=\"dl-d-value\">D:\\Downloads\\half.bin</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">操作</span><span class=\"dl-d-value\"><button class=\"dl-btn dl-copy\" id=\"dl-copy\">复制路径</button></span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">大小</span><span class=\"dl-d-value\">2.00MB</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">任务</span><span class=\"dl-d-value\">t-interrupted</span></div><div class=\"dl-d-row\"><span class=\"dl-d-label\">状态</span><span class=\"dl-d-value\">已中断</span></div></div></div>"
+    }
+  ]
+}

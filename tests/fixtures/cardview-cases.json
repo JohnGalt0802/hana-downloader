@@ -1,0 +1,328 @@
+{
+  "note": "cardview 纯函数的验收 fixture 集（P0 · W2，2026-10-15）。覆盖各状态与形态分支；每条含 id / desc / task / expect。expect.contains 为必须出现的子串，expect.notContains 为必须缺席的子串，expect.badge 为期望的状态徽标文本。",
+  "cases": [
+    {
+      "id": "running-known",
+      "desc": "下载中·总量已知（有百分比/大小/速度，且触发详情面板的预计完成时刻）",
+      "task": {
+        "taskId": "t-run-known",
+        "state": "running",
+        "kind": "url",
+        "fileName": "ubuntu-24.04.iso",
+        "filePath": "D:\\Downloads\\ubuntu-24.04.iso",
+        "received": 524288,
+        "total": 1048576,
+        "percent": 50,
+        "speed": 131072,
+        "unit": "bytes",
+        "stalled": false
+      },
+      "expect": {
+        "badge": "下载中",
+        "contains": [
+          "class=\"dl-badge b-running\">下载中</span>",
+          "<span class=\"dl-pct\">50.0%</span>",
+          "<span class=\"dl-size\">512KB/1.00MB</span>",
+          "<span class=\"dl-speed\">128KB/s</span>",
+          "剩4s",
+          "class=\"dl-bar\" style=\"width:50%\"",
+          "<button class=\"dl-btn danger\" id=\"dl-cancel\">取消</button>",
+          "<span class=\"dl-d-label\">预计</span>",
+          "（已下载 512KB）"
+        ],
+        "notContains": ["id=\"dl-retry\"", "id=\"dl-open\"", "class=\"dl-bar done\"", " indet"]
+      }
+    },
+    {
+      "id": "running-unknown",
+      "desc": "下载中·总量未知（无百分比，进度条走 indeterminate）",
+      "task": {
+        "taskId": "t-run-unknown",
+        "state": "running",
+        "kind": "url",
+        "fileName": "big-file.bin",
+        "filePath": "D:\\Downloads\\big-file.bin",
+        "received": 3145728,
+        "total": null,
+        "percent": null,
+        "speed": 262144,
+        "unit": "bytes"
+      },
+      "expect": {
+        "badge": "下载中",
+        "contains": [
+          "<span class=\"dl-pct\">—</span>",
+          "<span class=\"dl-size\">3.00MB</span>",
+          "<span class=\"dl-speed\">256KB/s</span>",
+          "class=\"dl-bar indet\" style=\"width:0%\"",
+          "id=\"dl-cancel\""
+        ],
+        "notContains": ["剩", "（已下载", "id=\"dl-retry\""]
+      }
+    },
+    {
+      "id": "running-stalled",
+      "desc": "下载中·停滞（徽标转为 b-stalled，信息行给出停滞交代）",
+      "task": {
+        "taskId": "t-run-stalled",
+        "state": "running",
+        "kind": "url",
+        "fileName": "slow.zip",
+        "filePath": "D:\\Downloads\\slow.zip",
+        "received": 262144,
+        "total": 1048576,
+        "percent": 25,
+        "speed": 0,
+        "unit": "bytes",
+        "stalled": true
+      },
+      "expect": {
+        "badge": "下载中",
+        "contains": [
+          "class=\"dl-badge b-stalled\">下载中</span>",
+          "连接停滞，等待 Agent 决策",
+          "class=\"dl-bar\" style=\"width:25%\"",
+          "id=\"dl-cancel\""
+        ],
+        "notContains": ["dl-speed", "剩"]
+      }
+    },
+    {
+      "id": "pending-queued",
+      "desc": "准备中·排队（size 显示 —，信息行给排队中）",
+      "task": {
+        "taskId": "t-pending-queued",
+        "state": "pending",
+        "kind": "url",
+        "fileName": "queued.iso",
+        "filePath": "",
+        "received": 0,
+        "total": 0,
+        "percent": null,
+        "speed": 0,
+        "queued": true
+      },
+      "expect": {
+        "badge": "准备中",
+        "contains": [
+          "class=\"dl-badge b-pending\">准备中</span>",
+          "排队中…",
+          "<span class=\"dl-size\">—</span>",
+          "class=\"dl-bar indet\"",
+          "id=\"dl-cancel\""
+        ],
+        "notContains": ["id=\"dl-retry\"", "id=\"dl-open\""]
+      }
+    },
+    {
+      "id": "done-url",
+      "desc": "完成·普通下载（有 filePath 与 total，终态进度条 100% 且带 done 类，给打开+文件夹）",
+      "task": {
+        "taskId": "t-done-url",
+        "state": "done",
+        "kind": "url",
+        "fileName": "report.pdf",
+        "filePath": "D:\\Downloads\\report.pdf",
+        "received": 5242880,
+        "total": 5242880,
+        "percent": 100,
+        "speed": 0,
+        "unit": "bytes",
+        "note": "来自 example.com"
+      },
+      "expect": {
+        "badge": "完成",
+        "contains": [
+          "class=\"dl-badge b-done\">完成</span>",
+          "<span class=\"dl-pct\">100%</span>",
+          "<span class=\"dl-size\">5.00MB</span>",
+          "class=\"dl-bar done\" style=\"width:100%\"",
+          "<button class=\"dl-btn primary\" id=\"dl-open\">打开</button>",
+          "<button class=\"dl-btn\" id=\"dl-folder\" title=\"打开所在文件夹\">文件夹</button>",
+          "来自 example.com"
+        ],
+        "notContains": ["id=\"dl-cancel\"", "id=\"dl-retry\"", " indet"]
+      }
+    },
+    {
+      "id": "done-command",
+      "desc": "完成·命令型（kind=command，只给打开文件夹、不给打开文件）",
+      "task": {
+        "taskId": "t-done-command",
+        "state": "done",
+        "kind": "command",
+        "fileName": "myrepo",
+        "filePath": "D:\\Downloads\\myrepo",
+        "received": 0,
+        "total": 0,
+        "percent": 100,
+        "unit": "bytes"
+      },
+      "expect": {
+        "badge": "完成",
+        "contains": [
+          "class=\"dl-badge b-done\">完成</span>",
+          "<button class=\"dl-btn primary\" id=\"dl-folder\" title=\"打开目标目录\">打开文件夹</button>"
+        ],
+        "notContains": ["id=\"dl-open\"", "id=\"dl-cancel\"", "id=\"dl-retry\""]
+      }
+    },
+    {
+      "id": "done-pkg-winget",
+      "desc": "完成·包安装（winget，无产物：打开/文件夹都不给；数字区按阶段收起）",
+      "task": {
+        "taskId": "t-done-pkg-winget",
+        "state": "done",
+        "kind": "command",
+        "cmdType": "winget-install",
+        "fileName": "Notepad++.Notepad++",
+        "filePath": "",
+        "received": null,
+        "total": null,
+        "percent": null,
+        "stage": "finalizing",
+        "unit": "bytes"
+      },
+      "expect": {
+        "badge": "完成",
+        "contains": [
+          "class=\"dl-badge b-done\">完成</span>",
+          "<span class=\"dl-pct\">100%</span>",
+          "class=\"dl-bar done\" style=\"width:100%\""
+        ],
+        "notContains": ["id=\"dl-open\"", "id=\"dl-folder\"", "id=\"dl-cancel\"", "dl-size", "dl-retry"]
+      }
+    },
+    {
+      "id": "done-pkg-pip",
+      "desc": "完成·包安装（pip，同上，且阶段文案走 STAGE_TEXT）",
+      "task": {
+        "taskId": "t-done-pkg-pip",
+        "state": "done",
+        "kind": "command",
+        "cmdType": "pip-install",
+        "fileName": "requests",
+        "filePath": "",
+        "received": null,
+        "total": null,
+        "percent": null,
+        "stage": "installing",
+        "unit": "bytes"
+      },
+      "expect": {
+        "badge": "完成",
+        "contains": [
+          "class=\"dl-badge b-done\">完成</span>",
+          "<span class=\"dl-pct\">100%</span>",
+          "class=\"dl-bar done\" style=\"width:100%\""
+        ],
+        "notContains": ["id=\"dl-open\"", "id=\"dl-folder\"", "dl-size"]
+      }
+    },
+    {
+      "id": "done-count-objects",
+      "desc": "完成·计数型（unit=objects，大小行标签改为「数量」并带单位后缀）",
+      "task": {
+        "taskId": "t-done-count-objects",
+        "state": "done",
+        "kind": "command",
+        "cmdType": "git-clone",
+        "fileName": "big-repo",
+        "filePath": "D:\\Downloads\\big-repo",
+        "received": 9,
+        "total": 9,
+        "percent": 100,
+        "unit": "objects"
+      },
+      "expect": {
+        "badge": "完成",
+        "contains": [
+          "<span class=\"dl-pct\">100%</span>",
+          "<span class=\"dl-size\">9/9 对象</span>",
+          "<span class=\"dl-d-label\">数量</span>",
+          "<span class=\"dl-d-value\">9 对象</span>",
+          "<button class=\"dl-btn primary\" id=\"dl-folder\" title=\"打开目标目录\">打开文件夹</button>"
+        ],
+        "notContains": ["<span class=\"dl-d-label\">大小</span>", "id=\"dl-open\""]
+      }
+    },
+    {
+      "id": "failed-error",
+      "desc": "失败·带 error（信息行红色 + title 存全文，换行压成空格；给重试圈箭头）",
+      "task": {
+        "taskId": "t-failed-error",
+        "state": "failed",
+        "kind": "url",
+        "fileName": "broken.zip",
+        "filePath": "",
+        "received": 1024,
+        "total": 1048576,
+        "percent": 0.1,
+        "unit": "bytes",
+        "error": "网络超时\n连接被重置"
+      },
+      "expect": {
+        "badge": "失败",
+        "contains": [
+          "class=\"dl-badge b-failed\">失败</span>",
+          "<span class=\"dl-meta err\" title=\"网络超时",
+          "网络超时 连接被重置</span>",
+          "class=\"dl-bar failed\"",
+          "<button class=\"dl-btn ico retry\" id=\"dl-retry\" title=\"重试下载\">"
+        ],
+        "notContains": ["id=\"dl-cancel\"", "id=\"dl-open\"", " spinning"]
+      }
+    },
+    {
+      "id": "canceled",
+      "desc": "已取消·无 error（信息行回落到默认「下载失败」文案，给重试）",
+      "task": {
+        "taskId": "t-canceled",
+        "state": "canceled",
+        "kind": "url",
+        "fileName": "stopped.iso",
+        "filePath": "D:\\Downloads\\stopped.iso",
+        "received": 262144,
+        "total": 1048576,
+        "percent": 25,
+        "unit": "bytes"
+      },
+      "expect": {
+        "badge": "已取消",
+        "contains": [
+          "class=\"dl-badge b-canceled\">已取消</span>",
+          "下载失败",
+          "class=\"dl-bar failed\"",
+          "id=\"dl-retry\""
+        ],
+        "notContains": ["id=\"dl-cancel\"", "id=\"dl-open\""]
+      }
+    },
+    {
+      "id": "interrupted",
+      "desc": "已中断·带 error（重试态：spinning + disabled，由 opts.retrying 驱动）",
+      "task": {
+        "taskId": "t-interrupted",
+        "state": "interrupted",
+        "kind": "url",
+        "fileName": "half.bin",
+        "filePath": "D:\\Downloads\\half.bin",
+        "received": 524288,
+        "total": 2097152,
+        "percent": 25,
+        "unit": "bytes",
+        "error": "引擎重启，任务中断"
+      },
+      "expect": {
+        "badge": "已中断",
+        "contains": [
+          "class=\"dl-badge b-interrupted\">已中断</span>",
+          "引擎重启，任务中断",
+          "class=\"dl-bar failed\"",
+          "id=\"dl-retry\""
+        ],
+        "notContains": ["id=\"dl-cancel\""]
+      }
+    }
+  ]
+}
