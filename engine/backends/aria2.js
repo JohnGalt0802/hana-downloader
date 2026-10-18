@@ -32,6 +32,11 @@ const RPC_TIMEOUT_MS = 8000;    // 单次 RPC 超时
 const POLL_FAIL_LIMIT = 8;      // 连续轮询失败次数上限（≈5s）后判定 RPC 失联
 const DEFAULT_BASE_PORT = 6802;
 const PORT_SPAN = 8;            // 6802..6810
+// 能力探测缓存（2026-10-19 修）：成功结果长时间有效，失败结果仍然只留 5s。
+// 为什么分开：用户点一次开关就够了，不该每次开管理器都重跑一遍「找 exe → 起实例 → RPC 握手」。
+// 为什么失败不能长留（踩坑 49）：用户刚装好 aria2 就必须马上能识别，不能等缓存过期、更不能重启。
+const DETECT_POSITIVE_TTL_MS = 10 * 60 * 1000;
+const DETECT_NEGATIVE_TTL_MS = 5000;
 const INSTANCE_FILE = "aria2-instance.json";
 const FEATURES = ["resume", "sha256", "cancel", "proxy", "speed-limit", "multi-connection"];
 
@@ -48,8 +53,11 @@ const state = {
   recordPath: "",
   // 选项（由 dlcore 从 engine-config.json 灌入）
   options: { bin: "", port: DEFAULT_BASE_PORT },
+  adoptedPid: 0,       // adopted 实例的 pid（没 handle，只能靠 pid 探活）
   activeTasks: 0,      // 本 backend 当前在跑的任务数（并发对齐 aria2 用）
-  detection: { at: 0, value: null }, // capabilities() 的探测缓存（5s）
+  // capabilities() 的探测缓存。ok: true=成功结果 / false=失败结果 / null=未落定或探测中
+  detection: { at: 0, value: null, ok: null },
+  probes: 0,           // 真实跑过的探测次数（只给诊断/测试看，缓存命中不增）
 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -421,7 +429,9 @@ export async function shutdownInstance({ quiet = true } = {}) {
   state.proc = null;
   state.ready = false;
   state.adopted = false;
+  state.adoptedPid = 0;
   state.activeTasks = 0;
+  invalidateDetection(); // 实例没了，成功缓存必须一起失效
   if (proc) {
     // 先礼后兵：aria2.shutdown 让控制文件落盘，再 kill 兜底
     if (wasReady) {
@@ -479,6 +489,7 @@ async function _ensureInstance({ bin, port }) {
       state.ready = true;
       state.adopted = true;
       state.proc = null;
+      state.adoptedPid = rec.pid; // 没有 handle，靠 pid 判活（缓存失效条件要用）
       return { ok: true, port: state.port, secret: state.secret, adopted: true };
     }
   }
@@ -521,6 +532,9 @@ async function _ensureInstance({ bin, port }) {
     }
     state.proc = proc;
     state.adopted = false;
+    state.adoptedPid = 0;
+    // 自己起的实例退出（崩了 / 被外部杀掉）：成功缓存立即失效，下次探测会重新起
+    proc.once("exit", () => { if (state.proc === proc) invalidateDetection(); });
     state.port = p;
     state.secret = secret;
     state.bin = exe;
@@ -580,6 +594,38 @@ async function syncConcurrency(n) {
 // backend 对象
 // ════════════════════════════════════════════════════════════
 
+/** 丢掉探测缓存（配置变更 / 实例消失 / 手动刷新时调） */
+function invalidateDetection() {
+  state.detection = { at: 0, value: null, ok: null };
+}
+
+/**
+ * 缓存的探测结果还能用吗？
+ *
+ * 三个失效条件（除了 TTL）：
+ *   ① 配置变更 → setOptions 里直接 invalidateDetection()
+ *   ② 实例已启动但 pid 不在了 → 这里判（adopted 实例没 handle，只能靠 pid）
+ *   ③ 手动刷新 → capabilities({ force:true }) / refreshCapabilities()
+ *
+ * TTL 按结果分档：成功 10 分钟，失败 5 秒（踩坑 49：负结果不能长留）。
+ * 判定为「探测中」（ok===null）时按开始时刻算短 TTL，避免并发调用重跑探测。
+ */
+function detectionValid(now = Date.now()) {
+  const d = state.detection;
+  if (!d.value) return false;
+  if (d.ok === true) {
+    // ② 成功结果蕴含「有个活实例」：实例不在了（被关掉 / 进程崩了）就作废
+    if (!state.ready) return false;
+    if (state.proc) {
+      if (state.proc.exitCode !== null || state.proc.signalCode) return false;
+    } else if (state.adoptedPid && !pidAlive(state.adoptedPid)) {
+      return false;
+    }
+  }
+  const ttl = d.ok === true ? DETECT_POSITIVE_TTL_MS : DETECT_NEGATIVE_TTL_MS;
+  return now - d.at < ttl;
+}
+
 export const aria2Backend = {
   name: NAME,
 
@@ -593,7 +639,7 @@ export const aria2Backend = {
       bin: nextBin || "",
       port: Number.isFinite(nextPort) && nextPort > 0 ? Math.floor(nextPort) : DEFAULT_BASE_PORT,
     };
-    if (changed) state.detection = { at: 0, value: null };
+    if (changed) invalidateDetection();
     return { ...state.options };
   },
 
@@ -609,13 +655,19 @@ export const aria2Backend = {
    *
    * 避让保留：配置端口被**另一个 aria2** 占着时，跳过它自己找下一个端口（不去抢别人的实例）。
    *
-   * @param {object} [opts] { dataDir }
+   * 缓存策略（2026-10-19）：
+   *   · available:true  → 缓存 10 分钟，并在实例消失时立即失效（见 detectionValid）
+   *   · available:false → 只缓存 5s（踩坑 49：用户刚装好 aria2 必须马上能识别）
+   *   缓存只影响「要不要重跑探测」，**不影响判定标准**：探测真跑起来时 available:true 仍必须来自真实握手。
+   *
+   * @param {object} [opts] { dataDir, force }  force=true 跳过缓存，强制重测（手动刷新用）
    */
   capabilities(opts = {}) {
     const now = Date.now();
     const cached = state.detection.value;
-    if (cached && now - state.detection.at < 5000) return cached;
+    if (!opts.force && cached && detectionValid(now)) return cached;
     const unavailable = (reason, extra = {}) => ({ available: false, name: NAME, features: [], reason, ...extra });
+    state.probes += 1;
     const value = (async () => {
       const exe = resolveAria2Bin(state.options.bin);
       if (!exe) return unavailable("未检测到 aria2c", { bin: "" });
@@ -651,10 +703,22 @@ export const aria2Backend = {
         version: v.version,
       };
     })();
-    state.detection = { at: now, value };
-    // 缓存的是 Promise：探测失败也要能重试，5s 后自然失效
-    value.catch(() => { state.detection = { at: 0, value: null }; });
+    state.detection = { at: now, value, ok: null };
+    // 缓存的是 Promise：探测失败也要能重试。落定后按结果分别计时（成功 10min / 失败 5s）。
+    value.then(
+      (v) => { if (state.detection.value === value) state.detection.ok = v?.available === true; },
+      () => { if (state.detection.value === value) state.detection = { at: 0, value: null, ok: null }; },
+    );
     return value;
+  },
+
+  /**
+   * 手动刷新：丢掉缓存重新探测。
+   * 管理器/诊断想「现在就要真实结果」时用它（capabilities({ force: true }) 等价）。
+   */
+  refreshCapabilities(opts = {}) {
+    invalidateDetection();
+    return this.capabilities({ ...opts, force: true });
   },
 
   /**
@@ -854,6 +918,10 @@ export const aria2Backend = {
       port: state.port || null,
       version: state.version || null,
       activeTasks: state.activeTasks,
+      // 探测缓存现状（供诊断与测试观察；不含 secret）
+      probes: state.probes,
+      detectionAt: state.detection.at,
+      detectionOk: state.detection.ok,
     };
   },
 };

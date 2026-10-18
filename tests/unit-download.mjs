@@ -473,7 +473,59 @@ await new Promise((r) => flushSrv.listen(0, "127.0.0.1", r));
     (x) => x === true);
 }
 
+// ── 场景 13~14：小文件响应停顿 / 真断线（2026-10-19 修 readSmallBody 3 秒超时丢字节）──
+// 旧实现把「3 秒总耗时」当结束条件：超时后 resolve(null)，已缓冲的字节整段丢弃，
+// 调用方再从流里读剩下的字节 → 交付一个缺头部的截断文件，状态却是 done。
+// 这两条必须真的走 readSmallBody（content-length < 4KB 才进那条路）。
+const SMALL_SIZE = 3000; // < 4KB：走 readSmallBody 缓冲路径
+const SMALL_BODY = crypto.randomBytes(SMALL_SIZE);
+const SMALL_SHA = crypto.createHash("sha256").update(SMALL_BODY).digest("hex");
+const SPLIT = 1000; // 先发 1000，停 4.5s，再发 2000
+
+const smallSrv = http.createServer((req, res) => {
+  const headers = { "content-type": "application/octet-stream", "content-length": String(SMALL_SIZE) };
+  if ((req.url || "").startsWith("/drop.bin")) {
+    // 真断线：声明 3000，只发 800 就掐掉连接（不是停顿）
+    res.writeHead(200, headers);
+    res.write(SMALL_BODY.subarray(0, 800), () => setTimeout(() => res.destroy(), 50));
+    return;
+  }
+  // 停顿：中途停 4.5s 再补齐，body 本身是完整的
+  res.writeHead(200, headers);
+  res.write(SMALL_BODY.subarray(0, SPLIT), () => {
+    setTimeout(() => res.end(SMALL_BODY.subarray(SPLIT)), 4500);
+  });
+});
+await new Promise((r) => smallSrv.listen(0, "127.0.0.1", r));
+const STALLURL = `http://127.0.0.1:${smallSrv.address().port}/stall.bin`;
+const DROPURL = `http://127.0.0.1:${smallSrv.address().port}/drop.bin`;
+
+// 场景 13：中途停顿 4.5s → 停顿不是结束，最终文件必须完整
+// 故意不传 expectedSha256：这样旧实现会真的报 done 并交付截断文件（最坏的那种事故）
+{
+  const t = mgr.create({ url: STALLURL, fileName: "small-stall.bin", saveDir: SAVE_DIR });
+  const snap = await waitFinal(t.taskId);
+  check("small停顿: done", snap?.state, (x) => x === "done");
+  check("small停顿: 文件大小完整", snap && fs.existsSync(snap.filePath) ? fs.statSync(snap.filePath).size : -1,
+    (x) => x === SMALL_SIZE);
+  check("small停顿: 文件 SHA-256 与源一致", snap && fs.existsSync(snap.filePath)
+    ? crypto.createHash("sha256").update(fs.readFileSync(snap.filePath)).digest("hex") : null,
+    (x) => x === SMALL_SHA);
+  check("small停顿: 字节数对齐", snap, (x) => x.total === SMALL_SIZE && x.received === SMALL_SIZE);
+  check("small停顿: 无 .part 残留", snap?.filePath + ".part", (x) => !fs.existsSync(x));
+}
+
+// 场景 14：连接真断了 → 必须 failed 带 error，不能拿半截数据当 done
+{
+  const t = mgr.create({ url: DROPURL, fileName: "small-drop.bin", saveDir: SAVE_DIR });
+  const snap = await waitFinal(t.taskId, 15000);
+  check("small断线: failed（不是 done）", snap?.state, (x) => x === "failed");
+  check("small断线: 带 error 文案", snap?.error, (x) => typeof x === "string" && x.length > 0);
+  check("small断线: 正式文件未交付", snap && !fs.existsSync(snap.filePath), (x) => x === true);
+}
+
 console.log(`\n=== download: ${pass} passed, ${fail} failed ===`);
+smallSrv.close();
 srv.close();
 rangeSrv.close();
 shaSrv.close();

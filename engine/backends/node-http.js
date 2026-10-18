@@ -419,31 +419,78 @@ async function createResumeStream(task, startOffset) {
 // 小响应缓冲：Content-Length < 4KB 时读完整 body，用于检测文本重定向
 // （npmmirror 等返回 200 + "Redirecting to <url>" 的非标准重定向）。
 // 非重定向时返回 Buffer（由调用方写回流），重定向/异常返回 null 由上层处理。
+//
+// 2026-10-19 修：旧实现拿「总耗时 3 秒」当结束条件——到点就 resolve(null)，
+// 把已经收到的字节整段扔掉；调用方再从流里读剩下的部分，于是交付一个缺头部的
+// 截断文件而状态报 done。现在的语义是：
+//   · 只有读到 end、且字节数与 Content-Length 相符，才算结束，返回完整 Buffer；
+//   · 停顿（暂时没有新数据）不是结束，只重置空闲计时，已收字节一律保留；
+//   · 空闲超过上限、流报错、实际字节数与声明不符 → 明确失败（reject），
+//     绝不把半截数据当成功交给上层。
+const SMALL_BODY_IDLE_MS = 30000; // 空闲上限：连续这么久一个新字节都没有才判失败（与 dlcore 默认 stall 阈值一致）
+const SMALL_BODY_MAX = 8192;      // 声明 <4KB 却发超这个量：响应头与实际不符，按失败处理
+
 function readSmallBody(res) {
   const cl = parseInt(res.headers["content-length"] || "", 10);
   if (!(Number.isFinite(cl) && cl >= 0 && cl < 4096)) return Promise.resolve(null);
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const chunks = [];
+    let total = 0;
     let done = false;
-    const finish = (v) => {
-      if (done) return;
-      done = true;
+    let timer = null;
+    const cleanup = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
       res.removeListener("data", onData);
       res.removeListener("end", onEnd);
       res.removeListener("error", onErr);
-      resolve(v);
+      res.removeListener("close", onClose);
+    };
+    // 失败即明确失败：拆掉连接，别让它带着「已丢字节」的半成品继续往下走
+    const fail = (err) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      try { res.destroy(); } catch { /* 忽略 */ }
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+    const ok = (buf) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve(buf);
+    };
+    const arm = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(
+        () => fail(new Error(`小文件响应空闲超过 ${SMALL_BODY_IDLE_MS / 1000} 秒（已收 ${total}/${cl} 字节）`)),
+        SMALL_BODY_IDLE_MS
+      );
     };
     const onData = (c) => {
       chunks.push(c);
-      const total = chunks.reduce((a, b) => a + b.length, 0);
-      if (total > 8192) finish(null);
+      total += c.length;
+      if (total > SMALL_BODY_MAX) {
+        return fail(new Error(`响应长度与 Content-Length 不符（声明 ${cl}，已收到 ${total} 字节）`));
+      }
+      arm(); // 有新字节：只重置空闲计时，不结束
     };
-    const onEnd = () => finish(chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0));
-    const onErr = () => finish(null);
+    const onEnd = () => {
+      if (total !== cl) {
+        return fail(new Error(`响应长度与 Content-Length 不符（声明 ${cl}，实际 ${total} 字节）`));
+      }
+      ok(Buffer.concat(chunks));
+    };
+    const onErr = (e) => fail(e);
+    // close 而没等到 end：连接被提前断开。Node 对截断响应通常先发 aborted/error，
+    // 这里兜一层，避免「只有 close 没有 error」时永远挂住（旧实现就会挂到进程退出）。
+    const onClose = () => {
+      if (!res.complete) fail(new Error(`连接提前关闭（已收 ${total}/${cl} 字节）`));
+    };
     res.on("data", onData);
     res.on("end", onEnd);
     res.on("error", onErr);
-    setTimeout(() => finish(null), 3000);
+    res.on("close", onClose);
+    arm();
   });
 }
 

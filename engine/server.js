@@ -18,6 +18,8 @@ import { normalizeAria2Config } from "./backends/contract.js";
 import { parseWingetSearch } from "./progress-parsers.js";
 import { ENGINE_PORT } from "./engine-port.js";
 import { summarizeTask } from "./summary.js";
+// 终态/停滞记录的原子写（2026-10-19）：等待方每 2 秒 JSON.parse 一次，半截文件会被吞成「下载超时」
+import { writeJsonAtomic, finishedPathOf } from "./atomic-write.js";
 import {
   scanCandidates,
   getStatus as getProxyControlStatus,
@@ -137,19 +139,16 @@ const summarize = summarizeTask;
 try { mgr.onFinal((t) => {
     log(`final ${t?.taskId} ${t?.state}`);
     // 落一个结果文件：app 侧用 fs 轮询它（不走 RPC，避免堵住工具回程的 rpc2.drain()）
+    // 原子写：目标路径上只会出现「没有文件」或「完整 JSON」两种状态（2026-10-19）
     try {
-      const dir = path.join(DATA_DIR, "finished");
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, `${t.taskId}.json`), JSON.stringify(summarize(t)), "utf8");
+      writeJsonAtomic(finishedPathOf(DATA_DIR, t.taskId), JSON.stringify(summarize(t)));
     } catch (e) { log(`write finished ERR ${e?.message || e}`); }
   }); } catch (e) { log(`onFinal ERR ${e?.message || e}`); }
 try { mgr.onStall((t) => {
   log(`stall ${t?.taskId}`);
   // 与 finished 同一机制：落盘让 app 侧用 fs 轮询到（不占 RPC，不堵工具回包）
   try {
-    const dir = path.join(DATA_DIR, "stalled");
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, `${t.taskId}.json`), JSON.stringify(summarize(t)), "utf8");
+    writeJsonAtomic(path.join(DATA_DIR, "stalled", `${t.taskId}.json`), JSON.stringify(summarize(t)));
   } catch (e) { log(`write stalled ERR ${e?.message || e}`); }
 }); } catch (e) { log(`onStall ERR ${e?.message || e}`); }
 

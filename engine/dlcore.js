@@ -13,6 +13,8 @@ import { aria2Backend } from "./backends/aria2.js";
 import { capabilitiesOf, normalizeAria2Config } from "./backends/contract.js";
 // 摘要口径全仓唯一一份（snapshot 与 /list、finished/、stalled/ 共用，见 engine/summary.js）
 import { percentOf, summarizeTask } from "./summary.js";
+// 终态记录的原子写（2026-10-19）：finished/*.json 不能出现半截，见 atomic-write.js
+import { writeJsonAtomic, finishedPathOf } from "./atomic-write.js";
 
 const TASKS_FILE = "tasks.json";
 // restore 时的孤儿终态回收阈值（见 _pruneOrphanFinished）：
@@ -23,7 +25,7 @@ const RESTORE_FINISHED_MAX_AGE_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_CONCURRENT = 3; // 同时运行的任务数上限（0=不限）；管理器设置里可改
 
 let _instance = null;
-const MGR_VER = 27; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished；v27=retry 以磁盘校正 received（取消后重试不再永久失败））
+const MGR_VER = 28; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished；v27=retry 以磁盘校正 received（取消后重试不再永久失败）；v28=终态记录改原子写（临时文件+fsync+rename，不再出现半截 JSON））
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -873,9 +875,9 @@ class TaskManager {
   _publishInterrupted(task) {
     if (!task || task.state !== "interrupted") return;
     try {
-      const dir = path.join(this.dataDir, "finished");
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, `${task.taskId}.json`), JSON.stringify(summarizeTask(task)), "utf8");
+      // 原子写：补写途中被 kill 时，等待方读到的要么没有文件、要么是完整记录，不会读到半截 JSON
+      // （半截会被 JSON.parse 抛错吞掉，最终退化成「下载超时未结束」的假错误）
+      writeJsonAtomic(finishedPathOf(this.dataDir, task.taskId), JSON.stringify(summarizeTask(task)));
     } catch { /* 补写失败不影响恢复本身（管理器至少还能显示 interrupted） */ }
   }
 
