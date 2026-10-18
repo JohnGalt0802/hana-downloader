@@ -235,7 +235,9 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
           metaBits.push(STAGE_TEXT[t.stage] || "安装中");
         } else if (isCountTask(t)) {
           // 计数型（git / pnpm）：received/total 是对象数/包数，不能按字节渲染（2026-09-19）
-          metaBits.push(t.stageDetail || (t.received + (t.total ? "/" + t.total : "" ) + unitSuffix(t.unit)));
+          // received 缺失时不能拼出「undefined/68 包」（2026-10-18）
+          var recv = t.received == null ? 0 : t.received;
+          metaBits.push(t.stageDetail || (recv + (t.total ? "/" + t.total : "") + unitSuffix(t.unit)));
         } else {
           if (t.speed) metaBits.push(fmtSpeed(t.speed));
           metaBits.push(t.total ? (t.percent != null ? t.percent + "%" : "") : fmtBytes(t.received));

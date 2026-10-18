@@ -41,7 +41,11 @@ function fmtDuration(sec) {
 }
 
 function stateBadge(s) {
-  return { running: "下载中", pending: "准备中", done: "完成", failed: "失败", canceled: "已取消", interrupted: "已中断", stalled: "停滞" }[s] || s;
+  // 2026-10-18：状态缺失时不能直接把 undefined 透出去（会被拼成字面量 "undefined" 徽标
+  // 与 class="b-undefined"）。未知状态一律落到 unknown 桶。
+  const key = s == null || s === "" ? "unknown" : s;
+  return { running: "下载中", pending: "准备中", done: "完成", failed: "失败", canceled: "已取消", interrupted: "已中断", stalled: "停滞" }[key]
+    || (key === "unknown" ? "未知" : key);
 }
 
 // 文件扩展名（仅 icon:"badge" 用，P1 细化）
@@ -111,7 +115,8 @@ export function renderCardHTML(task, theme, opts) {
   }
 
   const badge = stateBadge(state);
-  const badgeState = state === "running" && t.stalled ? "stalled" : state;
+  // badgeState 只能落已知值：undefined 会让 class 变成 b-undefined，样式全丢
+  const badgeState = (state === "running" && t.stalled ? "stalled" : state) || "unknown";
   const barClass = "dl-bar"
     + (pending || (!known && !terminal) ? " indet" : "")
     + (done ? " done" : "")
@@ -168,7 +173,7 @@ export function renderCardHTML(task, theme, opts) {
   }
   // 左侧图标形态（icon）——minimal 取 "none"，不额外画元素
   if (icon === "dot") {
-    html += '<span class="dl-ico b-' + badgeState + '"></span>';
+    html += '<span class="dl-ico b-' + esc(badgeState) + '"></span>';
   } else if (icon === "badge") {
     // 40×40 格式徽章（图标 + 扩展名）——P1 细化
     html += '<span class="dl-ico-badge">' + esc(extOf(t.fileName)) + "</span>";
@@ -176,9 +181,9 @@ export function renderCardHTML(task, theme, opts) {
   // 主行首元素（primary）——minimal 取 "badge"
   if (primary === "name") {
     html += '<span class="dl-name">' + esc(t.fileName || "—") + "</span>";
-    html += '<span class="dl-badge b-' + badgeState + '">' + badge + "</span>";
+    html += '<span class="dl-badge b-' + esc(badgeState) + '">' + esc(badge) + "</span>";
   } else {
-    html += '<span class="dl-badge b-' + badgeState + '">' + badge + "</span>";
+    html += '<span class="dl-badge b-' + esc(badgeState) + '">' + esc(badge) + "</span>";
   }
 
   // 失败/中断原因：放在进度条上面那行（信息行）里，红色短文本，超长省略；

@@ -30,7 +30,8 @@ import { defineApp } from "./sdk/app-contract/server-client.js";
 //   engine/engine-port.js  端口（server.js 同用）
 //   ui/shared/display.js   阶段/单位文案与任务形态判定（卡片、管理器同用）
 import { ENGINE_PORT } from "./engine/engine-port.js";
-import { isPkgTask, isCloneTask, isCmdTask, progressText } from "./ui/shared/display.js";
+import { isPkgTask, isCloneTask, isCmdTask, waitLineText, displayNameOf } from "./ui/shared/display.js";
+import { parseEngineResponse, asText } from "./engine/ipc-contract.js";
 
 const APP_ID = "hana-downloader";
 const ENGINE_ENTRY = "engine/server.js";
@@ -126,18 +127,25 @@ export default defineApp(async (sdk) => {
       throw new Error(`engine fetch ${path} failed: ${e?.message || e}`);
     }
     const text = await raw.text();
-    try {
-      return JSON.parse(text);
-    } catch {
-      return text;
-    }
+    // 2026-10-18 修：旧实现解析失败时 `return text` 把裸字符串交给调用方，
+    // 调用方按对象用（r.ok / r.taskId / r.port）全是 undefined —— 引擎失联
+    // 被显示成「任务已发起/已完成」，属于乱码当成功。现在统一返回结构化错误对象，
+    // 契约形状恒为 object（详见 engine/ipc-contract.js）。
+    return parseEngineResponse(text);
+  }
+
+  // 探活用：引擎必须真的回了一个 ok 的回包，非 JSON 不算 ready（否则 watchdog 会以为一切正常）
+  async function pingEngine(timeoutMs) {
+    const r = await callEngine("/ping", { method: "GET", timeoutMs });
+    if (r?.ok === false) throw new Error(r.error || "engine ping 非法回包");
+    return r;
   }
 
   async function waitEngineReady(timeoutMs = READY_WAIT_MS) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
       try {
-        const r = await callEngine("/ping", { method: "GET", timeoutMs: PING_TIMEOUT_MS });
+        const r = await pingEngine(PING_TIMEOUT_MS);
         log(`engine ready | ${JSON.stringify(r).slice(0, 200)}`);
         return true;
       } catch {
@@ -157,7 +165,7 @@ export default defineApp(async (sdk) => {
     watchdogTimer = setInterval(async () => {
       if (restarting) return;
       try {
-        await callEngine("/ping", { method: "GET", timeoutMs: 4000 });
+        await pingEngine(4000);
       } catch (e) {
         restarting = true;
         err(`engine unreachable, restarting | ${e?.message || e}`);
@@ -213,7 +221,7 @@ export default defineApp(async (sdk) => {
     const isPkg = isPkgTask(snap);
     const isClone = isCloneTask(snap);
     const isCmd = isCmdTask(snap);
-    const name = snap.fileName || label;
+    const name = displayNameOf(snap.fileName, label, snap.taskId);
     // 三类任务分开措辞（2026-09-19）：
     //   URL 下载 → 字节数有意义；命令类（clone/pnpm）received/total 是对象数/包数，不是产物大小；
     //   包安装（winget/pip）没有可打开产物，只报备注。
@@ -227,11 +235,13 @@ export default defineApp(async (sdk) => {
       : snap.state === "canceled"
         ? `${verb}已取消：${name}`
         : `${verb}失败：${name}${snap.error ? `（${snap.error}）` : ""}`;
+    // 模型可见文本必须恒为字符串（宿主读 .length，非字符串会抛错）。
+    const body = asText(text);
 
     try {
       if (snap.state === "done") {
         await sdk.tasks.complete(hostTaskId, {
-          text,
+          text: body,
           filePath: snap.filePath || null,
           total: snap.total ?? null,
           received: snap.received ?? 0,
@@ -239,7 +249,7 @@ export default defineApp(async (sdk) => {
       } else if (snap.state === "canceled") {
         await sdk.tasks.cancel(hostTaskId);
       } else {
-        await sdk.tasks.fail(hostTaskId, text);
+        await sdk.tasks.fail(hostTaskId, asText(body));
       }
       log(`tasks settled | ${hostTaskId} -> ${snap.state}`);
     } catch (e) {
@@ -308,10 +318,12 @@ export default defineApp(async (sdk) => {
   // 能力 app/tasks.manage + app/session.start-turn（清单里都有）。
   async function createStallTask(callToken, label) {
     if (!callToken) return null;
+    // label 可能是 undefined（未传文件名/URL 的调用路径），先收口再拼，避免「停滞提醒：undefined」
+    const name = asText(label) || "任务";
     try {
-      const st = await sdk.tasks.create({ callToken, label: `停滞提醒：${label}`, delivery: "next-step" });
+      const st = await sdk.tasks.create({ callToken, label: `停滞提醒：${name}`, delivery: "next-step" });
       const id = st?.taskId || null;
-      log(`stall-task created | ${id} | ${label}`);
+      log(`stall-task created | ${id} | ${name}`);
       return id;
     } catch (e) {
       err(`stall-task create ERR | ${e?.message || e}`);
@@ -364,6 +376,9 @@ export default defineApp(async (sdk) => {
   async function notifySession(target, text, customType) {
     const sessionPath = typeof target === "string" ? target : target?.sessionPath;
     let sessionId = typeof target === "string" ? null : target?.sessionId;
+    // content 是模型可见文本：入口归一成字符串，null/undefined/对象一律不直接下发
+    // （宿主会读 content 的 .length，非字符串是会话级事故，2026-10-18）
+    const body = asText(text);
     // 夹带兜底：任务里没存 sessionId（老任务）时现查一次
     if (!sessionId) sessionId = await resolveSessionId(sessionPath);
     if (!sessionId) { log(`notify skipped (${customType}) | 没有 sessionId`); return false; }
@@ -371,7 +386,7 @@ export default defineApp(async (sdk) => {
       await sdk.sessions.sendCustom({
         sessionId,
         sessionPath: sessionPath || undefined,
-        content: text,
+        content: body,
         customType: customType || "retry-note",
         display: false,
         triggerTurn: false,
@@ -391,7 +406,8 @@ export default defineApp(async (sdk) => {
   //（不是新的下载请求），跑完的结果另外再通知一次。
   async function notifyRetryStarted(engineTaskId, sessionPath, label) {
     try {
-      const name = label || engineTaskId;
+      // 投递文本进模型上下文：名字统一走 displayNameOf，避免出现「任务：undefined」
+      const name = displayNameOf(label, engineTaskId);
       const lines = [
         `${RECORD_PREFIX}用户在下载管理器里点「重试」，该任务已重新开始（重试发起，不是新的下载请求）。`,
         `任务：${name}`,
@@ -419,7 +435,7 @@ export default defineApp(async (sdk) => {
     }
     if (!snap) { log(`retry notify | 未等到终态 ${engineTaskId}`); return; }
 
-    const name = snap.fileName || label || engineTaskId;
+    const name = displayNameOf(snap.fileName, label, engineTaskId);
     const stateCn = snap.state === "done" ? "完成" : snap.state === "canceled" ? "已取消" : "失败";
     const lines = [
       `${RECORD_PREFIX}用户在下载管理器里点「重试」的任务已结束（重试发起，不是新的下载请求）。`,
@@ -499,7 +515,7 @@ export default defineApp(async (sdk) => {
       const stId = snap.stallTaskId || null;
       if (stId) {
         try {
-          await sdk.tasks.complete(stId, { text: lines.join("\n") });
+          await sdk.tasks.complete(stId, { text: asText(lines.join("\n")) });
           consumedStallTasks.add(stId);
           log(`stall notify sent (next-step) | ${stId}`);
           // 通知成功：删掉这条 stalled 文件，不再只增不减（2026-10-10）
@@ -555,12 +571,14 @@ export default defineApp(async (sdk) => {
   async function registerCard(taskId, title, sessionPath) {
     const cardInstanceId = stableCardId(taskId);
     try {
-      await callEngine("/register-card", {
+      const r = await callEngine("/register-card", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ taskId, title, sessionPath: sessionPath || null, cardInstanceId, seq: Date.now() }),
       });
-      log(`register-card OK | ${cardInstanceId} -> ${taskId}`);
+      // callEngine 解析失败时会给 {ok:false,error}：不能当成功记日志（否则卡片认领失败无声无息）
+      if (r?.ok === false) err(`register-card ERR | ${r.error || "引擎未确认"}`);
+      else log(`register-card OK | ${cardInstanceId} -> ${taskId}`);
     } catch (e) {
       err(`register-card ERR | ${e?.message || e}`);
     }
@@ -612,7 +630,7 @@ export default defineApp(async (sdk) => {
           return { content: [{ type: "text", text: `发起下载失败：${r?.error || "引擎未返回 taskId"}` }], isError: true };
         }
 
-        const displayName = r?.fileName || fileName || url;
+        const displayName = displayNameOf(r?.fileName, fileName, url);
 
         // 宿主任务：拿到 callToken 才能挂进会话投递通道。
         let task = null;
@@ -717,9 +735,13 @@ export default defineApp(async (sdk) => {
         //   进行中 → "45%（45MB/100MB），1.2MB/s"
         //   终态   → "done｜100%（100MB/100MB）"
         // 完整快照仍走 details.download（卡片与管理器用，不进模型上下文）。
-        const progressLine = progressText(snap, { doneText: true });
-        const line = snap.state === "running" ? progressLine : `${snap.state}｜${progressLine}`;
-        const text = snap.error ? `${line}｜错误：${snap.error}` : line;
+        //
+        // 2026-10-18 修复：这行不能直接拿 progressText 的返回值拼。progressText 对
+        // 「包安装且 stage 未赋值」返回 null（那是 UI 的设计契约，见 display.js），
+        // 而 content[].text 是模型可见字段，宿主会读它的 .length ——写进 null 就是
+        // `Cannot read properties of null (reading 'length')`，整条会话当场断。
+        // 所以统走 waitLineText：它内部调用 progressText 并保证返回字符串。
+        const text = waitLineText(snap);
 
         return { content: [{ type: "text", text }], details: { download: snap } };
       },
@@ -754,8 +776,11 @@ export default defineApp(async (sdk) => {
           return { content: [{ type: "text", text: `取消失败：${e?.message || e}` }], isError: true };
         }
 
-        const snap = r?.snap || r || {};
-        const ok = r?.ok !== false;
+        const snap = r?.snap || {};
+        // ok 要同时看顶层与内核结果：任务不存在时引擎回 ok:false / result.ok:false，
+        // 只看顶层会谎报「已取消」（2026-10-18）
+        const ok = r?.ok !== false && r?.result?.ok !== false;
+        // content[].text 恒为字符串（宿主读 .length，null 会断会话）。
         const text = ok
           ? `已取消任务 ${id}${snap?.fileName ? `（${snap.fileName}）` : ""}${snap?.partPath ? `，半成品已保留供续传（${snap.partPath}）` : "。"}`
           : `取消失败：${r?.error || "任务不存在"}`;
@@ -798,14 +823,17 @@ export default defineApp(async (sdk) => {
           return { content: [{ type: "text", text: `代理控制请求失败：${e?.message || e}` }], isError: true };
         }
         if (a === "status") {
-          const state = r?.running ? `运行中（端口 ${r.port}）` : `未运行（端口 ${r.port} 不通）`;
+          if (r?.ok === false && r?.error) {
+            return { content: [{ type: "text", text: `代理状态查询失败：${asText(r.error)}` }], isError: true };
+          }
+          const state = r?.running ? `运行中（端口 ${r.port}）` : `未运行（端口 ${r.port ?? "?"} 不通）`;
           const sys = r?.systemProxy?.enabled ? `系统代理已开（${r.systemProxy.server || "地址未知"}）` : "系统代理未开";
           const launcher = r?.launcher ? `梯子配置：${r.launcher.name}（${r.launcher.exe}）` : "尚未配置梯子（去设置页扫描）";
           const auth = r?.enabled ? "已授权启停" : "未授权启停（只读）";
           return { content: [{ type: "text", text: `代理状态：${state}；${sys}；${launcher}；${auth}。` }], details: { proxyControl: r } };
         }
         const ok = r?.ok !== false;
-        const text = ok ? (r?.message || "完成。") : `未执行：${r?.message || r?.error || "未知原因"}`;
+        const text = ok ? String(r?.message || "完成。") : `未执行：${r?.message || r?.error || "未知原因"}`;
         return { content: [{ type: "text", text }], isError: !ok, details: { proxyControl: r } };
       },
     });
@@ -871,10 +899,10 @@ export default defineApp(async (sdk) => {
           return { content: [{ type: "text", text: `发起失败：${r?.error || "引擎未返回 taskId"}` }], isError: true };
         }
 
-        const displayName = r?.fileName || label
-          || (kind === "git-clone" ? (repo || "git-clone")
-            : kind === "pnpm-install" ? (workdir || "pnpm-install")
-              : (pkg || kind));
+        const displayName = displayNameOf(
+          r?.fileName, label,
+          kind === "git-clone" ? repo : kind === "pnpm-install" ? workdir : pkg, kind,
+        );
 
         let task = null;
         try {
@@ -992,6 +1020,7 @@ export default defineApp(async (sdk) => {
         } catch (e) {
           return c.json({ ok: false, error: `引擎不可达：${e?.message || e}` }, 502);
         }
+        // 引擎回包非 JSON / 非对象时 callEngine 已给 {ok:false,error}：照原样回给前端（ok:false）
         if (r?.ok && r?.taskId) {
           const sessionPath = r.sessionPath || body?.sessionPath || null;
           log(`retry accepted | ${r.taskId} | session=${sessionPath || "-"}`);

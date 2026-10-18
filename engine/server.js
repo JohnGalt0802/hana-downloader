@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 import { getTaskManager, resolveWingetBin } from "./dlcore.js";
 import { parseWingetSearch } from "./progress-parsers.js";
 import { ENGINE_PORT } from "./engine-port.js";
+import { summarizeTask } from "./summary.js";
 import {
   scanCandidates,
   getStatus as getProxyControlStatus,
@@ -124,18 +125,12 @@ function pruneBindings(db) {
 // app 侧不吃 RPC：轮询会产生持续挂起的连接，把工具回程前的 drain() 堵死。
 // 所以引擎把事件写成文件，app 用 fs 轮询。
 //
-// 字段说明（2026-09-20 补）：sessionPath / sessionId 必须带上——app 侧收到卡滞快照后
-// 要靠它把「任务停滞，需要决策」投回原会话（卡滞发生在工具 execute 早已结束之后，
-// 那条宿主任务通道要 callToken，用不了）。stalledAt 用于 app 侧去重（同一任务两次卡滞是两件事）。
-const summarize = (t) => t ? ({
-  taskId: t.taskId, state: t.state || t.status, fileName: t.fileName, url: t.url,
-  total: t.total ?? null, received: t.received ?? 0, filePath: t.filePath || null,
-  error: t.error || null, canceledBy: t.canceledBy || null,
-  cmdType: t.cmd?.type || null, note: t.note || null,
-  sessionPath: t.sessionPath || null, sessionId: t.sessionId || null,
-  stallTaskId: t.stallTaskId || null,
-  stalledAt: t.stalledAt || null,
-}) : null;
+// 摘要口径的唯一来源是 engine/summary.js 的 summarizeTask（/list 与两处落盘共用一份）：
+//   · 2026-09-20 补：sessionPath / sessionId 必须带上——app 侧收到卡滞快照后要靠它把
+//     「任务停滞，需要决策」投回原会话；stalledAt 用于 app 侧去重（同一任务两次卡滞是两件事）。
+//   · 2026-10-18 补：unit / stage / stageDetail / percent / speed / elapsed / queued /
+//     kind / startedAt / finishedAt 曾在这里被丢掉，/list 与管理器因此整段显示错误。
+const summarize = summarizeTask;
 
 try { mgr.onFinal((t) => {
     log(`final ${t?.taskId} ${t?.state}`);
@@ -260,6 +255,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && u.pathname === "/list") {
     let tasks = [];
     try { tasks = mgr.list() || []; } catch (e) { return send(500, { error: String(e?.message || e) }); }
+    // mgr.list() 已经是 snapshot 形态（含 percent）。summarizeTask 再补齐摘要侧字段；
+    // percent 在两条路上都走 summary.percentOf，口径单一（2026-10-18 收口）。
+    // 与 /wait 的 snapshot 必须同语义——UI 同一套代码消费两处。
     return send(200, { ok: true, tasks: tasks.map(summarize) });
   }
 
@@ -448,7 +446,13 @@ const server = http.createServer(async (req, res) => {
     try {
       const r = mgr.cancel(b.taskId, b.source || "agent");
       log(`cancel ${b.taskId} -> ${JSON.stringify(r)}`);
-      return send(200, { ok: true, result: r ?? null });
+      // 响应形状必须与消费方（index.js 的 download-cancel、管理器）对齐：
+      //   · snap     取消后的快照 → 工具要报「半成品已保留供续传（partPath）」
+      //   · result   内核原始结果 → 任务不存在时 ok:false 藏在里面
+      //   · ok       顶层与 result 的**合取**：任务不存在不能回「已取消」（2026-10-18 修）
+      const snap = mgr.snapshot(b.taskId);
+      const ok = r?.ok !== false;
+      return send(200, { ok, result: r ?? null, snap, error: ok ? undefined : (r?.error || "任务不存在") });
     } catch (e) {
       return send(500, { error: String(e?.message || e) });
     }

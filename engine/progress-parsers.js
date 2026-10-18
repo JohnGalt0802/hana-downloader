@@ -215,8 +215,25 @@ export function createUvParser() {
 // 码表来源：winget-cli/doc/windows/package-manager/winget/returnCodes.md（2026-05 版）+
 // 本机实测（0x8A150014 找不到包 / 0x8A15002B 无可用升级）。
 // 返回 { state, note?, error? }；未知码返回 null，由 _runCommand 走通用失败分支（附 hex）。
+//
+// 2026-10-18 修：入口先排掉「没有退出码」——Node 的 child.on("close") 在子进程被信号杀死时
+// 给的 code 是 **null**（不是 0），而 Number(null) >>> 0 === 0 会把「被杀死的安装」判成
+// 「安装成功」并回执宿主。凡不是合法有限数值的，一律当未知码返回 null。
 export function classifyWingetExit(rawCode) {
-  const code = Number(rawCode) >>> 0;
+  if (rawCode == null) return null;
+  // 只接受「数字」与「数字字符串」两种形态。别的类型（null/undefined/布尔/对象/数组/空串）
+  // 都是「没有退出码」或脏输入，不能经 Number() 静默变成 0。
+  let n;
+  if (typeof rawCode === "number") {
+    n = rawCode;
+  } else if (typeof rawCode === "string") {
+    if (rawCode.trim() === "") return null;
+    n = Number(rawCode);
+  } else {
+    return null;
+  }
+  if (!Number.isFinite(n)) return null;
+  const code = n >>> 0;
   switch (code) {
     case 0x00000000: return { state: "done" };
     case 0x8A15002B: return { state: "done", note: "无可用更新" };          // UPDATE_NOT_APPLICABLE（已安装且最新）

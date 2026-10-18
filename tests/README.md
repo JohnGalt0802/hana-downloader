@@ -23,6 +23,10 @@ node tests/run-tests.mjs
 | `unit-display.mjs` | `ui/shared/display.js`：阶段/单位表、任务形态判定（兼容快照与任务对象两种形态）、三类进度文案 |
 | `unit-download.mjs` | 下载内核端到端：落盘完整性、**SHA-256 校验**（对/错两条路）、**限速**是否真拖慢、记录清理。需要约 8 秒 |
 | `unit-queue.mjs` | 并发队列与重试：maxConcurrent 排队与自动放行、放宽上限后立即开跑、失败→重试→成功、在途拒绝重试、排队任务可取消、默认限速套用。需要约 10 秒 |
+| `unit-theme.mjs` | 声明式主题数据层：继承合并、校验拒收、DEFAULTS 填满、schema 口径与 theme.json 三腿一致 |
+| `unit-cardview.mjs` | `ui/shared/cardview.js`：minimal 主题逐字节回归、golden 冻结快照、缺省第三腿一致性、主题字段落地 |
+| `unit-stall.mjs` | 卡滞快照落盘契约（起真引擎）：sessionPath/stallTaskId/stalledAt 带到 App 侧、卡滞中的任务可取消 |
+| `unit-contract.mjs` | **契约兜底（2026-10-18）**：`/list` 摘要字段齐全且与 `snapshot` 同语义、`percent` 口径一致、非 JSON 回包结构化、`displayNameOf` 永不产出 undefined、`stateBadge(undefined)` 不渲染 undefined、`/cancel` 响应形状与消费方一致。起真引擎跑 `/cancel` 与 `/list` |
 
 ## servers/ — 手工验证用的本地下载源
 

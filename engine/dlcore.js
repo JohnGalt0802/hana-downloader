@@ -11,6 +11,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import { startWingetProbe } from "./download-probe.js";
 import { createTunnelAgent } from "./tunnel-agent.js";
+// 百分比口径全仓唯一一份（snapshot 与 /list 的摘要共用，见 engine/summary.js）
+import { percentOf } from "./summary.js";
 
 const TASKS_FILE = "tasks.json";
 // 任务记录持久化（2026-10-12 John 定）：不再按条数自动裁剪，见 _createTask / _persist / restore。
@@ -20,7 +22,7 @@ const SPEED_SAMPLES_MAX = 5;   // 滑动窗口样本数（≈3.5s）
 const CHUNK_SLEEP_MIN_MS = 1;  // 限速时 chunk 间最小等待
 
 let _instance = null;
-const MGR_VER = 23; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试）
+const MGR_VER = 24; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf）
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -746,8 +748,13 @@ class TaskManager {
           const codeU = Number(code) >>> 0;
           const hexSuffix = codeU >= 0x80000000 ? `（0x${codeU.toString(16).toUpperCase()}）` : "";
           const clsMsg = cls && cls.error ? cls.error + "；" : "";
-          task.error = (task._spawnError ? task._spawnError.message + "；" : "") + clsMsg
-            + `命令退出码 ${code}` + hexSuffix + (tail ? `：${summarizeCmdTail(tail)}` : "");
+          // 没有退出码（进程被信号杀死，close 的 code 就是 null）时不能拼成「命令退出码 null」：
+          // 那句话会经 finished/*.json → 模型可见文本，属于脏数据（2026-10-18 修）。
+          const codeText = code == null
+            ? "进程被信号终止"
+            : `命令退出码 ${code}` + hexSuffix;
+          task.error = (task._spawnError ? task._spawnError.message + "；" : "") + clsMsg + codeText
+            + (tail ? `：${summarizeCmdTail(tail)}` : "");
         }
       }
       // 完成备注：把“已安装 <包>”放在最前（winget 成功路径的输出没有成句结果行；
@@ -808,10 +815,11 @@ class TaskManager {
   snapshot(taskId) {
     const t = this.tasks.get(taskId);
     if (!t) return null;
-    const percent = t.total ? Math.min(100, (t.received / t.total) * 100) : null;
+    // percent 走 percentOf（与 /list 的摘要同一函数）：算两次就是两个真相源，
+    // 迟早会漂。原先这里是内联的 Math.min + round，percentOf 与它逐字等价。
     return {
       taskId: t.taskId,
-      url: t.url,
+      url: t.url || null,  // 命令型任务没有 URL：给 null，别让 JSON 序列化把整个键丢掉
       fileName: t.fileName,
       filePath: t.filePath,
       state: t.state,
@@ -822,7 +830,10 @@ class TaskManager {
       total: t.total,
       received: t.received,
       speed: Math.round(t.speed),
-      percent: percent == null ? null : Math.round(percent * 10) / 10,
+      percent: percentOf(t),
+      // 取消后要告诉调用方「半成品在哪」（断点续传靠它）。此前 snapshot 不带它，
+      // 工具面的「半成品已保留供续传（…）」永远报不出来（2026-10-18 补）。
+      partPath: t.partPath || null,
       startedAt: t.startedAt,
       finishedAt: t.finishedAt,
       elapsed: t.elapsed,

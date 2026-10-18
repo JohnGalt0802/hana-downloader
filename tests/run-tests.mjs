@@ -24,6 +24,7 @@ const SUITES = [
   ["unit-queue.mjs", "并发队列与重试（排队放行 / 失败重跑 / 默认限速）"],
   ["unit-stall.mjs", "卡滞快照的落盘契约（起真引擎，验 sessionPath/stalledAt 带到 App 侧）"],
   ["unit-theme.mjs", "声明式主题数据层（继承合并 / 校验拒收 / 默认值填满 / schema 口径）"],
+  ["unit-contract.mjs", "IPC 与展示契约兜底（/list 字段齐全 / 非 JSON 回包 / displayName / stateBadge / /cancel 形状）"],
   ["unit-cardview.mjs", "卡片渲染纯函数（minimal 逐字节回归 + golden 基准 + 缺省第三腿一致性）"],
 ];
 

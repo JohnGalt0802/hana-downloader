@@ -5,7 +5,7 @@
 // 这份断言就是三处共同的地基——它错了，三个面一起错，所以必须有网。
 import {
   STAGE_TEXT, UNIT_NAME, stageLabel, unitSuffix, cmdTypeOf,
-  isPkgTask, isCloneTask, isCountTask, isCmdTask, progressText,
+  isPkgTask, isCloneTask, isCountTask, isCmdTask, progressText, waitLineText,
 } from "../ui/shared/display.js";
 
 let pass = 0, fail = 0;
@@ -60,6 +60,51 @@ check("count: doneText 但未终态仍写进度", progressText({ unit: "packages
 check("bytes: 有总量", progressText({ unit: "bytes", state: "running", received: 512, total: 1024 }), (x) => x === "进度：50%（512/1024 字节）");
 check("bytes: 无总量", progressText({ received: 512 }), (x) => x === "已下载：512 字节");
 check("null 任务", progressText(null), (x) => x === null);
+// 数值守卫（2026-10-18）：received 非数值时不能输出「进度：NaN%（undefined/100 字节）」
+check("bytes: received 缺失不产出 NaN", progressText({ unit: "bytes", state: "running", total: 100 }),
+  (x) => typeof x === "string" && !x.includes("NaN") && !x.includes("undefined"));
+check("bytes: received=null 不产出 NaN", progressText({ unit: "bytes", state: "running", total: 100, received: null }),
+  (x) => typeof x === "string" && !x.includes("NaN"));
+check("bytes: received 正常时输出不变（守卫不改变既有语义）",
+  progressText({ unit: "bytes", received: 512, total: 1024 }), (x) => x === "进度：50%（512/1024 字节）");
+
+// ── progressText 返回 null 的三种场景（设计契约，给 UI 用：null = 这一行不渲染）──
+// 2026-10-18 事故回归：这三条 null 一旦被工具面当成字符串用，content[].text 就是 null，
+// 宿主读 .length 直接抛 `Cannot read properties of null (reading 'length')`，会话当场断。
+check("null 契约 1/3: pip-install + stage=null → null", progressText({ cmdType: "pip-install", stage: null, state: "running", unit: "bytes" }, { doneText: true }), (x) => x === null);
+check("null 契约 2/3: winget-install + stage 缺省 → null", progressText({ cmdType: "winget-install", state: "running" }, { doneText: true }), (x) => x === null);
+check("null 契约 3/3: task 为 null → null", progressText(null, { doneText: true }), (x) => x === null);
+
+// ── waitLineText：工具面专用，恒为字符串（模型可见的 content[].text）──
+const isStr = (x) => typeof x === "string" && x.length > 0;
+check("waitLineText: pip + stage=null 是字符串", waitLineText({ cmdType: "pip-install", stage: null, state: "running" }), isStr);
+check("waitLineText: pip + stage=null 给的是人话", waitLineText({ cmdType: "pip-install", stage: null, state: "running" }), (x) => x === "进行中：暂无可报进度");
+check("waitLineText: winget + stage 缺省", waitLineText({ cmdType: "winget-install", state: "running" }), (x) => x === "进行中：暂无可报进度");
+check("waitLineText: snap=null 不出现 undefined/null", waitLineText(null), (x) => isStr(x) && !/undefined|null/.test(x));
+check("waitLineText: snap=undefined", waitLineText(undefined), (x) => isStr(x) && !/undefined|null/.test(x));
+check("waitLineText: 非对象入参", waitLineText("oops"), isStr);
+check("waitLineText: 数组入参", waitLineText([]), isStr);
+check("waitLineText: 空快照（引擎只回 {}）不冒充进度", waitLineText({}), (x) => x === "快照缺失：暂无进度可报");
+check("waitLineText: 只有状态也能出字符串", waitLineText({ state: "pending" }), (x) => isStr(x) && !/undefined|null/.test(x));
+check("waitLineText: 有阶段照常报阶段", waitLineText({ cmdType: "pip-install", stage: "installing", state: "running" }), (x) => x === "阶段：安装中");
+check("waitLineText: 终态带状态前缀", waitLineText({ unit: "bytes", state: "done", received: 1024, total: 1024 }), (x) => x === "done｜进度：100%（1024/1024 字节）");
+check("waitLineText: 错误仍报错误", waitLineText({ cmdType: "pip-install", stage: null, state: "failed", error: "pip exited 1" }), (x) => x.includes("错误：pip exited 1"));
+check("waitLineText: 错误 + 未知状态", waitLineText({ state: "failed", error: "boom" }), (x) => isStr(x) && x.includes("boom"));
+check("waitLineText: 计数型跑通", waitLineText({ cmdType: "pnpm-install", unit: "packages", state: "running", received: 12, total: 68 }), (x) => x === "进度：12/68 包");
+
+// 全形态扫描：任何输入都不得产出非字符串（这就是宿主侧的崩溃面）
+const SNAPS = [
+  null, undefined, 0, "", "x", [], {},
+  { state: "running", cmdType: "pip-install", stage: null },
+  { state: "running", cmdType: "winget-install", stage: null },
+  { state: "pending", cmdType: "git-clone" },
+  { state: "done" }, { state: "failed" }, { state: "canceled", error: null },
+  { state: "running", unit: "bytes", received: 0, total: 0 },
+  { state: "running", unit: "objects", received: null, total: null },
+  { state: "running", error: "x" },
+];
+check("waitLineText: 全形态扫描均为非空字符串", SNAPS.map((s) => waitLineText(s)), (arr) => arr.every(isStr));
+check("waitLineText: 全形态扫描无 undefined 污染", SNAPS.map((s) => waitLineText(s)), (arr) => arr.every((x) => !x.includes("undefined") && !x.includes("null")));
 
 console.log(`\n=== display: ${pass} passed, ${fail} failed ===`);
 process.exit(fail ? 1 : 0);

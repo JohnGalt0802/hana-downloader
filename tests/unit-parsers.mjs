@@ -63,6 +63,21 @@ function check(name, actual, expectFn) {
   check("exit: unknown", pp.classifyWingetExit(12345), (x) => x === null);
   check("exit: 0x80072EE2 WinINet timeout", pp.classifyWingetExit(2147954402), (x) => x && x.state === "failed" && x.error.includes("超时"));
   check("exit: 0x80072EE7 DNS", pp.classifyWingetExit(-2147012889), (x) => x && x.state === "failed");
+  // 2026-10-18 事故：Number(null) >>> 0 === 0，把「被信号杀死的安装」判成安装成功并回执宿主。
+  // 凡不是合法有限数值的，一律当未知码（null），交给调用方走通用失败分支。
+  check("exit: null 不是 0（进程被信号杀）", pp.classifyWingetExit(null), (x) => x === null);
+  check("exit: undefined 不是 0", pp.classifyWingetExit(undefined), (x) => x === null);
+  check("exit: 'abc' 不是 0", pp.classifyWingetExit("abc"), (x) => x === null);
+  check("exit: true 不是 0", pp.classifyWingetExit(true), (x) => x === null);
+  check("exit: false 不是 0", pp.classifyWingetExit(false), (x) => x === null);
+  check("exit: [] 不是 0", pp.classifyWingetExit([]), (x) => x === null);
+  check("exit: {} 不是 0", pp.classifyWingetExit({}), (x) => x === null);
+  check("exit: '' 不是 0", pp.classifyWingetExit(""), (x) => x === null);
+  check("exit: NaN 不是 0", pp.classifyWingetExit(NaN), (x) => x === null);
+  check("exit: Infinity 不是 0", pp.classifyWingetExit(Infinity), (x) => x === null);
+  check("exit: 真 0 仍是 done", pp.classifyWingetExit(0), (x) => x && x.state === "done");
+  check("exit: '0' 字符串仍是 done", pp.classifyWingetExit("0"), (x) => x && x.state === "done");
+  check("exit: 0x8A15002B 带 note", pp.classifyWingetExit(0x8A15002B), (x) => x && x.state === "done" && !!x.note);
 }
 
 // ── winget search 表格解析 ──
