@@ -672,7 +672,7 @@ export default defineApp(async (sdk) => {
               // 投递时给定稳定实例 id，让这条卡跨重载不会换身份
               cardInstanceId: stableCardId(r.taskId),
               route: "/card.html",
-              title: `下载 ${displayName}`.trim(),
+              title: displayName, // 2026-10-18 John：抬头直接显示文件名，去掉「下载 」前缀
               description: String(displayName),
               aspectRatio: "8:1",
               cardForm: "flush",
@@ -943,7 +943,7 @@ export default defineApp(async (sdk) => {
               cardId: `dl-${r.taskId}`,
               cardInstanceId: stableCardId(r.taskId),
               route: "/card.html",
-              title: `下载 ${displayName}`.trim(),
+              title: displayName, // 2026-10-18 John：抬头直接显示文件名，去掉「下载 」前缀
               description: String(displayName),
               aspectRatio: "8:1",
               cardForm: "flush",

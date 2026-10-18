@@ -1,0 +1,371 @@
+// hana-downloader-app/engine/backends/node-http.js — URL 下载 backend（Node 原生 http/https）
+// 2026-10-18 从 dlcore._run() 原地提取：行为零变化，只搬家不重写。
+//
+// 搬进来的：请求与重定向（3xx / 文本重定向）、代理优先 + 失败降级直连、断点续传
+// （Range/If-Range/.part、206/200/416 分支）、流式落盘与限速、SHA-256 校验、终态判定。
+// 留在 dlcore 的：停滞监视、elapsed、快照刷盘、终态回调（生命周期归 dlcore，传输归 backend）。
+//
+// ctx 由 dlcore 传入：
+//   task        任务对象（字段见 dlcore._createTask）
+//   dataDir     数据目录（解析代理时用）
+//   resolveProxy(dataDir, url) → 代理地址字符串（空串 = 直连）
+//   friendlyError(err)         → 人话错误文案
+//   persist()                  → dlcore._persist()，进度节流落盘用
+import fs from "node:fs";
+import http from "node:http";
+import https from "node:https";
+import { createHash } from "node:crypto";
+import { createTunnelAgent } from "../tunnel-agent.js";
+
+const SPEED_SAMPLE_MS = 700;   // 测速采样间隔
+const SPEED_SAMPLES_MAX = 5;   // 滑动窗口样本数（≈3.5s）
+const CHUNK_SLEEP_MIN_MS = 1;  // 限速时 chunk 间最小等待
+
+export const nodeHttpBackend = {
+  name: "node-http",
+  capabilities() {
+    return {
+      available: true,
+      name: "node-http",
+      features: ["resume", "sha256", "proxy", "proxy-fallback", "speed-limit", "cancel", "redirect"],
+      reason: null,
+    };
+  },
+
+  async run(ctx) {
+    const { task } = ctx;
+
+    let ws = null;
+    let wroteAnyChunk = false;
+    const hash = task.expectedSha256 ? createHash("sha256") : null;
+    const controller = task.controller;
+    let req = null;
+    // 取消：destroy 底层请求（触发 error → catch 按 canceled 处理）
+    const abortListener = () => { try { if (req) req.destroy(new AbortError("canceled by user")); } catch { /* 忽略 */ } };
+    controller.signal.addEventListener("abort", abortListener);
+    try {
+      const targetUrl = new URL(task.url);
+      // 本地回环目标永不走代理：回环流量经代理隧道既慢又不稳定（实测被中途掐断）
+      const isLoopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(targetUrl.hostname)
+        || /^127\./.test(targetUrl.hostname);
+      const proxy = isLoopback ? "" : ctx.resolveProxy(ctx.dataDir, task.url);
+      const mod = targetUrl.protocol === "https:" ? https : http;
+
+      // 请求 + 重定向（3xx 与文本重定向，如 npmmirror 的 "Redirecting to ..."）
+      // 代理策略：优先走代理，若代理失败（网络错/HTTP 4xx/5xx）自动降级直连重试一次
+      let target = task.url;
+      let res = null;
+      let preBuffer = null; // 文本重定向检测时缓冲的小 body（非重定向时写回流）
+      let lastReqErr = null;
+      let startOffset = 0; // 断点续传起始偏移（每轮请求按 received 重新计算）
+      const proxyAttempts = proxy ? [proxy, null] : [null];
+      for (let pi = 0; pi < proxyAttempts.length && !res; pi++) {
+        const useProxy = proxyAttempts[pi];
+        const useAgent = useProxy ? createTunnelAgent(useProxy) : undefined;
+        let current = target;
+        let redirects = 0;
+        try {
+          while (redirects < 5) {
+            startOffset = (task.resumable !== false ? (task.received || 0) : 0);
+            const headers = {
+              "User-Agent": "HanaAgent/1.0 (hana-downloader)",
+              "Accept": "*/*",
+              "Accept-Encoding": "identity", // 防 CDN 压缩导致字节偏移错位
+              "Range": startOffset > 0 ? `bytes=${startOffset}-` : undefined,
+              "If-Range": (task.etag || task.lastModified) || undefined,
+            };
+            if (headers["Range"] === undefined) delete headers["Range"];
+            if (headers["If-Range"] === undefined) delete headers["If-Range"];
+            res = await new Promise((resolve, reject) => {
+              const r = mod.request(current, {
+                agent: useAgent,
+                headers,
+              }, (resp) => resolve(resp));
+              req = r;
+              r.on("error", reject);
+              r.end();
+            });
+            const sc = res.statusCode || 0;
+            // 标准 3xx 重定向
+            if ((sc === 301 || sc === 302 || sc === 303 || sc === 307 || sc === 308) && res.headers.location) {
+              res.resume();
+              current = new URL(res.headers.location, current).toString();
+              redirects++;
+              continue;
+            }
+            // 416：服务器不支持 Range（或 If-Range 校验失败），删 .part 后从头下载
+            if (sc === 416 && startOffset > 0) {
+              res.resume();
+              try { if (fs.existsSync(task.partPath)) fs.unlinkSync(task.partPath); } catch { /* 忽略清理失败 */ }
+              task.received = 0;
+              continue;
+            }
+            // 4xx/5xx：代理路径下视为可能被风控，降级直连重试；直连路径直接失败
+            if (sc >= 400) {
+              res.resume();
+              if (useProxy) { res = null; break; }
+              throw new Error(`HTTP ${sc} ${res.statusMessage || ""}`);
+            }
+            // 文本重定向（如 npmmirror 返回 200 + "Redirecting to <url>"）
+            const small = await readSmallBody(res);
+            if (small) {
+              const text = small.toString("utf8");
+              const m = /^Redirecting to\s+(\S+)/.exec(text.trim());
+              if (m) {
+                current = new URL(m[1], current).toString();
+                redirects++;
+                continue;
+              }
+              preBuffer = small; // 真小文件：缓冲数据留待写回流
+            }
+            break; // 正常响应
+          }
+          if (!res) continue; // 降级直连
+        } catch (e) {
+          lastReqErr = e;
+          res = null;
+          // 代理失败降级直连；直连也失败则保留最后错误
+        }
+      }
+      if (!res) throw (lastReqErr || new Error("HTTP 请求失败"));
+
+      if (!res.statusCode || res.statusCode >= 400) throw new Error(`HTTP ${res.statusCode} ${res.statusMessage || ""}`);
+
+      // 记录响应元数据（供断点续传 If-Range 与重启恢复）
+      task.etag = res.headers["etag"] || null;
+      task.lastModified = res.headers["last-modified"] || null;
+      task.acceptRanges = (res.headers["accept-ranges"] || "none") !== "none";
+
+      // 响应分支：206 续传 / 200 从头（416 已在请求循环内处理）
+      if (res.statusCode === 206) {
+        const m = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)/.exec(res.headers["content-range"] || "");
+        if (!m) throw new Error("HTTP 206 响应缺少有效的 Content-Range 头");
+        const crStart = Number(m[1]);
+        if (crStart !== startOffset) throw new Error(`断点续传偏移不符：服务器返回 ${crStart}，期望 ${startOffset}`);
+        const crTotal = m[3] === "*" ? null : Number(m[3]);
+        if (crTotal != null && Number.isFinite(crTotal) && crTotal > 0) {
+          task.total = crTotal;
+        } else {
+          // Content-Range 无总长度：用剩余长度 + 起始偏移还原全量大小
+          const cl = parseInt(res.headers["content-length"] || "", 10);
+          task.total = Number.isFinite(cl) && cl > 0 ? cl + startOffset : null;
+        }
+        ws = await createResumeStream(task, startOffset);
+      } else {
+        // 200：Range 被忽略（或新任务无 Range），从头下载
+        if (!fs.existsSync(task.partPath)) fs.writeFileSync(task.partPath, Buffer.alloc(0));
+        fs.truncateSync(task.partPath, 0);
+        startOffset = 0;
+        task.received = 0;
+        const cl = parseInt(res.headers["content-length"] || "", 10);
+        task.total = Number.isFinite(cl) && cl > 0 ? cl : null;
+        ws = fs.createWriteStream(task.partPath, { flags: "w" });
+      }
+
+      // 流式接收 + 进度采样 + 限速（与旧 fetch 版逻辑一致）
+      await new Promise((resolve, reject) => {
+        let lastTick = Date.now();
+        let lastBytes = 0;
+        let chunkStart = Date.now();
+        const speedSample = () => {
+          const now = Date.now();
+          if (now - lastTick >= SPEED_SAMPLE_MS) {
+            const inst = (task.received - lastBytes) / ((now - lastTick) / 1000);
+            task._samples.push(inst);
+            if (task._samples.length > SPEED_SAMPLES_MAX) task._samples.shift();
+            task.speed = task._samples.reduce((a, b) => a + b, 0) / task._samples.length;
+            lastTick = now;
+            lastBytes = task.received;
+          }
+        };
+        const processChunk = (chunk) => {
+          if (task.cancelRequested) { try { if (req) req.destroy(); } catch { /* 忽略 */ } return; }
+          wroteAnyChunk = true;
+          ws.write(chunk);
+          task.received += chunk.length;
+          if (hash) hash.update(chunk); // SHA-256 流式累计
+          task._lastProgressAt = Date.now();
+          if (task.stalledAt != null) {
+            task.stalledAt = null;
+            task.stallNotified = false;
+          }
+          // 已知总大小且已收满：提前收尾（与服务端关闭边界一致）
+          if (task.total != null && task.received >= task.total) {
+            try { if (req) req.destroy(); } catch { /* 忽略 */ }
+            return;
+          }
+          // 进度节流落盘：每 1.5s 持久化一次 received（作为断点续传恢复点）
+          if (Date.now() - (task._lastPersistAt || 0) >= 1500) {
+            task._lastPersistAt = Date.now();
+            ctx.persist();
+          }
+          // 限速：暂停流 + 定时恢复
+          if (task.speedLimit > 0) {
+            const want = (chunk.length / task.speedLimit) * 1000;
+            const used = Date.now() - chunkStart;
+            if (want > used) {
+              res.pause();
+              setTimeout(() => { chunkStart = Date.now(); res.resume(); }, want - used + CHUNK_SLEEP_MIN_MS);
+            } else { chunkStart = Date.now(); }
+          }
+          speedSample();
+        };
+        if (preBuffer && preBuffer.length) processChunk(preBuffer);
+        if (preBuffer) {
+          // 小文件已由 readSmallBody 完整缓冲（读到 end），直接收尾
+          ws.end((err) => (err ? reject(err) : resolve()));
+        } else {
+          res.on("data", processChunk);
+          res.on("end", () => {
+            ws.end((err) => (err ? reject(err) : resolve()));
+          });
+          res.on("error", reject);
+          req.on("error", reject);
+        }
+      });
+
+      // 流正常结束即下载完整：总大小未知（chunked 无 Content-Length）或声明值与实际不符
+      // （如 Content-Encoding 自动解压时 received 为解压后字节）时，以实际接收为准兜底。
+      // received < total 不拉低（若服务器提前断开会走 error/abort 分支）。
+      if (task.received > 0 && (task.total == null || task.received > task.total)) task.total = task.received;
+
+      // 终态收尾：SHA-256 校验（若配置 expectedSha256）→ 通过后将 .part 改名为正式文件
+      if (task.expectedSha256 && hash) {
+        const digest = hash.digest("hex");
+        if (digest !== task.expectedSha256) {
+          task.state = "failed";
+          task.error = `SHA-256 校验失败：期望 ${task.expectedSha256}，实际 ${digest}`;
+        } else {
+          fs.renameSync(task.partPath, task.filePath);
+          task.state = "done";
+        }
+      } else {
+        fs.renameSync(task.partPath, task.filePath);
+        task.state = "done";
+      }
+      task.finishedAt = Date.now();
+    } catch (e) {
+      const aborted = task.cancelRequested || e?.name === "AbortError" || controller.signal.aborted;
+      // 注意：chunked（total=null）半途断连时 complete 恒为 false，会走下方删除分支——
+      // body 无长度声明无法验证完整性，failed + 删半成品是保守正确。勿放宽此判定为
+      // (total==null || received>=total)：会把残缺文件误判为完成保下来，比删文件更糟。
+      // 续传场景 received 从旧偏移起步，额外要求本次写过 chunk，否则请求阶段失败会误判 complete。
+      const complete = !aborted && wroteAnyChunk && task.total != null && task.received >= task.total && task.received > 0;
+      if (complete) {
+        try {
+          if (ws) await new Promise((res, rej) => ws.end((err) => (err ? rej(err) : res())));
+        } catch { /* 落盘失败则按失败处理 */ }
+        // 收满路径同样做 SHA-256 校验：不匹配则不得交付
+        if (task.expectedSha256 && hash) {
+          const digest = hash.digest("hex");
+          if (digest !== task.expectedSha256) {
+            task.state = "failed";
+            task.error = `SHA-256 校验失败：期望 ${task.expectedSha256}，实际 ${digest}`;
+            task.finishedAt = Date.now();
+            return; // 已标终态，交给 dlcore 收尾
+          }
+        }
+        if (fs.existsSync(task.partPath)) {
+          try {
+            fs.renameSync(task.partPath, task.filePath);
+            task.state = "done";
+            task.error = null;
+          } catch (re) {
+            task.state = "failed";
+            task.error = ctx.friendlyError(e) + "；落盘改名失败：" + ctx.friendlyError(re);
+          }
+        } else {
+          task.state = "failed";
+          task.error = ctx.friendlyError(e);
+        }
+      } else {
+        if (ws) { try { ws.destroy(); } catch { /* 忽略 */ } }
+        if (aborted) {
+          // canceled：保留 .part 半成品（可续传）
+          task.state = "canceled";
+          task.error = "已取消";
+        } else if (!wroteAnyChunk) {
+          // failed 且未写过任何 chunk：仅删空 .part（避免空文件）；非空 .part 保留供续传
+          try {
+            const st = fs.statSync(task.partPath);
+            if (st && st.size === 0) fs.unlinkSync(task.partPath);
+          } catch { /* .part 不存在或不可读：跳过清理 */ }
+          task.state = "failed";
+          task.error = ctx.friendlyError(e);
+        } else {
+          // failed 且写过 chunk：保留 .part，状态置 interrupted（可续传）
+          task.state = "interrupted";
+          task.error = ctx.friendlyError(e);
+        }
+      }
+      task.finishedAt = Date.now();
+    } finally {
+      try { controller.signal.removeEventListener("abort", abortListener); } catch { /* 忽略 */ }
+    }
+  },
+};
+
+// 206 续传：必须用 r+ 打开已存在的 .part，绝不能用默认的 "w"（会截断清零）。
+// fs.createWriteStream(path, { start }) 默认 flags 是 "w"：先 truncate 到 0 再从 start 写，
+// [0,startOffset) 全部被清零、状态却报 done（2026-10-18 修）。
+// r+ 不截断（文件不存在则 ENOENT），FileHandle.createWriteStream({ start }) 基于已打开的 fd，
+// 不会重新打开/截断（实测对照见提交说明）。长度不足 startOffset 属于异常状态，报错而不是硬写。
+async function createResumeStream(task, startOffset) {
+  // 从 0 开始（服务器主动给 206、我们没发 Range 的非规范响应）：无前段要保留，
+  // 保持原有 "w" 语义（建文件/截断到 0），与原实现逐字等价。
+  if (!(startOffset > 0)) return fs.createWriteStream(task.partPath, { flags: "w" });
+  let fh;
+  try {
+    fh = await fs.promises.open(task.partPath, "r+");
+  } catch (e) {
+    throw new Error(`续传失败：半成品文件不可用（${e.code || e.message}）`);
+  }
+  try {
+    const st = await fh.stat();
+    if (st.size < startOffset) {
+      throw new Error(`续传失败：半成品文件长度 ${st.size} 小于续传起点 ${startOffset}`);
+    }
+    return fh.createWriteStream({ start: startOffset });
+  } catch (e) {
+    try { await fh.close(); } catch { /* 忽略 */ }
+    throw e;
+  }
+}
+
+// 小响应缓冲：Content-Length < 4KB 时读完整 body，用于检测文本重定向
+// （npmmirror 等返回 200 + "Redirecting to <url>" 的非标准重定向）。
+// 非重定向时返回 Buffer（由调用方写回流），重定向/异常返回 null 由上层处理。
+function readSmallBody(res) {
+  const cl = parseInt(res.headers["content-length"] || "", 10);
+  if (!(Number.isFinite(cl) && cl >= 0 && cl < 4096)) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const chunks = [];
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      res.removeListener("data", onData);
+      res.removeListener("end", onEnd);
+      res.removeListener("error", onErr);
+      resolve(v);
+    };
+    const onData = (c) => {
+      chunks.push(c);
+      const total = chunks.reduce((a, b) => a + b.length, 0);
+      if (total > 8192) finish(null);
+    };
+    const onEnd = () => finish(chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0));
+    const onErr = () => finish(null);
+    res.on("data", onData);
+    res.on("end", onEnd);
+    res.on("error", onErr);
+    setTimeout(() => finish(null), 3000);
+  });
+}
+
+class AbortError extends Error {
+  constructor(msg) {
+    super(msg);
+    this.name = "AbortError";
+  }
+}
