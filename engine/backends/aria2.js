@@ -421,6 +421,68 @@ function pidAlive(pid) {
 }
 
 /**
+ * 记录文件里的实例进程是否还活着（**同步、只做粗筛**）。
+ *
+ * 为什么只算粗筛：引擎被硬杀（App reload / 宿主重启）时，它 spawn 的 aria2c 是独立进程，
+ * 不会跟着死，还会继续往同一个 `.part` 写。恢复任务时若一律按「引擎重启=任务被打断」处理，
+ * 用户就看到「下载失败」，而文件其实还在下、最后会下完，只是没人记录（2026-10-19 的误报）。
+ * 所以要区分「实例还活着」与「实例已经没了」。
+ *
+ * 但 pid 存活**不等于**实例可用：pid 可能被系统复用给别的进程。真正的判据是
+ * `aria2.getVersion` 用正确 secret 能通（见 adoptRecordedInstance）——本项目铁律：
+ * `available:true` 必须建立在真实 RPC 往返之上。这里返回 true 只代表「值得去握一次手」。
+ *
+ * @param {string} dataDir
+ * @returns {boolean}
+ */
+export function recordedInstanceAlive(dataDir) {
+  if (!dataDir) return false;
+  const rec = readRecord(path.join(dataDir, INSTANCE_FILE));
+  if (!rec || !rec.pid || !rec.port || !rec.secret) return false;
+  return pidAlive(rec.pid);
+}
+
+/**
+ * 把「上一条引擎进程留下的、仍然活着的实例」接回本进程（**不 spawn、不 kill**）。
+ *
+ * 与 _ensureInstance 的分支②同源，但刻意分开：恢复任务时绝不能因为「记录失效」就
+ * 起一个新实例——那会变成两个 aria2 同时写同一份 `.part`。接不回来就如实返回失败，
+ * 由 dlcore 退回「任务被中断」的原有语义。
+ *
+ * @param {string} dataDir
+ * @returns {Promise<{ok:boolean, port?:number, adopted?:boolean, version?:string, reason?:string}>}
+ */
+async function adoptRecordedInstance(dataDir) {
+  if (!dataDir) return { ok: false, reason: "缺少 dataDir" };
+  state.dataDir = dataDir;
+  state.recordPath = path.join(dataDir, INSTANCE_FILE);
+  // ① 本进程内存里已有就绪实例（同进程重建 TaskManager 的场景）：仍然握手一次再认
+  // dataDir 必须对得上：一个引擎进程只养一个实例，换了 dataDir 就不能认上一份的实例
+  if (state.ready && state.port && state.dataDir === dataDir
+      && (!state.proc || state.proc.exitCode === null)) {
+    const v = await probeAria2(state.port, state.secret);
+    if (v) return { ok: true, port: state.port, adopted: state.adopted === true, version: v.version };
+  }
+  // ② 记录文件里的实例：pid 活着 + getVersion 用正确 secret 能通，两个都过才算活着
+  const rec = readRecord(state.recordPath);
+  if (!rec || !rec.pid || !rec.port || !rec.secret) return { ok: false, reason: "没有可复用的实例记录" };
+  if (!pidAlive(rec.pid)) return { ok: false, reason: `记录的实例进程已不在（pid ${rec.pid}）` };
+  const v = await probeAria2(rec.port, rec.secret);
+  if (!v) return { ok: false, reason: "实例端口上 aria2 RPC 握手失败（secret/端口不匹配）" };
+  // 接回来的实例不是本进程 spawn 的：不持有 handle，只靠 pid 探活，绝不 kill
+  state.proc = null;
+  state.adopted = true;
+  state.adoptedPid = rec.pid;
+  state.port = rec.port;
+  state.secret = rec.secret;
+  state.bin = rec.bin || state.bin;
+  state.version = v.version;
+  state.ready = true;
+  invalidateDetection();
+  return { ok: true, port: rec.port, adopted: true, version: v.version };
+}
+
+/**
  * 关掉本进程 spawn 的实例。**只关自己持有的 ChildProcess**——
  * 复用来的实例（adopted）只断 RPC，不 kill（那个进程不是我们起的）。
  */
@@ -761,7 +823,14 @@ export const aria2Backend = {
     const pollFailures = { n: 0 };
 
     try {
-      gid = await submit(ctx, task);
+      // 恢复路径（引擎重启后接回活实例）：优先复用实例里已有的 gid，绝不再 addUri 一次
+      // ——那会对同一份 `.part` 起第二个下载。复用不成（gid 被清、路径也对不上）才重新提交，
+      // 此时 continue=true + `.part.aria2` 控制文件仍能续传。
+      if (task._resumeGid) {
+        task._resumeGid = null;
+        gid = await reuseExisting(task);
+      }
+      if (!gid) gid = await submit(ctx, task);
       if (!gid) {
         // submit 已经写了任务状态（不可能「结果不明还当成功」）
         return;
@@ -927,6 +996,28 @@ export const aria2Backend = {
   /** 供测试/关闭引擎时收尾：只关自己起的实例 */
   async shutdown() { return shutdownInstance(); },
 
+  /**
+   * 引擎重启后「接回」还活着的实例，并确认这条任务确实还在它那儿。
+   *
+   * 两条硬条件（缺一不可）：
+   *   1. 记录过的 pid 进程存活（只做粗筛：pid 可能被复用）
+   *   2. `aria2.getVersion` 用记录的 secret 真能通（真实 RPC 往返）
+   * 再加一条业务条件：实例里能找到这条任务（持久化的 gid，或按 `.part` 路径回找）。
+   * 全部成立才返回 ok——任何一条不成立都如实报 reason，由 dlcore 退回「任务被中断」语义。
+   *
+   * **绝不 spawn**：恢复时起新实例 = 两个 aria2 同时写同一份 `.part`。
+   *
+   * @param {{dataDir:string, task:object}} args
+   * @returns {Promise<{ok:boolean, gid?:string|null, port?:number, version?:string, adopted?:boolean, reason?:string}>}
+   */
+  async adopt({ dataDir, task } = {}) {
+    const inst = await adoptRecordedInstance(dataDir);
+    if (!inst.ok) return { ok: false, reason: inst.reason || "实例不可用" };
+    const gid = await reuseExisting(task || {});
+    if (!gid) return { ok: false, reason: "实例活着，但这条任务已不在它的队列里" };
+    return { ok: true, gid, port: inst.port, version: inst.version, adopted: inst.adopted === true };
+  },
+
   /** 供诊断：实例现状（不含 secret） */
   instanceInfo() {
     return {
@@ -947,6 +1038,71 @@ export const aria2Backend = {
 // ════════════════════════════════════════════════════════════
 // 内部：提交 / 取消 / 收尾
 // ════════════════════════════════════════════════════════════
+
+// 路径比较用的归一（Windows 大小写不敏感；盘符大小写也常不一致）
+function normPath(p) {
+  try {
+    const r = path.resolve(String(p || ""));
+    return process.platform === "win32" ? r.toLowerCase() : r;
+  } catch { return String(p || ""); }
+}
+
+/**
+ * 在实例的活动/等待/已停队列里按落盘路径找回这条任务的 gid。
+ *
+ * 为什么需要它：`aria2Gid` 是 v30 才开始持久化的，升级前创建的任务重启后没有 gid；
+ * 但它的 aria2 实例可能还在下。按 `files[].path` 匹配 `.part` 绝对路径是唯一可靠的回指
+ *（out 就是我们给的 `.part`，auto-file-renaming=false 保证不会被改名）。
+ *
+ * @param {string} partPath
+ * @returns {Promise<string|null>}
+ */
+async function findGidByPath(partPath) {
+  if (!partPath) return null;
+  const want = normPath(partPath);
+  const queries = [
+    ["aria2.tellActive", [["gid", "status", "files"]]],
+    ["aria2.tellWaiting", [0, 1000, ["gid", "status", "files"]]],
+    ["aria2.tellStopped", [0, 1000, ["gid", "status", "files"]]],
+  ];
+  for (const [method, params] of queries) {
+    let list;
+    try { list = await rpc(method, params); } catch { continue; }
+    for (const it of Array.isArray(list) ? list : []) {
+      const files = Array.isArray(it?.files) ? it.files : [];
+      if (files.some((f) => f?.path && normPath(f.path) === want)) return it.gid || null;
+    }
+  }
+  return null;
+}
+
+/**
+ * 复用实例里已有的这条任务：先用持久化的 gid，gid 不认再按落盘路径找。
+ * 成功时把 task 的归属字段对齐（这份 `.part` 确实归 aria2），返回 gid；找不到返回 null。
+ *
+ * @param {object} task
+ * @returns {Promise<string|null>}
+ */
+async function reuseExisting(task) {
+  const gid = task?.aria2Gid;
+  if (gid) {
+    try {
+      const st = await rpc("aria2.tellStatus", [gid, ["gid", "status"]]);
+      // removed = 已被 aria2 从活动列表摘掉（我们不在时它被取消了），不能当成「还在下」
+      if (st && st.status && st.status !== "removed") {
+        task.partOwner = NAME;
+        task.aria2Status = st.status;
+        return gid;
+      }
+    } catch { /* 走路径查找 */ }
+  }
+  const found = await findGidByPath(task?.partPath);
+  if (found) {
+    task.partOwner = NAME;
+    return found;
+  }
+  return null;
+}
 
 /** 提交任务，返回 gid（失败时已把 task 写成 failed 并返回 null） */
 async function submit(ctx, task) {

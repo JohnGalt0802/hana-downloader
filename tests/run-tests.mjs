@@ -24,6 +24,7 @@ const SUITES = [
   ["unit-queue.mjs", "并发队列与重试（排队放行 / 失败重跑 / 默认限速）"],
   ["unit-stall.mjs", "卡滞快照的落盘契约（起真引擎，验 sessionPath/stalledAt 带到 App 侧）"],
   ["unit-restore.mjs", "重启恢复的终态补写（running/pending → interrupted 落 finished / 幂等 / 孤儿回收）"],
+  ["unit-restore-aria2.mjs", "重启后 aria2 活实例接回（实例还在→继续跟踪到 done；实例已没→仍 interrupted；已下完→正确收尾）"],
   ["unit-atomic-final.mjs", "终态记录的原子写（写入中断不出半截 JSON / 内容与改动前一致 / 失败不留 .tmp）"],
   ["unit-theme.mjs", "声明式主题数据层（继承合并 / 校验拒收 / 默认值填满 / schema 口径）"],
   ["unit-contract.mjs", "IPC 与展示契约兜底（/list 字段齐全 / 非 JSON 回包 / displayName / stateBadge / /cancel 形状）"],

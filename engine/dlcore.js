@@ -9,7 +9,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { startWingetProbe } from "./download-probe.js";
 import { nodeHttpBackend } from "./backends/node-http.js";
-import { aria2Backend } from "./backends/aria2.js";
+import { aria2Backend, recordedInstanceAlive } from "./backends/aria2.js";
 import { capabilitiesOf, normalizeAria2Config } from "./backends/contract.js";
 // 摘要口径全仓唯一一份（snapshot 与 /list、finished/、stalled/ 共用，见 engine/summary.js）
 import { percentOf, summarizeTask } from "./summary.js";
@@ -25,7 +25,7 @@ const RESTORE_FINISHED_MAX_AGE_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_CONCURRENT = 3; // 同时运行的任务数上限（0=不限）；管理器设置里可改
 
 let _instance = null;
-const MGR_VER = 29; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished；v27=retry 以磁盘校正 received（取消后重试不再永久失败）；v28=终态记录改原子写（临时文件+fsync+rename，不再出现半截 JSON）；v29=.part 归属后端（partOwner）+ 换后端丢弃旧半成品，修「切后端续传交付带洞文件却报 done」）
+const MGR_VER = 30; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished；v27=retry 以磁盘校正 received（取消后重试不再永久失败）；v28=终态记录改原子写（临时文件+fsync+rename，不再出现半截 JSON）；v29=.part 归属后端（partOwner）+ 换后端丢弃旧半成品，修「切后端续传交付带洞文件却报 done」；v30=restore 区分「aria2 实例还活着」与「实例已没」，前者恢复运行态继续跟踪，不再误报下载失败）
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -148,7 +148,9 @@ class TaskManager {
     task.queued = false;
     task.queuedAt = null;
     task.state = "running";
-    task.startedAt = Date.now();
+    // 从 aria2 活实例接回来的任务保留原起始时间（elapsed 才是真实下载时长，不是「重启后跑了多久」）
+    task.startedAt = task._resumedStartedAt || Date.now();
+    delete task._resumedStartedAt;
     task.controller = new AbortController();
     task._lastProgressAt = Date.now();
     this._persist();
@@ -332,7 +334,12 @@ class TaskManager {
     // 边界（2026-10-18 重构）：传输归 backend，生命周期归 dlcore。
     // backend 只负责把字节弄到磁盘并写 task.state/received/total/error 等字段；
     // 停滞监视、elapsed、刷盘、终态回调都在这里包一层 try/finally。
-    const backend = await this._selectBackend(task);
+    // 恢复路径（_forceBackend）：这条任务已被确认还在某个活着的 aria2 实例里，
+    // 必须继续由 aria2 跟到底——不能重走选路（用户此刻把开关关了就会切到 node-http，
+    // 而 _alignPartOwner 会把实例正在写的 .part 删掉）。
+    const forced = task._forceBackend || null;
+    if (forced) delete task._forceBackend;
+    const backend = forced || await this._selectBackend(task);
     // 选路后、动手前：这次选中的 backend 与 .part 的归属不一致，就必须丢弃旧半成品（从头下）。
     // 放在这里而不是 retry()：选路只在这里发生（retry 只把任务排进队列）。
     this._alignPartOwner(task, backend.name);
@@ -840,7 +847,21 @@ class TaskManager {
     return { ok: true, canceled: ids };
   }
 
-  // ── 重启恢复：running → interrupted、pending → interrupted（定时器丢失），删除半成品 ──
+  // ── 重启恢复 ──
+  // 两件事分开做：
+  //   ① 同步全量恢复（历史 + 在途）——必须在返回前完成，server.js 启动即依赖 mgr.tasks 就绪
+  //   ② 异步接回「还在跑的 aria2 任务」——需要真实 RPC 握手，不能阻塞启动
+  //
+  // 为什么要 ②：aria2c 是引擎 spawn 的**独立进程**，引擎被硬杀（崩溃 / App reload / 宿主重启）
+  // 时它不会跟着死，还在继续往同一个 `.part` 写。旧语义「引擎重启 = 任务被打断」会把这种
+  // 任务标成 interrupted 并补写失败终态——用户看到「下载失败」，而文件其实还在下、最后会下完，
+  // 只是没人记录。一个跑了两小时的大文件因为 App 重启就显示失败，是明确的误报。
+  //
+  // 恢复规则（两种情形）：
+  //   A：aria2 实例还活着（pid 存活 **且** getVersion 用正确 secret 能通）且任务还在它队列里
+  //      → 不标 interrupted、不写终态，恢复成运行态继续跟踪（进度只取 RPC 的 completedLength）
+  //   B：实例已没了 / 握手失败 / 任务不在它队列里
+  //      → 保持原有语义：interrupted + 补写终态
   restore() {
     // 先把没人等的孤儿终态收掉：见 _pruneOrphanFinished 的说明。
     this._pruneOrphanFinished();
@@ -850,6 +871,8 @@ class TaskManager {
     } catch { return; }
     if (!meta || !Array.isArray(meta.tasks)) return;
     const now = Date.now();
+    // 待接回的候选：只包含「可能还在 aria2 里跑」的 URL 任务，用于后面异步验证
+    const candidates = [];
     for (const m of meta.tasks) {
       const t = this.tasks.get(m.taskId);
       if (t) continue; // 内存中已有（create/prepare 后立即持久化过）
@@ -892,12 +915,22 @@ class TaskManager {
           // .part 归属：重启后必须把「这份半成品是谁写的」一起恢复，否则选路时
           // 只能靠 .part.aria2 推断（那份控制文件可能已被清理）——推断错了就是带洞交付。
           partOwner: m.partOwner || m.backend || null,
+          // 恢复时要靠 gid 回指实例里的同一条任务（不能重新 addUri：那会对同一份 .part 起第二个下载）
+          aria2Gid: m.aria2Gid || null,
         };
         this.tasks.set(m.taskId, revived);
-        // 补写终态：引擎被 kill 时来不及走 onFinal，finished/<taskId>.json 永远不会出现，
-        // 于是 app 侧 settleWhenDone 空等 30 分钟后报「下载超时未结束」——一个假错误，
-        // 真实原因是「被应用重启打断」。这里补一条与 onFinal 同形的记录，让等待方立刻拿到真原因。
-        this._publishInterrupted(revived);
+        // 可能还在 aria2 里跑的候选：先不写终态，等真实 RPC 握手后再定（见 _resumeAria2Tasks）。
+        // 为什么要延后：一旦落了 interrupted 终态，app 侧等待方会立刻读到并报「下载失败」，
+        // 而这条任务其实还在下——那正是要修的误报。同步只做一次廉价的 pid 粗筛：
+        // 记录里的实例进程已经不在了，就没什么可等的，直接按原语义落终态。
+        if (!isCmd && this._wasAria2Task(m, partPath) && recordedInstanceAlive(this.dataDir)) {
+          candidates.push(m.taskId);
+        } else {
+          // 补写终态：引擎被 kill 时来不及走 onFinal，finished/<taskId>.json 永远不会出现，
+          // 于是 app 侧 settleWhenDone 空等 30 分钟后报「下载超时未结束」——一个假错误，
+          // 真实原因是「被应用重启打断」。这里补一条与 onFinal 同形的记录，让等待方立刻拿到真原因。
+          this._publishInterrupted(revived);
+        }
       } else {
         // 已完成/失败/取消的历史任务：全量恢复、永久保留，供卡片回放与管理器查阅。
         // 2026-10-12 John 定：不再只保留 24 小时内（原实现配合 _persist 的裁剪，
@@ -924,6 +957,98 @@ class TaskManager {
           partOwner: m.partOwner || m.backend || null,
         });
       }
+    }
+    // ② 异步接回还活着的 aria2 实例（不阻塞启动；握手不通就按 ① 的 interrupted 语义落终态）
+    this._resumePromise = candidates.length
+      ? this._resumeAria2Tasks(candidates).catch(() => { /* 见下方兜底 */ })
+        // 兜底：不管接回过程出了什么意外，剩下仍是 interrupted 的候选必须把终态补上——
+        // 否则它们既没恢复成运行态、也没落终态，app 侧会空等到自己的超时。
+        .then(() => {
+          for (const id of candidates) {
+            const t = this.tasks.get(id);
+            if (t && t.state === "interrupted") this._publishInterrupted(t);
+          }
+        })
+      : Promise.resolve();
+  }
+
+  /**
+   * 等「异步接回 aria2 活实例」这一步跑完。
+   *
+   * 为什么要公开：restore() 必须同步完成（server.js 启动即依赖 tasks 就绪），而接回需要
+   * 真实 RPC 往返。要判断最终状态的调用方（测试 / 诊断）得能等它——否则会在握手中途
+   * 读到「还是 interrupted」的中间态。不 await 也不会出错：接回失败就一直是 interrupted。
+   *
+   * @returns {Promise<void>}
+   */
+  whenRestored() {
+    return this._resumePromise || Promise.resolve();
+  }
+
+  // ── 这条任务曾经是 aria2 接管的吗（决定要不要去握一次手）──
+  // 三个依据，任一成立即候选：
+  //   · partOwner === "aria2"：c04a2c0 起由真正写 .part 的 backend 记录，最直接
+  //   · backend === "aria2"：上一轮选的传输后端（partOwner 缺失时的回填来源）
+  //   · 存在 `.part.aria2` 控制文件：aria2 多段稀疏写的铁证（即使记录字段都被抹掉）
+  _wasAria2Task(m, partPath) {
+    if (!m || m.kind === "command") return false;
+    if (m.partOwner === "aria2" || m.backend === "aria2") return true;
+    try { return !!partPath && fs.existsSync(partPath + ".aria2"); } catch { return false; }
+  }
+
+  // ── 把「还在 aria2 里跑」的任务从 interrupted 恢复成运行态（2026-10-19）──
+  //
+  // 判定必须可靠，两道硬门槛：
+  //   1. 记录过的 pid 进程存活（只算粗筛：pid 可能被复用）
+  //   2. aria2.getVersion 用记录的 secret 真能通（真实 RPC 往返，不靠端口/进程名猜）
+  // 再加一道业务门槛：实例里真能找回这条任务（持久化的 gid，或按 .part 路径回找）。
+  // 三道全过才算「还在下」；任一道不过就保持 interrupted（实例已没 / 握手不通 / 任务不在队列）。
+  //
+  // 确认还在下之后要做的四件事：
+  //   · 把已补写的 interrupted 终态**收回**（否则 app 侧等待方会先读到它而报失败）
+  //   · 状态改回 running 并重新跑 _run，让 aria2 backend 接着跟踪到收尾（含已下完的交付）
+  //   · 进度立刻用 RPC 刷一次（.part 大小在 aria2 下不是进度）
+  //   · 不动 `.part` 与 `.part.aria2`：它们正在被写入
+  async _resumeAria2Tasks(taskIds) {
+    const cfg = this._readAria2Config();
+    aria2Backend.setOptions({ bin: cfg.bin, port: cfg.port });
+    // 实例已没 / 不是 aria2：不必再挨个握手，直接保持 interrupted
+    for (const id of taskIds) {
+      const t = this.tasks.get(id);
+      if (!t || t.state !== "interrupted") continue;
+      let adopted;
+      try {
+        adopted = await aria2Backend.adopt({ dataDir: this.dataDir, task: t });
+      } catch (e) {
+        adopted = { ok: false, reason: e?.message || String(e) };
+      }
+      if (!adopted?.ok) {
+        // B 情形：实例已没 / 握手不通 / 任务不在队列 —— 保持原语义，现在才落 interrupted 终态。
+        t.resumedFromInstance = false;
+        this._publishInterrupted(t);
+        continue;
+      }
+      // 从这一刻起它是运行中任务，不是终态任务
+      t.state = "running";
+      t.queued = false;
+      t.finishedAt = null;
+      t.error = null;
+      t.speed = 0;
+      t.elapsed = 0;
+      t.resumedFromInstance = true;
+      t.backend = "aria2";
+      t.partOwner = "aria2";
+      t.aria2Gid = adopted.gid || t.aria2Gid || null;
+      t._resumeGid = true; // 让 backend.run 复用已有 gid，而不是再 addUri 一次
+      t._forceBackend = aria2Backend; // 继续由 aria2 跟到底（不重走选路，否则可能删掉正在写的 .part）
+      t._resumedStartedAt = t.startedAt || Date.now();
+      t._lastProgressAt = Date.now();
+      // 直接 _startTask，不走 _enqueueOrStart：这些任务**已经在 aria2 里跑着**，
+      // 把它们挂成 pending 等于「不跟踪一条正在下的任务」，比误报失败更糟。
+      // 并发槽位若因此超出上限，那只是如实反映了现状（aria2 并不会因为我们不跟踪就停下）。
+      // 收回误报的终态：等待方读到 interrupted 就会直接报失败
+      try { fs.rmSync(finishedPathOf(this.dataDir, t.taskId), { force: true }); } catch { /* 没文件也无所谓 */ }
+      this._startTask(t);
     }
   }
 
@@ -989,6 +1114,10 @@ class TaskManager {
           backend: t.backend || null,
           backendNote: t.backendNote || null,
           partOwner: t.partOwner || null,
+          // aria2 的 gid：重启后靠它回指实例里的同一条任务。
+          // 不落盘就只能按 .part 路径回找（也能找，但 gid 是更直接的证据，
+          // 且能区分「实例里另一条同名任务」这种罕见情形）。
+          aria2Gid: t.aria2Gid || null,
         })),
       };
       fs.mkdirSync(this.dataDir, { recursive: true });
