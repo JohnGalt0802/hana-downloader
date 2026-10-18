@@ -32,6 +32,8 @@ const SUITES = [
   ["unit-aria2-cache.mjs", "aria2 探测缓存（成功结果长缓存不重测 / 负结果 5s 重测 / 配置变更与手动刷新失效）"],
   ["unit-aria2-config.mjs", "aria2 配置归一（缺段/脏类型/边界端口/畸形输入不抛）"],
   ["unit-aria2-ui.mjs", "aria2 开关三态文案（未启用 / 已启用可用 / 已启用不可用 / 检测中）"],
+  ["unit-aria2-persist.mjs", "aria2 进度节流落盘（运行中 ≥2s 后磁盘 received>0 / 写盘频率受控 / 不用 .part 大小当进度）"],
+  ["unit-backend-switch.mjs", ".part 归属与换后端（aria2 稀疏半成品切 node-http 必须从头下，不交付带洞文件）"],
 ];
 
 function run(file) {

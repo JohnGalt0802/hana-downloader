@@ -27,6 +27,10 @@ const NAME = "aria2";
 const POLL_MS = 600;            // 轮询节拍（与 dlcore 的 SPEED_SAMPLE_MS=700 同量级）
 const SPEED_SAMPLE_MS = 700;    // 测速采样窗口
 const SPEED_SAMPLES_MAX = 5;    // 滑动窗口样本数（≈3.5s）
+// 进度节流落盘间隔（与 node-http 同口径，1.5s ≈ 每 2 秒一次）。
+// 为什么要落盘：进度原先只在内存里，引擎被硬杀后重启，restore 只能读到 0 或很早的值，
+// 用户看到两小时的下载从 0 重来（文件其实还在盘上）。
+const PERSIST_INTERVAL_MS = 1500;
 const START_TIMEOUT_MS = 12000; // 起实例 + 首次握手的总预算
 const RPC_TIMEOUT_MS = 8000;    // 单次 RPC 超时
 const POLL_FAIL_LIMIT = 8;      // 连续轮询失败次数上限（≈5s）后判定 RPC 失联
@@ -752,6 +756,8 @@ export const aria2Backend = {
     const samples = [];
     let lastTick = Date.now();
     let lastBytes = task.received || 0;
+    // 落盘去重基准：初始化为当前值，避免刚提交（received=0）时白写一次
+    task._lastPersistedReceived = task.received || 0;
     const pollFailures = { n: 0 };
 
     try {
@@ -838,6 +844,17 @@ export const aria2Backend = {
           if (task.stalledAt != null) { task.stalledAt = null; task.stallNotified = false; }
         }
 
+        // 进度节流落盘：走 dlcore 的 ctx.persist()（不另开写盘路径），
+        // 每 PERSIST_INTERVAL_MS 最多写一次，且只在 received 真的变了才写。
+        // 进度来源仍然只有 RPC 的 completedLength（mapProgress），绝不看 .part 大小。
+        // 终态由 dlcore 的 finally / 各分支自行落盘，这里不重复写终态。
+        if (task.received !== task._lastPersistedReceived
+            && now - (task._lastPersistAt || 0) >= PERSIST_INTERVAL_MS) {
+          task._lastPersistAt = now;
+          task._lastPersistedReceived = task.received;
+          ctx.persist();
+        }
+
         if (mapped.state === "complete") {
           await finalizeComplete(ctx, task, st, gid);
           return;
@@ -892,6 +909,7 @@ export const aria2Backend = {
       await syncConcurrency(state.activeTasks || 1);
       task.stage = null;
       delete task._aria2LastReceived;
+      delete task._lastPersistedReceived;
     }
   },
 
@@ -1002,6 +1020,10 @@ async function submit(ctx, task) {
     return null;
   }
   task.aria2Gid = gid;
+  // 归属标记：从这里开始这份 .part 归 aria2。aria2 写的是「多段稀疏文件」，
+  // st_size 只是最远分片写到的偏移（file-allocation=none 时一上来就是全长），
+  // 绝不能当成「已下载的连续前缀」交给 node-http 续写（那会交付带洞文件却报 done）。
+  task.partOwner = NAME;
   ctx.persist();
   return gid;
 }

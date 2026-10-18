@@ -25,7 +25,7 @@ const RESTORE_FINISHED_MAX_AGE_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_CONCURRENT = 3; // 同时运行的任务数上限（0=不限）；管理器设置里可改
 
 let _instance = null;
-const MGR_VER = 28; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished；v27=retry 以磁盘校正 received（取消后重试不再永久失败）；v28=终态记录改原子写（临时文件+fsync+rename，不再出现半截 JSON））
+const MGR_VER = 29; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished；v27=retry 以磁盘校正 received（取消后重试不再永久失败）；v28=终态记录改原子写（临时文件+fsync+rename，不再出现半截 JSON）；v29=.part 归属后端（partOwner）+ 换后端丢弃旧半成品，修「切后端续传交付带洞文件却报 done」）
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -200,6 +200,10 @@ class TaskManager {
     t.state = "pending";
     t.queued = true;
     t.queuedAt = Date.now();
+    // 升级前创建的旧任务没有 partOwner：用持久化的 backend 回填归属（aria2 任务必然写过 backend；
+    // 更早的时代只有 node-http，partOwnershipConflict 的缺省归属正是 node-http）。
+    // 必须在清 backend 之前做——清完就没有任何线索了。
+    if (!t.partOwner && t.backend) t.partOwner = t.backend;
     // backend 先清空：重试会重新选路，保留上一轮的结论会误导（“这次用的 aria2”其实是上次）
     t.backend = null;
     t.backendNote = null;
@@ -272,6 +276,11 @@ class TaskManager {
       // backendNote 记「降级/不可用」这类要看得见的原因，不隐藏失败。
       backend: null,
       backendNote: null,
+      // .part 的归属后端（"node-http" / "aria2"）：由真正开始写 .part 的 backend 设置。
+      // 为什么必须记：两种 backend 对 .part 的语义不同——node-http 当它是「从 0 开始的连续前缀」，
+      // aria2 当它是「多段稀疏写，st_size 只是最远分片写到的偏移」。换后端接着写就是交付带洞文件
+      // 却报 done（2026-10-19 实测：9.8% 取消后重试，洞占 75.84%，状态 done）。
+      partOwner: null,
       _lastPersistAt: 0,
     };
     this.tasks.set(taskId, task);
@@ -324,6 +333,9 @@ class TaskManager {
     // backend 只负责把字节弄到磁盘并写 task.state/received/total/error 等字段；
     // 停滞监视、elapsed、刷盘、终态回调都在这里包一层 try/finally。
     const backend = await this._selectBackend(task);
+    // 选路后、动手前：这次选中的 backend 与 .part 的归属不一致，就必须丢弃旧半成品（从头下）。
+    // 放在这里而不是 retry()：选路只在这里发生（retry 只把任务排进队列）。
+    this._alignPartOwner(task, backend.name);
     this._startStallMonitor(task);
     try {
       await backend.run({
@@ -343,6 +355,8 @@ class TaskManager {
           && !task.aria2Gid && (task.received || 0) === 0 && task.state !== "done") {
         task.backend = nodeHttpBackend.name;
         task.backendNote = `aria2 不可用，已降级 node-http：${e.message}`;
+        // 降级同样是「换后端」：如果 .part 是 aria2 写的，同样不能拿它当连续前缀续写。
+        this._alignPartOwner(task, nodeHttpBackend.name);
         task.error = null;
         task.state = "running";
         task.aria2Gid = null;
@@ -405,6 +419,49 @@ class TaskManager {
       task.backendNote = `backend 选择失败（${e?.message || e}），已用 node-http`;
       return nodeHttpBackend;
     }
+  }
+
+  // ── .part 归属与本次选中的 backend 对齐（2026-10-19）──
+  // 两种 backend 对 .part 的语义互不兼容，绝不能拿同一份半成品接力：
+  //   · node-http：把它当「从 0 开始的连续前缀」，Range 起点 = 文件大小
+  //   · aria2：把它当「多段稀疏写」，st_size 只是最远分片写到的偏移
+  //     （file-allocation=none 时一上来就是全长，实测 9.8% 进度时 .part 已 78.8%）
+  // 换后端接着写 = 把洞当成已下载的字节交付出去，状态还报 done（实测：洞占 75.84%、SHA 不符、绿勾）。
+  // 洞检测行不通（真实内容的零字节与空洞无法区分），唯一可靠的依据是「这个 .part 是谁写的」。
+  // 所以：归属与本次 backend 不一致 → 丢掉半成品与控制文件、received 归零、从头下。
+  // 进度归零是看得见的，比绿勾配坏文件好得多。
+  // 归属一致 → 一律保持现状（续传行为不变）。
+  //
+  // 归属推断（partOwner 为空时）：
+  //   · .part.aria2 存在 → aria2（那份控制文件本身就是 aria2 写的铁证，多段稀疏必然带它）
+  //   · 否则 → node-http（升级前的任务只可能是 node-http，那时还没有 aria2 backend）
+  // 这样既不丢老任务的续传能力，又不会把 aria2 的稀疏文件当连续前缀。
+  _alignPartOwner(task, backendName) {
+    if (!task || task.kind === "command" || !task.partPath || !backendName) return false;
+    const ctlPath = task.partPath + ".aria2";
+    let size = 0;
+    let ctlExists = false;
+    try { size = fs.existsSync(task.partPath) ? fs.statSync(task.partPath).size : 0; } catch { size = 0; }
+    try { ctlExists = fs.existsSync(ctlPath); } catch { ctlExists = false; }
+    // 没有半成品也没有控制文件：干净开局，归属跟着本次 backend 走
+    if (size <= 0 && !ctlExists) {
+      task.partOwner = backendName;
+      return false;
+    }
+    const owner = task.partOwner || (ctlExists ? "aria2" : "node-http");
+    if (owner === backendName) {
+      task.partOwner = backendName; // 归属一致（含推断值落定）：续传行为保持现状
+      return false;
+    }
+    try { fs.rmSync(task.partPath, { force: true }); } catch { /* 忽略清理失败 */ }
+    try { fs.rmSync(ctlPath, { force: true }); } catch { /* 忽略清理失败 */ }
+    task.partOwner = backendName;
+    task.received = 0;
+    const why = owner
+      ? `后端已切换（${owner} → ${backendName}），旧半成品不可续用，重新下载`
+      : `半成品归属不明，重新下载`;
+    task.backendNote = task.backendNote ? `${task.backendNote}；${why}` : why;
+    return true;
   }
 
   // engine-config.json 的 aria2 段（只读；开关由 W3 的管理器设置负责写）。
@@ -832,6 +889,9 @@ class TaskManager {
           resumable: isCmd ? false : (m.resumable !== false),
           backend: m.backend || null,
           backendNote: m.backendNote || null,
+          // .part 归属：重启后必须把「这份半成品是谁写的」一起恢复，否则选路时
+          // 只能靠 .part.aria2 推断（那份控制文件可能已被清理）——推断错了就是带洞交付。
+          partOwner: m.partOwner || m.backend || null,
         };
         this.tasks.set(m.taskId, revived);
         // 补写终态：引擎被 kill 时来不及走 onFinal，finished/<taskId>.json 永远不会出现，
@@ -861,6 +921,7 @@ class TaskManager {
           resumable: m.kind === "command" ? false : (m.resumable !== false),
           backend: m.backend || null,
           backendNote: m.backendNote || null,
+          partOwner: m.partOwner || m.backend || null,
         });
       }
     }
@@ -927,6 +988,7 @@ class TaskManager {
           resumable: t.resumable !== false,
           backend: t.backend || null,
           backendNote: t.backendNote || null,
+          partOwner: t.partOwner || null,
         })),
       };
       fs.mkdirSync(this.dataDir, { recursive: true });

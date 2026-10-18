@@ -165,6 +165,10 @@ export const nodeHttpBackend = {
       task.lastModified = res.headers["last-modified"] || null;
       task.acceptRanges = (res.headers["accept-ranges"] || "none") !== "none";
 
+      // 归属标记：从这里开始（即将建写流写 .part）这份半成品归 node-http。
+      // 语义声明：node-http 把 .part 当「从 0 开始的连续前缀」，所以只有同样语义的写入者才能续写。
+      task.partOwner = "node-http";
+
       // 响应分支：206 续传 / 200 从头（416 已在请求循环内处理）
       if (res.statusCode === 206) {
         const m = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)/.exec(res.headers["content-range"] || "");
