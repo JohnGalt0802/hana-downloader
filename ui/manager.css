@@ -487,3 +487,103 @@ html, body {
   color: var(--mgr-muted, #6B6F73);
   white-space: nowrap;
 }
+
+/* ── aria2 加速开关（2026-10-18 W3）── */
+.mgr-settings-section {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--mgr-border-soft, rgba(0, 0, 0, 0.06));
+}
+.mgr-settings-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+}
+.mgr-settings-toggle-label {
+  font-size: 13px;
+  color: var(--mgr-text, #3B3D3F);
+}
+/* 开关本体：轨道 + 滑块，两态只靠 .on 切换，禁用态降不透明度 */
+.mgr-toggle {
+  position: relative;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 18px;
+  padding: 0;
+  border-radius: 9px;
+  border: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.18));
+  background: var(--mgr-input-bg, rgba(0, 0, 0, 0.05));
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.mgr-toggle::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--mgr-muted, #8E9196);
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+.mgr-toggle.on {
+  background: var(--mgr-accent, #537D96);
+  border-color: var(--mgr-accent, #537D96);
+}
+.mgr-toggle.on::after {
+  transform: translateX(16px);
+  background: var(--mgr-bg, #FFFFFF);
+}
+.mgr-toggle:disabled { opacity: 0.55; cursor: default; }
+.mgr-toggle:focus-visible { outline: 2px solid var(--mgr-accent, #537D96); outline-offset: 2px; }
+
+.mgr-settings-status {
+  font-size: 11px;
+  padding: 0 8px 4px;
+  word-break: break-all;
+  line-height: 1.5;
+}
+.mgr-settings-status.tone-muted { color: var(--mgr-muted, #8E9196); }
+.mgr-settings-status.tone-probing { color: var(--mgr-muted, #8E9196); }
+.mgr-settings-status.tone-ok { color: var(--mgr-success, #7BAE7F); }
+.mgr-settings-status.tone-danger { color: var(--mgr-danger, #8B3A3A); }
+/* 不可用要醒目但不能只靠颜色（色弱/深色主题）：加一道左侧竖条 */
+.mgr-settings-status.tone-danger {
+  border-left: 2px solid var(--mgr-danger, #8B3A3A);
+  padding-left: 6px;
+  font-weight: 500;
+}
+.mgr-settings-note {
+  font-size: 11px;
+  color: var(--mgr-muted, #8E9196);
+  padding: 0 8px 4px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.mgr-settings-adv {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--mgr-muted, #8E9196);
+  cursor: pointer;
+  border-radius: 6px;
+}
+.mgr-settings-adv:hover { background: var(--mgr-hover, rgba(0, 0, 0, 0.05)); color: var(--mgr-text, #3B3D3F); }
+.mgr-settings-adv-body { padding: 0 8px 6px; }
+.mgr-settings-text {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  font-size: 12px;
+  color: var(--mgr-text, #3B3D3F);
+  background: var(--mgr-bg, #FFFFFF);
+  border: 1px solid var(--mgr-border, rgba(0, 0, 0, 0.14));
+  border-radius: 6px;
+}
+.mgr-settings-text:focus { outline: none; border-color: var(--mgr-accent, #537D96); }

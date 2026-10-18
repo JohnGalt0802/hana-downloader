@@ -4,7 +4,7 @@
 
 import { hana } from "./assets/sdk.js";
 // 阶段文案、计数单位与任务形态判定都有唯一来源（Node 侧 index.js 同用这个模块）
-import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./shared/display.js";
+import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask, ARIA2_LIMIT_NOTE, aria2StatusText } from "./shared/display.js";
 
 (function () {
   "use strict";
@@ -73,6 +73,7 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
     "/download/reveal": { path: "engine/reveal", method: "POST" },
     "/download/retry": { path: "retry", method: "POST" }, // 走 App 路由：App 要起终态守望，好把重试结果通知给 agent
     "/settings": { path: "engine/settings", method: null },
+    "/aria2/status": { path: "engine/aria2/status", method: "GET" }, // 只读探测（2026-10-18 W3）
     "/diag": { path: "engine/ping", method: "GET" },
   };
 
@@ -781,6 +782,167 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask } from "./sha
     menu.appendChild(opt3);
     menu.appendChild(opt4);
     menu.appendChild(opt5);
+
+    // aria2 加速开关（2026-10-18 W3）。整段包在 try 里：探测失败/回包异常
+    // 只影响本区状态行，绝不把整个设置菜单做掉。
+    try {
+      menu.appendChild(aria2Block());
+    } catch (e) {
+      var broke = el("div", "mgr-settings-note", "aria2 开关加载失败：" + (e && e.message ? e.message : e));
+      menu.appendChild(broke);
+    }
+  }
+
+  // aria2 加速开关：开关 + 三态状态行 + 显示限制说明 + 高级路径输入（默认折叠）。
+  // 契约（与引擎侧对齐）：
+  //   · POST /settings 的 body 必须是 { aria2: { enabled, bin, port } } 整段——
+  //     引擎用 normalizeAria2Config(整份配置) 归一，只发 enabled 会把 bin/port 抹成默认值。
+  //   · 能力探测走只读端点 GET /aria2/status（回 capabilities：available/reason/version/port）。
+  function aria2Block() {
+    var wrap = el("div", "mgr-settings-section");
+    var head = el("div", "mgr-settings-toggle-row");
+    var sw = el("button", "mgr-toggle");
+    sw.type = "button";
+    sw.setAttribute("role", "switch");
+    var swLabel = el("span", "mgr-settings-toggle-label", "启用 aria2 加速");
+    head.appendChild(sw);
+    head.appendChild(swLabel);
+    var status = el("div", "mgr-settings-status");
+    var note = el("div", "mgr-settings-note", ARIA2_LIMIT_NOTE);
+
+    // 高级：aria2c 路径（留空 = 自动探测），默认折叠
+    var advBtn = el("button", "mgr-settings-adv", "高级：aria2c 路径");
+    advBtn.type = "button";
+    var advBody = el("div", "mgr-settings-adv-body");
+    advBody.style.display = "none";
+    var binInput = document.createElement("input");
+    binInput.type = "text";
+    binInput.className = "mgr-settings-text";
+    binInput.placeholder = "留空 = 自动探测（PATH / WinGet / scoop / choco）";
+    binInput.spellcheck = false;
+    var advHint = el("div", "mgr-settings-note", "填了但文件不存在时判定为不可用（不会静默回落自动探测），改完立刻重新探测。");
+    advBody.appendChild(binInput);
+    advBody.appendChild(advHint);
+
+    wrap.appendChild(head);
+    wrap.appendChild(status);
+    wrap.appendChild(note);
+    wrap.appendChild(advBtn);
+    wrap.appendChild(advBody);
+
+    var st = { enabled: false, bin: "", port: 6802, cap: null, probing: false, busy: false, error: null };
+    function readCfg() {
+      var a = settings && settings.aria2;
+      st.enabled = !!(a && a.enabled === true);
+      st.bin = a && typeof a.bin === "string" ? a.bin : "";
+      var p = a ? Number(a.port) : NaN;
+      st.port = Number.isInteger(p) && p > 0 && p <= 65535 ? p : 6802;
+    }
+
+    function paint() {
+      var r = aria2StatusText({ enabled: st.enabled, cap: st.cap, probing: st.probing, error: st.error });
+      status.textContent = r.text;
+      status.className = "mgr-settings-status tone-" + r.tone;
+      sw.setAttribute("aria-checked", st.enabled ? "true" : "false");
+      if (st.enabled) sw.classList.add("on"); else sw.classList.remove("on");
+      sw.disabled = st.busy;
+      sw.title = st.enabled ? "点击关闭 aria2 加速" : "点击开启 aria2 加速";
+    }
+
+    // 探测：只在开启时打；失败只写状态行（tone=danger），不抛、不锁菜单
+    function probe() {
+      if (!st.enabled) { st.cap = null; st.error = null; st.probing = false; paint(); return Promise.resolve(); }
+      st.probing = true;
+      paint();
+      return apiFetch("/aria2/status", { cache: "no-store" })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d && d.ok === false) { st.cap = null; st.error = d.error || "探测失败"; }
+          else if (d && typeof d.available === "boolean") { st.cap = d; st.error = null; }
+          else { st.cap = null; st.error = "探测回包不合法"; }
+        })
+        .catch(function () { st.cap = null; st.error = "探测请求失败（引擎不可达）"; })
+        .then(function () { st.probing = false; paint(); });
+    }
+
+    function saveAria2(payload, okText) {
+      return apiFetch("/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ aria2: payload }),
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (!data || !data.ok) { hint("aria2 设置保存失败：" + ((data && data.error) || "未知错误")); return false; }
+          settings = data.settings || settings;
+          readCfg();
+          binInput.value = st.bin;
+          hint(okText);
+          return true;
+        })
+        .catch(function () { hint("aria2 设置保存失败：网络错误"); return false; });
+    }
+
+    sw.onclick = function (e) {
+      e.stopPropagation(); // 菜单外有 document 级点击监听，不拦会关菜单
+      if (st.busy) return;
+      var next = !st.enabled;
+      st.busy = true;
+      // 乐观切换：先把开关拨过去并进「检测中…」，别让人对着空白猜
+      st.enabled = next;
+      st.cap = null;
+      st.error = null;
+      st.probing = next;
+      paint();
+      saveAria2({ enabled: next, bin: st.bin, port: st.port }, next ? "已开启 aria2 加速" : "已关闭 aria2 加速")
+        .then(function (ok) {
+          if (!ok) {
+            // 保存失败：开关回滚（错误已由 hint 明确报出），再按回滚后的真实状态重探一次，
+            // 不把「上一次的 cap」留着冒充当前状态
+            st.enabled = !next;
+            st.cap = null;
+            st.error = null;
+            return probe();
+          }
+          return probe();
+        })
+        .then(function () { st.busy = false; paint(); })
+        .catch(function () {
+          st.enabled = !next; st.probing = false; st.busy = false; paint();
+          hint("aria2 开关切换失败");
+        });
+    };
+
+    advBtn.onclick = function (e) {
+      e.stopPropagation();
+      var open = advBody.style.display === "none";
+      advBody.style.display = open ? "block" : "none";
+      advBtn.textContent = open ? "高级：aria2c 路径（收起）" : "高级：aria2c 路径";
+      if (open) { try { binInput.focus(); } catch (e2) { /* 忽略 */ } }
+    };
+    // 输入框内的点击/按键都不能冒泡到 document（否则菜单被关）
+    advBody.onclick = function (e) { e.stopPropagation(); };
+    advBody.onmousedown = function (e) { e.stopPropagation(); };
+
+    function commitBin() {
+      var v = String(binInput.value || "").trim();
+      if (v === st.bin) return;
+      saveAria2({ enabled: st.enabled, bin: v, port: st.port }, v ? "已设置 aria2c 路径" : "已清空 aria2c 路径（自动探测）")
+        .then(function (ok) { if (ok) return probe(); })
+        .catch(function () { hint("aria2c 路径保存失败"); });
+    }
+    binInput.onkeydown = function (e) {
+      e.stopPropagation();
+      if (e.key === "Enter") commitBin();
+    };
+    binInput.onblur = commitBin;
+
+    readCfg();
+    binInput.value = st.bin;
+    paint();
+    // 打开菜单就探一次（未启用时不打端点，避免无意义的实例拉起）
+    probe();
+    return wrap;
   }
 
   // 数值型设置行：标签 + 数字输入框 + 单位，回车或失焦即保存。

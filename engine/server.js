@@ -13,6 +13,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { getTaskManager, resolveWingetBin } from "./dlcore.js";
+import { aria2Backend } from "./backends/aria2.js";
+import { normalizeAria2Config } from "./backends/contract.js";
 import { parseWingetSearch } from "./progress-parsers.js";
 import { ENGINE_PORT } from "./engine-port.js";
 import { summarizeTask } from "./summary.js";
@@ -519,6 +521,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET") {
       // proxyMode 由 config.json 归一而来（dlcore.js 读的是那个文件，不是 engine-config.json）
       const s = { ...loadCfg(), proxyMode: normalizeProxyMode(loadUserCfg().proxy) };
+      s.aria2 = normalizeAria2Config(s);
       return send(200, { ok: true, settings: s });
     }
     if (req.method === "POST") {
@@ -541,12 +544,37 @@ const server = http.createServer(async (req, res) => {
           log(`proxyMode set | ${mode}`);
         }
         const next = { ...loadCfg(), ...body };
+        // aria2 段（2026-10-18 W2）：只归一形状，不在这里做开关（W3 的管理器 UI 负责）。
+        // 不传就不写（保持「没有这段 = 关闭」的默认语义，不被动地给老配置插一段）。
+        if ("aria2" in body) next.aria2 = normalizeAria2Config(next);
         fs.mkdirSync(DATA_DIR, { recursive: true });
         fs.writeFileSync(CFG_FILE, JSON.stringify(next, null, 2), "utf8");
         // 改设置即时生效：把新的并发上限与默认限速灌进任务管理器，不等下一次发起
         try { mgr.applyConfig(next); } catch (e2) { log(`applyConfig ERR ${e2?.message || e2}`); }
-        return send(200, { ok: true, settings: { ...next, proxyMode: normalizeProxyMode(loadUserCfg().proxy) } });
+        return send(200, { ok: true, settings: { ...next, aria2: normalizeAria2Config(next), proxyMode: normalizeProxyMode(loadUserCfg().proxy) } });
       } catch (e) { return send(500, { error: String(e?.message || e) }); }
+    }
+  }
+
+  // ── aria2 能力探测（2026-10-18 W3，只读）────────────────────
+  // 为什么要有这个端点：管理器要显示「已启用 · aria2 1.37.0 · 端口 6802」或
+  // 「已启用但不可用：<reason>」，这些只有 aria2Backend.capabilities() 知道。
+  // 本端点只读：不写配置、不选 backend、不碰任何任务；回包形状就是 capabilities 回包。
+  // 副作用只有一个（且正是被调用的目的）：开启状态下会复用/拉起受管实例来真实握手。
+  // 探测抛错也回 200 + available:false，让 UI 能把原因写在状态行里，而不是拿个 500 干瞪眼。
+  if (u.pathname === "/aria2/status" && req.method === "GET") {
+    try {
+      const cfg = normalizeAria2Config(loadCfg());
+      // 未启用就直接答，不调 capabilities()：探测会拉起受管实例，
+      // 「关着的时候被随便探一下就把 aria2c 起起来」不是用户要的副作用。
+      if (!cfg.enabled) {
+        return send(200, { ok: true, enabled: false, available: false, name: "aria2", features: [], reason: "aria2 未启用" });
+      }
+      aria2Backend.setOptions({ bin: cfg.bin, port: cfg.port });
+      const cap = await aria2Backend.capabilities({ dataDir: DATA_DIR });
+      return send(200, { ok: true, enabled: cfg.enabled, ...cap });
+    } catch (e) {
+      return send(200, { ok: true, available: false, name: "aria2", features: [], reason: `探测失败：${e?.message || e}` });
     }
   }
 
@@ -603,6 +631,18 @@ server.listen(PORT, "127.0.0.1", () => {
   // 就绪标记必须独占一行且与 service.readyMarker 精确匹配
   console.log(READY_MARKER);
 });
+
+// 优雅退出：关掉**本引擎自己起的** aria2 实例（2026-10-18 W2）——
+// 只关自己 spawn 的那个 ChildProcess，绝不 taskkill aria2c.exe（会误杀别人的）。
+// 硬杀（taskkill /F）时这里跑不到，靠 aria2 的 save-session + 实例记录文件下次复用。
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  try {
+    process.once(sig, async () => {
+      try { await aria2Backend.shutdown(); } catch { /* 退出路径不报错 */ }
+      process.exit(0);
+    });
+  } catch { /* 平台不支持该信号 */ }
+}
 
 // ── 通用子进程捕获（同步查询用：winget search）──
 // 收 stdout/stderr 全文；超时杀进程（kill 后 close 会照常回来）。

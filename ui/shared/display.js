@@ -156,3 +156,60 @@ export function waitLineText(snap) {
   const text = snap.error ? `${line}｜错误：${snap.error}` : line;
   return typeof text === "string" && text ? text : "暂无进度可报";
 }
+
+// ── aria2 加速开关的文案（2026-10-18 W3，管理器设置菜单用）────────────
+
+/**
+ * 显示限制说明。必须显示在状态行下方。
+ *
+ * 为什么要写死一句：命令型任务（git clone / pip / pnpm / winget）是外部程序自己下网，
+ * aria2 接不进去，开关对它们天然无效。不说清楚，用户会以为「开了没效果」。
+ */
+export const ARIA2_LIMIT_NOTE = "aria2 只加速普通文件下载；git clone / pip / pnpm 等命令型任务由对应程序自行下载，不受影响。";
+
+/** 状态行里两个固定出口的文案。 */
+export const ARIA2_STATUS_TEXT = Object.freeze({ off: "未启用", probing: "检测中…" });
+
+/**
+ * aria2 状态行文案的唯一口径（三态 + 检测中，共四条出口）。
+ *
+ *   检测中      → 「检测中…」
+ *   未启用      → 「未启用」
+ *   启用且可用  → 「已启用 · aria2 1.37.0 · 端口 6802」
+ *   启用不可用  → 「已启用但不可用：<reason（来自 capabilities）>」
+ *
+ * 口径：**任何输入都不抛、且永远不出现 undefined/null**。capabilities 缺 version / port 时
+ * 只省掉那一段，不写占位符（`aria2 undefined` 这种脏话会直接被用户看到）。
+ *
+ * @param {object} [input]
+ * @param {boolean} [input.enabled] settings.aria2.enabled
+ * @param {object|null} [input.cap] capabilities 回包 { available, version, port, reason }
+ * @param {boolean} [input.probing] 正在探测（优先于一切，避免用户面对空白/旧值）
+ * @param {string} [input.error] 探测请求本身失败时的错误文案（拿不到 cap 时兜底）
+ * @returns {{ text: string, tone: "muted"|"probing"|"ok"|"danger", available: boolean }}
+ */
+export function aria2StatusText(input = {}) {
+  const src = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  if (src.probing === true) {
+    return { text: ARIA2_STATUS_TEXT.probing, tone: "probing", available: false };
+  }
+  if (src.enabled !== true) {
+    return { text: ARIA2_STATUS_TEXT.off, tone: "muted", available: false };
+  }
+  const cap = src.cap && typeof src.cap === "object" && !Array.isArray(src.cap) ? src.cap : null;
+  // 取属性一律走 safeGet：cap 是老对象也可能带着会抛的 getter（探测回包被代理页/畸形 JSON 污染时），
+  // 一个属性读取抛错不能把整个设置菜单带下去。
+  const safeGet = (obj, key) => { try { return obj ? obj[key] : undefined; } catch { return undefined; } };
+  if (cap && safeGet(cap, "available") === true) {
+    const parts = ["已启用"];
+    const verRaw = safeGet(cap, "version");
+    const ver = typeof verRaw === "string" ? verRaw.trim() : "";
+    if (ver) parts.push(`aria2 ${ver}`);
+    const port = Number(safeGet(cap, "port"));
+    if (Number.isInteger(port) && port > 0 && port <= 65535) parts.push(`端口 ${port}`);
+    return { text: parts.join(" · "), tone: "ok", available: true };
+  }
+  const pickText = (v) => (typeof v === "string" && v.trim() ? v.trim() : "");
+  const reason = pickText(cap && safeGet(cap, "reason")) || pickText(src.error) || "探测失败，原因未知";
+  return { text: `已启用但不可用：${reason}`, tone: "danger", available: false };
+}

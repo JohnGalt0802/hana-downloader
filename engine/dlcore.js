@@ -9,15 +9,21 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { startWingetProbe } from "./download-probe.js";
 import { nodeHttpBackend } from "./backends/node-http.js";
-// 百分比口径全仓唯一一份（snapshot 与 /list 的摘要共用，见 engine/summary.js）
-import { percentOf } from "./summary.js";
+import { aria2Backend } from "./backends/aria2.js";
+import { capabilitiesOf, normalizeAria2Config } from "./backends/contract.js";
+// 摘要口径全仓唯一一份（snapshot 与 /list、finished/、stalled/ 共用，见 engine/summary.js）
+import { percentOf, summarizeTask } from "./summary.js";
 
 const TASKS_FILE = "tasks.json";
+// restore 时的孤儿终态回收阈值（见 _pruneOrphanFinished）：
+// 正常路径是等待方「读走即删」，最长等待方 settleWhenDone 是 30 分钟（900×2s），
+// 超过 1 小时还没人读的终态文件就是没人等了。
+const RESTORE_FINISHED_MAX_AGE_MS = 60 * 60 * 1000;
 // 任务记录持久化（2026-10-12 John 定）：不再按条数自动裁剪，见 _createTask / _persist / restore。
 const DEFAULT_MAX_CONCURRENT = 3; // 同时运行的任务数上限（0=不限）；管理器设置里可改
 
 let _instance = null;
-const MGR_VER = 24; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf）
+const MGR_VER = 26; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished）
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -188,6 +194,11 @@ class TaskManager {
     t.state = "pending";
     t.queued = true;
     t.queuedAt = Date.now();
+    // backend 先清空：重试会重新选路，保留上一轮的结论会误导（“这次用的 aria2”其实是上次）
+    t.backend = null;
+    t.backendNote = null;
+    t.aria2Gid = null;
+    t.aria2Status = null;
     this._persist();
     this._pumpQueue();
     return { ok: true, taskId: t.taskId, state: t.state, queued: t.queued === true };
@@ -251,6 +262,10 @@ class TaskManager {
       acceptRanges: false,
       expectedSha256: expectedSha256 || null,
       resumable: kind === "command" ? false : (resumable !== false),
+      // 实际使用的传输 backend（"node-http" / "aria2"，由 _selectBackend 写）；
+      // backendNote 记「降级/不可用」这类要看得见的原因，不隐藏失败。
+      backend: null,
+      backendNote: null,
       _lastPersistAt: 0,
     };
     this.tasks.set(taskId, task);
@@ -302,7 +317,7 @@ class TaskManager {
     // 边界（2026-10-18 重构）：传输归 backend，生命周期归 dlcore。
     // backend 只负责把字节弄到磁盘并写 task.state/received/total/error 等字段；
     // 停滞监视、elapsed、刷盘、终态回调都在这里包一层 try/finally。
-    const backend = nodeHttpBackend; // 后续会在这里按配置选 backend
+    const backend = await this._selectBackend(task);
     this._startStallMonitor(task);
     try {
       await backend.run({
@@ -312,6 +327,38 @@ class TaskManager {
         friendlyError,
         persist: () => this._persist(),
       });
+    } catch (e) {
+      // aria2 起不来 / 半路失联属于「基础设施不可用」，不是「这个文件下不下来」。
+      // 只在**一点数据都还没写、而且从没拿到 gid** 的时候降级回 node-http：
+      //   · 没写字节 → 换 backend 不会产生第二份半成品，也不会把 aria2 的预分配文件当进度
+      //   · 没拿到 gid → RPC 不可达时那个 aria2 进程已经没了，不存在「它在后台偷偷下载而这边也写」的双写风险
+      // 已经传了一部分就如实报错——绝不悄悄换 backend 再报成功（那正是「state=done 文件却不对」的老坑）。
+      if (e?.code === "ARIA2_UNAVAILABLE" && backend !== nodeHttpBackend
+          && !task.aria2Gid && (task.received || 0) === 0 && task.state !== "done") {
+        task.backend = nodeHttpBackend.name;
+        task.backendNote = `aria2 不可用，已降级 node-http：${e.message}`;
+        task.error = null;
+        task.state = "running";
+        task.aria2Gid = null;
+        task.aria2Status = null;
+        task.stage = null;
+        await nodeHttpBackend.run({
+          task,
+          dataDir: this.dataDir,
+          resolveProxy,
+          friendlyError,
+          persist: () => this._persist(),
+        });
+      } else {
+        // backend 抛错 = 「没完成」。绝不能带着 running 静默结束（_run 是后台调用，
+        // 这里若直接 rethrow 会变成不是任何人接的 unhandledRejection，任务永远挂 running）。
+        const aborted = task.cancelRequested === true || task.controller?.signal?.aborted;
+        if (task.state !== "done" && task.state !== "canceled") {
+          task.state = aborted ? "canceled" : "interrupted";
+          task.error = aborted ? (task.error || "已取消") : (task.error || `${backend.name} 传输异常：${friendlyError(e)}`);
+          task.finishedAt = Date.now();
+        }
+      }
     } finally {
       this._stopStallMonitor(task);
       task.elapsed = (task.finishedAt || Date.now()) - (task.startedAt || Date.now());
@@ -319,6 +366,57 @@ class TaskManager {
       this._persist();
       this._fireFinal(task);
     }
+  }
+
+  // ── backend 选择（2026-10-18，W2）──
+  // 规则：命令型永不进来（_run 顶部已分流）；URL 任务在「配置开启 + aria2 真的可用」时走 aria2，
+  // 其余一律 node-http。**engine-config.json 没有 aria2 段 → 关闭 → 行为与改造前完全一致。**
+  // 选中的名字写进 task.backend，供 UI/摘要显示（诊断「这条到底走的哪条路」）。
+  async _selectBackend(task) {
+    if (task.kind === "command") {
+      task.backend = nodeHttpBackend.name;
+      return nodeHttpBackend;
+    }
+    // 选择本身绝不允许把任务搞死：任何异常都是「不知道 aria2 行不行」，那就走久经考验的 node-http。
+    try {
+      const cfg = this._readAria2Config();
+      aria2Backend.setOptions({ bin: cfg.bin, port: cfg.port });
+      if (!cfg.enabled) {
+        task.backend = nodeHttpBackend.name;
+        return nodeHttpBackend;
+      }
+      const cap = await capabilitiesOf(aria2Backend, { dataDir: this.dataDir });
+      if (!cap.available) {
+        task.backend = nodeHttpBackend.name;
+        task.backendNote = `aria2 不可用（${cap.reason || "未知原因"}），已用 node-http`;
+        return nodeHttpBackend;
+      }
+      task.backend = aria2Backend.name;
+      task.backendNote = null;
+      return aria2Backend;
+    } catch (e) {
+      task.backend = nodeHttpBackend.name;
+      task.backendNote = `backend 选择失败（${e?.message || e}），已用 node-http`;
+      return nodeHttpBackend;
+    }
+  }
+
+  // engine-config.json 的 aria2 段（只读；开关由 W3 的管理器设置负责写）。
+  // 读盘按 mtime 缓存：每次下载都读一遍 JSON 太浪费，但改配置又必须立即生效。
+  // 归一逻辑只有一份：engine/backends/contract.js 的 normalizeAria2Config（server 侧共用）。
+  _readAria2Config() {
+    const file = path.join(this.dataDir, "engine-config.json");
+    let mtime = 0;
+    try { mtime = fs.statSync(file).mtimeMs; } catch { mtime = 0; }
+    const c = this._aria2CfgCache;
+    if (c && c.mtime === mtime && c.file === file) return c.value;
+    let value = normalizeAria2Config(null);
+    try {
+      const cfg = JSON.parse(fs.readFileSync(file, "utf-8") || "{}");
+      value = normalizeAria2Config(cfg);
+    } catch { /* 无配置文件/解析失败 → 默认关闭（保持旧行为） */ }
+    this._aria2CfgCache = { file, mtime, value };
+    return value;
   }
 
   // ── 命令型任务（git-clone / pnpm-install / winget-install / pip-install）──
@@ -591,6 +689,9 @@ class TaskManager {
       sessionPath: t.sessionPath || null,
       saveDir: t.saveDir || null,
       speedLimit: t.speedLimit || 0,
+      // 这条任务实际走的传输 backend（UI/诊断用；历史任务/命令任务为 null）
+      backend: t.backend || null,
+      backendNote: t.backendNote || null,
     };
   }
 
@@ -678,6 +779,8 @@ class TaskManager {
 
   // ── 重启恢复：running → interrupted、pending → interrupted（定时器丢失），删除半成品 ──
   restore() {
+    // 先把没人等的孤儿终态收掉：见 _pruneOrphanFinished 的说明。
+    this._pruneOrphanFinished();
     let meta = null;
     try {
       meta = JSON.parse(fs.readFileSync(path.join(this.dataDir, TASKS_FILE), "utf-8"));
@@ -700,10 +803,14 @@ class TaskManager {
         // URL 任务：保留 .part 半成品（不再删除），received 取 .part 实际大小作为续传恢复点
         const partPath = m.partPath || (m.filePath ? m.filePath + ".part" : null);
         let received = m.received || 0;
-        if (!isCmd && partPath && fs.existsSync(partPath)) {
+        // aria2 任务的 .part 大小**不是进度**：file-allocation=none 时它一上来就是全长（稀疏文件，
+        // 实测已完成 300KB 的 .part 已经 1.19MB）。aria2 的真实进度在它自己的 .aria2 控制文件里，
+        // 所以这类任务只能沿用持久化的 received，不能 statSync 兑现（否则重管后进度直接显示 100%）。
+        const aria2Task = (m.backend === "aria2" || m.aria2Gid) && !isCmd;
+        if (!isCmd && !aria2Task && partPath && fs.existsSync(partPath)) {
           try { received = fs.statSync(partPath).size; } catch { /* statSync 失败则保留 m.received */ }
         }
-        this.tasks.set(m.taskId, {
+        const revived = {
           taskId: m.taskId, url: m.url || "", fileName: m.fileName || "",
           filePath: m.filePath || "", saveDir: m.saveDir || this.downloadDir,
           state: "interrupted", total: m.total || null, received,
@@ -719,7 +826,14 @@ class TaskManager {
           acceptRanges: m.acceptRanges === true,
           expectedSha256: m.expectedSha256 || null,
           resumable: isCmd ? false : (m.resumable !== false),
-        });
+          backend: m.backend || null,
+          backendNote: m.backendNote || null,
+        };
+        this.tasks.set(m.taskId, revived);
+        // 补写终态：引擎被 kill 时来不及走 onFinal，finished/<taskId>.json 永远不会出现，
+        // 于是 app 侧 settleWhenDone 空等 30 分钟后报「下载超时未结束」——一个假错误，
+        // 真实原因是「被应用重启打断」。这里补一条与 onFinal 同形的记录，让等待方立刻拿到真原因。
+        this._publishInterrupted(revived);
       } else {
         // 已完成/失败/取消的历史任务：全量恢复、永久保留，供卡片回放与管理器查阅。
         // 2026-10-12 John 定：不再只保留 24 小时内（原实现配合 _persist 的裁剪，
@@ -741,8 +855,42 @@ class TaskManager {
           acceptRanges: m.acceptRanges === true,
           expectedSha256: m.expectedSha256 || null,
           resumable: m.kind === "command" ? false : (m.resumable !== false),
+          backend: m.backend || null,
+          backendNote: m.backendNote || null,
         });
       }
+    }
+  }
+
+  // ── 补写恢复后的 interrupted 终态（2026-10-18）──
+  // 为什么要落盘而不是只留在内存：app 侧读到终态的唯一通道是 dataDir/finished/<taskId>.json
+  // （不轮询引擎，避免挂起 RPC 堵住工具回程）。内存里标成 interrupted 只能让管理器显示正确，
+  // 正在等这个任务的那一侧什么都收不到，只能等到自己的超时。
+  // 形状必须与 server.js 的 onFinal 一致（同一个 summarizeTask 产出），否则消费方解析不了。
+  // 幂等：路径固定为 finished/<taskId>.json，重复 restore 只会覆盖同一份。
+  _publishInterrupted(task) {
+    if (!task || task.state !== "interrupted") return;
+    try {
+      const dir = path.join(this.dataDir, "finished");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${task.taskId}.json`), JSON.stringify(summarizeTask(task)), "utf8");
+    } catch { /* 补写失败不影响恢复本身（管理器至少还能显示 interrupted） */ }
+  }
+
+  // ── 回收没人等的孤儿终态（2026-10-18）──
+  // finished/ 的正常路径是「等待方读走即删」（index.js settleWhenDone / notifyWhenRetryDone）。
+  // 但等待方是 app 侧的轮询协程：App 重启时它一起没了，补写的终态就没人消费。
+  // 所以引擎每次 restore 时收一次：超过 1 小时的终态文件必然没有等待方了。
+  // 单个文件失败不影响其它，也不影响恢复。
+  _pruneOrphanFinished(maxAgeMs = RESTORE_FINISHED_MAX_AGE_MS) {
+    const dir = path.join(this.dataDir, "finished");
+    let files = [];
+    try { files = fs.readdirSync(dir); } catch { return; }
+    const cutoff = Date.now() - maxAgeMs;
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      const p = path.join(dir, f);
+      try { if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p); } catch { /* 单个失败忽略 */ }
     }
   }
 
@@ -773,6 +921,8 @@ class TaskManager {
           acceptRanges: t.acceptRanges === true,
           expectedSha256: t.expectedSha256 || null,
           resumable: t.resumable !== false,
+          backend: t.backend || null,
+          backendNote: t.backendNote || null,
         })),
       };
       fs.mkdirSync(this.dataDir, { recursive: true });

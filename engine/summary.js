@@ -79,5 +79,9 @@ export function summarizeTask(t) {
     saveDir: t.saveDir || null,
     partPath: t.partPath || null,
     speedLimit: t.speedLimit || 0,
+    // 传输 backend（2026-10-18 W2）：UI 可能要显示「这条走的 aria2 / node-http」。
+    // 旧记录与命令型任务没有这个字段 → null，JSON 里保留键（不吞键）。
+    backend: t.backend || null,
+    backendNote: t.backendNote || null,
   };
 }

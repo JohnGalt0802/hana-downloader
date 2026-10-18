@@ -23,9 +23,13 @@ const SUITES = [
   ["unit-download.mjs", "下载内核端到端（落盘 / SHA-256 校验 / 限速 / 记录清理）"],
   ["unit-queue.mjs", "并发队列与重试（排队放行 / 失败重跑 / 默认限速）"],
   ["unit-stall.mjs", "卡滞快照的落盘契约（起真引擎，验 sessionPath/stalledAt 带到 App 侧）"],
+  ["unit-restore.mjs", "重启恢复的终态补写（running/pending → interrupted 落 finished / 幂等 / 孤儿回收）"],
   ["unit-theme.mjs", "声明式主题数据层（继承合并 / 校验拒收 / 默认值填满 / schema 口径）"],
   ["unit-contract.mjs", "IPC 与展示契约兜底（/list 字段齐全 / 非 JSON 回包 / displayName / stateBadge / /cancel 形状）"],
   ["unit-cardview.mjs", "卡片渲染纯函数（minimal 逐字节回归 + golden 基准 + 缺省第三腿一致性）"],
+  ["unit-aria2.mjs", "aria2 backend（契约/状态与进度映射纯函数 + 真链路 SHA-256 对拍；未装 aria2 则 skip）"],
+  ["unit-aria2-config.mjs", "aria2 配置归一（缺段/脏类型/边界端口/畸形输入不抛）"],
+  ["unit-aria2-ui.mjs", "aria2 开关三态文案（未启用 / 已启用可用 / 已启用不可用 / 检测中）"],
 ];
 
 function run(file) {
