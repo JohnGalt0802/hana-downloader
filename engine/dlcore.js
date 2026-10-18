@@ -23,7 +23,7 @@ const RESTORE_FINISHED_MAX_AGE_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_CONCURRENT = 3; // 同时运行的任务数上限（0=不限）；管理器设置里可改
 
 let _instance = null;
-const MGR_VER = 26; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished）
+const MGR_VER = 27; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished；v27=retry 以磁盘校正 received（取消后重试不再永久失败））
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -174,6 +174,10 @@ class TaskManager {
     const t = this.tasks.get(taskId);
     if (!t) return { ok: false, error: "任务不存在" };
     if (t.state === "running" || t.state === "pending") return { ok: false, error: "任务仍在进行中" };
+    // 重试起点以磁盘为准，不能沿用内存里的 received。必须在清 backend/aria2Gid 之前算：
+    // 那两个字段参与「这条是不是 aria2 任务」的判定（aria2 的 .part 大小不是进度）。
+    // .part 不存在 → 0（fallback 0）：没有半成品就不要拿内存值当初点。
+    t.received = receivedOnDisk(t, 0);
     t.error = null;
     t.note = null;
     t.stage = null;
@@ -802,14 +806,12 @@ class TaskManager {
         }
         // URL 任务：保留 .part 半成品（不再删除），received 取 .part 实际大小作为续传恢复点
         const partPath = m.partPath || (m.filePath ? m.filePath + ".part" : null);
-        let received = m.received || 0;
-        // aria2 任务的 .part 大小**不是进度**：file-allocation=none 时它一上来就是全长（稀疏文件，
-        // 实测已完成 300KB 的 .part 已经 1.19MB）。aria2 的真实进度在它自己的 .aria2 控制文件里，
-        // 所以这类任务只能沿用持久化的 received，不能 statSync 兑现（否则重管后进度直接显示 100%）。
-        const aria2Task = (m.backend === "aria2" || m.aria2Gid) && !isCmd;
-        if (!isCmd && !aria2Task && partPath && fs.existsSync(partPath)) {
-          try { received = fs.statSync(partPath).size; } catch { /* statSync 失败则保留 m.received */ }
-        }
+        // 与 retry 同一条规则（receivedOnDisk）：磁盘是 URL 任务进度的唯一事实来源。
+        // .part 不存在时保留持久化值而不是 0：这是「重启前的恢复点」用于展示历史，抹成 0 会丢信息。
+        const received = receivedOnDisk({
+          kind: m.kind, backend: m.backend, aria2Gid: m.aria2Gid,
+          partPath, filePath: m.filePath, received: m.received || 0,
+        }, m.received || 0);
         const revived = {
           taskId: m.taskId, url: m.url || "", fileName: m.fileName || "",
           filePath: m.filePath || "", saveDir: m.saveDir || this.downloadDir,
@@ -1129,6 +1131,34 @@ function uniquePath(p) {
     if (!fs.existsSync(candidate)) return candidate;
   }
   return path.join(dir, `${base} (${Date.now()})${ext}`);
+}
+
+// 续传起点校正（2026-10-19）：URL 任务的 received 以磁盘为准，不用内存值。
+//
+// 为什么要：task.received 记的是「已交给写流缓冲」的字节（node-http.js: task.received += chunk.length），
+// 取消/中断走 ws.destroy()，destroy 不 flush，缓冲里的写被丢弃——磁盘上的 .part 可能远小于
+// received，实测 64MB 高速下载取消时 .part 只有 0 字节。若沿用内存值当续传起点：
+// createResumeStream 的长度校验必然失败，而 retry() 原本又不清 received，每次重试都拿同一个坏起点
+// —— 于是「重试」按钮永久失败，只有重启引擎（走 restore 的 statSync）能自救。
+// 现在 retry() 与 restore() 共用这一条规则，不再有两套口径。
+//
+// .part 不存在时用调用方给的 fallback（两个调用点取值不同，理由写在各自处）：
+//   retry()  → 0：重试是一次新运行，不能声称自己有根本不存在的字节
+//   restore()→ 持久化的 received：那是「重启前的恢复点」，用于展示历史，抹成 0 会丢信息
+// 命令型任务没有 .part；aria2 任务的 .part 大小**不是进度**（file-allocation=none 时一上来就是全长，
+// 稀疏文件，实测已完成 300KB 的 .part 已经 1.19MB），它的真实进度在自己的 .aria2 控制文件里，
+// 所以这两类原样沿用持久化的 received。
+function receivedOnDisk(t, fallback = 0) {
+  const keep = Number.isFinite(t?.received) && t.received > 0 ? t.received : 0;
+  const miss = Number.isFinite(fallback) ? fallback : keep;
+  if (!t || t.kind === "command") return keep;
+  if (t.backend === "aria2" || t.aria2Gid) return keep;
+  if (!t.partPath) return miss;
+  try {
+    return fs.existsSync(t.partPath) ? fs.statSync(t.partPath).size : miss;
+  } catch {
+    return miss;
+  }
 }
 
 function friendlyError(e) {

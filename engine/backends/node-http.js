@@ -44,6 +44,30 @@ export const nodeHttpBackend = {
     const abortListener = () => { try { if (req) req.destroy(new AbortError("canceled by user")); } catch { /* 忽略 */ } };
     controller.signal.addEventListener("abort", abortListener);
     try {
+      // 续传前先核账（2026-10-19 修）：.part 已经完整（大小 === total）时，绝不能再发 Range 从尾部开始——
+      // 那必然被服务端回 416，而 416 分支会删掉 .part，一份可能完全正确的 1GB 半成品就此白下。
+      // 有 expectedSha256 时直接对整份 .part 流式重算摘要：通过即交付，不通过如实报失败（保留 .part）。
+      if (hash && task.partPath && task.total != null && task.total > 0) {
+        let partStat = null;
+        try { partStat = fs.statSync(task.partPath); } catch { /* 没有 .part：走正常下载 */ }
+        if (partStat && partStat.size === task.total) {
+          await seedHashFromFile(task.partPath, partStat.size, hash);
+          const presetDigest = hash.digest("hex");
+          task.received = task.total;
+          if (presetDigest === task.expectedSha256) {
+            fs.renameSync(task.partPath, task.filePath);
+            task.state = "done";
+            task.error = null;
+          } else {
+            task.state = "failed";
+            task.error = `SHA-256 校验失败：期望 ${task.expectedSha256}，实际 ${presetDigest}`
+              + "（半成品文件大小已完整，内容与期望摘要不符；已保留 .part 供排查）";
+          }
+          task.finishedAt = Date.now();
+          return;
+        }
+      }
+
       const targetUrl = new URL(task.url);
       // 本地回环目标永不走代理：回环流量经代理隧道既慢又不稳定（实测被中途掐断）
       const isLoopback = ["127.0.0.1", "localhost", "[::1]", "::1"].includes(targetUrl.hostname)
@@ -66,7 +90,12 @@ export const nodeHttpBackend = {
         let redirects = 0;
         try {
           while (redirects < 5) {
-            startOffset = (task.resumable !== false ? (task.received || 0) : 0);
+            // 续传起点：发出的 Range 必须与磁盘上的 .part 长度一致。
+            // 不能只信 task.received —— 那是「已交给写流缓冲」的字节，取消/中断后缓冲被丢弃，
+            // 磁盘可能更少甚至没有文件。以磁盘为准，后面 206 分支的 Content-Range 校验
+            // 就不会因为一个不可兑现的起点而硬失败。.part 不存在 → 0（从头下）。
+            startOffset = task.resumable !== false ? partSizeOnDisk(task) : 0;
+            if (task.received !== startOffset) task.received = startOffset;
             const headers = {
               "User-Agent": "HanaAgent/1.0 (hana-downloader)",
               "Accept": "*/*",
@@ -141,8 +170,18 @@ export const nodeHttpBackend = {
         const m = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)/.exec(res.headers["content-range"] || "");
         if (!m) throw new Error("HTTP 206 响应缺少有效的 Content-Range 头");
         const crStart = Number(m[1]);
-        if (crStart !== startOffset) throw new Error(`断点续传偏移不符：服务器返回 ${crStart}，期望 ${startOffset}`);
         const crTotal = m[3] === "*" ? null : Number(m[3]);
+        // 先建写流：它可能把起点按磁盘实际情况退回来（半成品长度不足 / 不存在时）。
+        // 返回值与期望不同时以它为准重算 startOffset 与 received，否则后续 chunk 会从旧值上累加。
+        const resumed = await createResumeStream(task, startOffset);
+        ws = resumed.ws;
+        if (resumed.startOffset !== startOffset) {
+          startOffset = resumed.startOffset;
+          task.received = startOffset;
+        }
+        // 服务器给的起始位置必须与（校正后的）起点一致：对不上是真的不一致（体是别的区间），
+        // 不能吞——吞了就会把错位的字节当成功交付。可恢复的情况已在 createResumeStream 里退让过了。
+        if (crStart !== startOffset) throw new Error(`断点续传偏移不符：服务器返回 ${crStart}，期望 ${startOffset}`);
         if (crTotal != null && Number.isFinite(crTotal) && crTotal > 0) {
           task.total = crTotal;
         } else {
@@ -150,7 +189,9 @@ export const nodeHttpBackend = {
           const cl = parseInt(res.headers["content-length"] || "", 10);
           task.total = Number.isFinite(cl) && cl > 0 ? cl + startOffset : null;
         }
-        ws = await createResumeStream(task, startOffset);
+        // 续传：hash 必须覆盖整文件，所以先把 [0, startOffset) 的已有字节喂进去。
+        // 漏掉这一段（旧实现）会让摘要只算后半截，正确文件也必然报「SHA-256 校验失败」。
+        if (hash) await seedHashFromFile(task.partPath, startOffset, hash);
       } else {
         // 200：Range 被忽略（或新任务无 Range），从头下载
         if (!fs.existsSync(task.partPath)) fs.writeFileSync(task.partPath, Buffer.alloc(0));
@@ -167,6 +208,10 @@ export const nodeHttpBackend = {
         let lastTick = Date.now();
         let lastBytes = 0;
         let chunkStart = Date.now();
+        // 写流出错必须转成 reject：ws.write() 失败（磁盘满）与取消时 destroy 后
+        // 残留的挂起写（ERR_STREAM_DESTROYED）都会在写流上发 'error'，没人监听就是
+        // 进程级 unhandled error —— 实测取消高速下载时直接抛死引擎进程（2026-10-19）。
+        ws.on("error", reject);
         const speedSample = () => {
           const now = Date.now();
           if (now - lastTick >= SPEED_SAMPLE_MS) {
@@ -180,6 +225,9 @@ export const nodeHttpBackend = {
         };
         const processChunk = (chunk) => {
           if (task.cancelRequested) { try { if (req) req.destroy(); } catch { /* 忽略 */ } return; }
+          // 写流已销毁（取消/出错）：还往上面写只会再抛 ERR_STREAM_DESTROYED，
+          // 而且会把根本没落盘的字节记进 received——正是「内存大于磁盘」的来源。
+          if (ws.destroyed) return;
           wroteAnyChunk = true;
           ws.write(chunk);
           task.received += chunk.length;
@@ -305,27 +353,63 @@ export const nodeHttpBackend = {
   },
 };
 
+// 把 .part 的 [0, length) 段流式喂给 hash（续传时补齐前段摘要）。
+// 必须流式：readFileSync 读 1GB 级文件会把内存和事件循环一起顶爆。
+async function seedHashFromFile(filePath, length, hash) {
+  if (!(length > 0)) return;
+  const rs = fs.createReadStream(filePath, { start: 0, end: length - 1 });
+  for await (const chunk of rs) hash.update(chunk);
+}
+
+// .part 的实际大小（续传起点的唯一事实来源）；不存在或不可读 → 0。
+function partSizeOnDisk(task) {
+  if (!task?.partPath) return 0;
+  try {
+    return fs.existsSync(task.partPath) ? fs.statSync(task.partPath).size : 0;
+  } catch {
+    return 0;
+  }
+}
+
 // 206 续传：必须用 r+ 打开已存在的 .part，绝不能用默认的 "w"（会截断清零）。
 // fs.createWriteStream(path, { start }) 默认 flags 是 "w"：先 truncate 到 0 再从 start 写，
 // [0,startOffset) 全部被清零、状态却报 done（2026-10-18 修）。
 // r+ 不截断（文件不存在则 ENOENT），FileHandle.createWriteStream({ start }) 基于已打开的 fd，
-// 不会重新打开/截断（实测对照见提交说明）。长度不足 startOffset 属于异常状态，报错而不是硬写。
+// 不会重新打开/截断（实测对照见提交说明）。
+//
+// 长度不足 startOffset / 文件不存在（2026-10-19 修）：不再硬失败，改为以磁盘为准把起点退回来。
+// 内存里的 received 是「已交给写流缓冲」的字节，取消/中断时 destroy 不 flush，磁盘上可能更少、
+// 甚至没有 .part。把一次本可恢复的状态报成永久失败（且 retry 沿用同一个坏起点，只能重启引擎），
+// 代价远大于「从头重下已经存在的那段」。真正的服务端不一致仍由调用方用 Content-Range 校验拦住。
+// 返回 { ws, startOffset }，调用方必须用返回的 startOffset 继续（它还要用于 received 与 Content-Range）。
 async function createResumeStream(task, startOffset) {
   // 从 0 开始（服务器主动给 206、我们没发 Range 的非规范响应）：无前段要保留，
   // 保持原有 "w" 语义（建文件/截断到 0），与原实现逐字等价。
-  if (!(startOffset > 0)) return fs.createWriteStream(task.partPath, { flags: "w" });
+  if (!(startOffset > 0)) return { ws: fs.createWriteStream(task.partPath, { flags: "w" }), startOffset: 0 };
   let fh;
   try {
     fh = await fs.promises.open(task.partPath, "r+");
   } catch (e) {
+    // .part 不存在（ENOENT）：没有可续的前段，退成从头写的 "w"，而不是把任务钉死。
+    // 其它错误（EACCES/EISDIR 等）是真的文件不可用，保留报错。
+    if (e?.code === "ENOENT") {
+      return { ws: fs.createWriteStream(task.partPath, { flags: "w" }), startOffset: 0 };
+    }
     throw new Error(`续传失败：半成品文件不可用（${e.code || e.message}）`);
   }
   try {
     const st = await fh.stat();
     if (st.size < startOffset) {
-      throw new Error(`续传失败：半成品文件长度 ${st.size} 小于续传起点 ${startOffset}`);
+      // 内存值与磁盘不符（取消时写缓冲被丢弃）。以磁盘为准继续，
+      // 不要把一次可恢复的状态变成永久失败。
+      startOffset = st.size;
     }
-    return fh.createWriteStream({ start: startOffset });
+    if (!(startOffset > 0)) {
+      // 磁盘上实际是 0 字节：r+ 从 0 写也能工作，但 "w" 语义更明确（截断到 0 再写）。
+      await fh.close();
+      return { ws: fs.createWriteStream(task.partPath, { flags: "w" }), startOffset: 0 };
+    }
+    return { ws: fh.createWriteStream({ start: startOffset }), startOffset };
   } catch (e) {
     try { await fh.close(); } catch { /* 忽略 */ }
     throw e;
