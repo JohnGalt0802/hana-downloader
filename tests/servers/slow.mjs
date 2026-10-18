@@ -2,7 +2,7 @@
 import http from "node:http";
 import fs from "node:fs";
 
-const PORT = 18933;
+const PORT = Number(process.argv[2] ?? process.env.PORT ?? 0); // 0 = 系统分配，起好后打印真实端口
 const FILESIZE = 6 * 1024 * 1024; // 6MB
 const CHUNK = 16 * 1024;          // 16KB per chunk
 const INTERVAL_MS = 200;          // 每 200ms 发一个 chunk → 16KB/0.2s ≈ 80KB/s → 6MB ≈ 75s
@@ -40,5 +40,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log("[serve-slow] listening 127.0.0.1:" + PORT + " size=" + FILESIZE + " rate≈" + Math.round(CHUNK * 1000 / INTERVAL_MS) + "B/s");
+  console.log("[serve-slow] listening 127.0.0.1:" + server.address().port + " size=" + FILESIZE + " rate≈" + Math.round(CHUNK * 1000 / INTERVAL_MS) + "B/s");
 });

@@ -18,7 +18,29 @@ fs.mkdirSync(OUT, { recursive: true });
 
 if (!bin) { console.log("跳过（未检测到 aria2c）"); process.exit(0); }
 
-const BASE_PORT = 6890;
+// 本脚本故意验证「端口全被占」——所以这里必须有一批真被占用的端口。
+// 端口仍向系统要（listen(0) 拿一个真端口，然后占住它自己及其后 7 个候选），不写死。
+const BASE_PORT = await (async () => {
+  for (let i = 0; i < 50; i++) {
+    const p = await new Promise((resolve) => {
+      const s = net.createServer();
+      s.listen(0, "127.0.0.1", () => { const q = s.address().port; s.close(() => resolve(q)); });
+    });
+    if (p + 8 > 65535) continue;
+    const cands = portCandidates(p);
+    const free = [];
+    let ok = true;
+    for (const c of cands) {
+      const s = net.createServer();
+      try { await new Promise((res, rej) => { s.once("error", rej); s.listen(c, "127.0.0.1", res); }); }
+      catch { ok = false; s.close(); break; }
+      free.push(s);
+    }
+    if (ok) { for (const s of free) s.close(); return p; }
+    for (const s of free) s.close();
+  }
+  throw new Error("找不到一整段空闲的候选端口段");
+})();
 aria2Backend.setOptions({ bin, port: BASE_PORT });
 
 const held = [];
@@ -39,13 +61,14 @@ const src = http.createServer((req, res) => {
   res.writeHead(200, { "content-length": String(SIZE) });
   res.end(BODY);
 });
-await new Promise((r) => src.listen(18970, "127.0.0.1", r));
+await new Promise((r) => src.listen(0, "127.0.0.1", r));
+const SRC_PORT = src.address().port;
 
 fs.writeFileSync(path.join(DATA, "engine-config.json"), JSON.stringify({
   aria2: { enabled: true, bin, port: BASE_PORT },
 }, null, 2));
 const mgr = getTaskManager(DATA);
-const t = mgr.create({ url: "http://127.0.0.1:18970/x.bin", fileName: "x.bin", saveDir: OUT });
+const t = mgr.create({ url: `http://127.0.0.1:${SRC_PORT}/x.bin`, fileName: "x.bin", saveDir: OUT });
 let s = null;
 const t0 = Date.now();
 while (Date.now() - t0 < 40000) {

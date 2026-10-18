@@ -2,7 +2,7 @@
 import http from "node:http";
 import fs from "node:fs";
 
-const PORT = 18932;
+const PORT = Number(process.argv[2] ?? process.env.PORT ?? 0); // 0 = 系统分配，起好后打印真实端口
 const FILESIZE = 6 * 1024 * 1024; // 6MB, small but not trivial
 
 function makeBuffer(size) {
@@ -26,7 +26,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log("[serve-fast] listening 127.0.0.1:" + PORT + " size=" + FILESIZE);
+  console.log("[serve-fast] listening 127.0.0.1:" + server.address().port + " size=" + FILESIZE);
 });
 
 setInterval(() => {}, 1 << 30);

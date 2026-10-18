@@ -3,9 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import net from "node:net";
 import crypto from "node:crypto";
 import { getTaskManager } from "../../engine/dlcore.js";
 import { aria2Backend, resolveAria2Bin } from "../../engine/backends/aria2.js";
+
+// 端口一律向系统要（listen(0) 后取真端口），并行跑不互抢
+const freePort = () => new Promise((resolve) => {
+  const s = net.createServer();
+  s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => resolve(p)); });
+});
 
 const bin = resolveAria2Bin("");
 if (!bin) { console.log("跳过（未检测到 aria2c）"); process.exit(0); }
@@ -30,7 +37,8 @@ const src = http.createServer((req, res) => {
   };
   tick();
 });
-await new Promise((r) => src.listen(18969, "127.0.0.1", r));
+await new Promise((r) => src.listen(0, "127.0.0.1", r));
+const SRC_PORT = src.address().port;
 
 const BASE = path.join(os.tmpdir(), "hd-a2-conc");
 fs.rmSync(BASE, { recursive: true, force: true });
@@ -38,13 +46,13 @@ const DATA = path.join(BASE, "data"), OUT = path.join(BASE, "out");
 fs.mkdirSync(DATA, { recursive: true });
 fs.mkdirSync(OUT, { recursive: true });
 fs.writeFileSync(path.join(DATA, "engine-config.json"), JSON.stringify({
-  aria2: { enabled: true, bin, port: 6873 }, maxConcurrent: 2,
+  aria2: { enabled: true, bin, port: await freePort() }, maxConcurrent: 2,
 }, null, 2));
 
 const mgr = getTaskManager(DATA);
 mgr.applyConfig({ maxConcurrent: 2 });
-const t1 = mgr.create({ url: "http://127.0.0.1:18969/a.bin", fileName: "conc-a.bin", saveDir: OUT });
-const t2 = mgr.create({ url: "http://127.0.0.1:18969/b.bin", fileName: "conc-b.bin", saveDir: OUT });
+const t1 = mgr.create({ url: `http://127.0.0.1:${SRC_PORT}/a.bin`, fileName: "conc-a.bin", saveDir: OUT });
+const t2 = mgr.create({ url: `http://127.0.0.1:${SRC_PORT}/b.bin`, fileName: "conc-b.bin", saveDir: OUT });
 
 const wait = async (id) => {
   const t0 = Date.now();

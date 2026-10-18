@@ -14,11 +14,12 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { getTaskManager } from "../engine/dlcore.js";
 
-const BASE = path.join(os.tmpdir(), "hd-dl-test");
+// 每进程唯一目录：两套测试并行跑时不会踩同一个 .part
+const BASE = fs.mkdtempSync(path.join(os.tmpdir(), "hd-dl-test-"));
 const DATA_DIR = path.join(BASE, "data");
 const SAVE_DIR = path.join(BASE, "out");
-fs.rmSync(BASE, { recursive: true, force: true });
 fs.mkdirSync(SAVE_DIR, { recursive: true });
+process.on("exit", () => { try { fs.rmSync(BASE, { recursive: true, force: true }); } catch { /* 忽略 */ } });
 
 const SIZE = 1024 * 1024; // 1MB
 const BODY = crypto.randomBytes(SIZE);
@@ -29,7 +30,7 @@ const srv = http.createServer((req, res) => {
   if (req.method === "HEAD") return res.end();
   res.end(BODY);
 });
-await new Promise((r) => srv.listen(18997, "127.0.0.1", r));
+await new Promise((r) => srv.listen(0, "127.0.0.1", r));
 
 const mgr = getTaskManager(DATA_DIR);
 
@@ -51,7 +52,7 @@ async function waitFinal(taskId, timeoutMs = 60000) {
   return mgr.snapshot(taskId);
 }
 
-const url = "http://127.0.0.1:18997/big.bin";
+const url = `http://127.0.0.1:${srv.address().port}/big.bin`;
 
 // ── 场景 1：普通下载 ──
 {
@@ -110,8 +111,6 @@ const url = "http://127.0.0.1:18997/big.bin";
 const RSIZE = 300000;
 const RBODY = crypto.randomBytes(RSIZE);
 const RSHA = crypto.createHash("sha256").update(RBODY).digest("hex");
-const RURL = "http://127.0.0.1:18995/ranged.bin";     // 无 Range 时 30% 掉线
-const FULLURL = "http://127.0.0.1:18995/full.bin";    // 无 Range 时发全量（416 回退用）
 const CUT_AT = 90000; // 首次只发 30% 就掐断
 
 const rangeSrv = http.createServer((req, res) => {
@@ -148,7 +147,9 @@ const rangeSrv = http.createServer((req, res) => {
   });
   res.end(RBODY.subarray(start));
 });
-await new Promise((r) => rangeSrv.listen(18995, "127.0.0.1", r));
+await new Promise((r) => rangeSrv.listen(0, "127.0.0.1", r));
+const RURL = `http://127.0.0.1:${rangeSrv.address().port}/ranged.bin`;    // 无 Range 时 30% 掉线
+const FULLURL = `http://127.0.0.1:${rangeSrv.address().port}/full.bin`;   // 无 Range 时发全量（416 回退用）
 
 // 场景 6：真实链路续传（第一次中断 → retry 走 Range/206）
 {
@@ -210,7 +211,6 @@ const SSIZE = 400000;
 const SBODY = crypto.randomBytes(SSIZE);
 const SSHA = crypto.createHash("sha256").update(SBODY).digest("hex");
 const SCUT = Math.floor(SSIZE * 0.4); // 40% 处断线
-const SURL = "http://127.0.0.1:18994/sha-resume.bin";
 const srvStats = { full: 0, reqs: 0, lastRangeStart: null };
 
 const shaSrv = http.createServer((req, res) => {
@@ -244,7 +244,8 @@ const shaSrv = http.createServer((req, res) => {
   });
   res.end(SBODY.subarray(start));
 });
-await new Promise((r) => shaSrv.listen(18994, "127.0.0.1", r));
+await new Promise((r) => shaSrv.listen(0, "127.0.0.1", r));
+const SURL = `http://127.0.0.1:${shaSrv.address().port}/sha-resume.bin`;
 
 // 场景 8：正确摘要 + 40% 中断 + retry 续传 → done，SHA 与源一致，半成品没被误删
 {
@@ -327,7 +328,6 @@ await new Promise((r) => shaSrv.listen(18994, "127.0.0.1", r));
 const CSIZE = 64 * 1024 * 1024;
 const CBODY = crypto.randomBytes(CSIZE);
 const CSHA = crypto.createHash("sha256").update(CBODY).digest("hex");
-const CURL = "http://127.0.0.1:18984/cancel.bin"; // 18984：本套件专用，勿与其它套件重口（18995~18998 已分别被 stall/probe/queue/aria2 占用）
 const CSPLIT = 8 * 1024 * 1024; // 每块 8MB，留出「用户点取消」的窗口
 
 const cancelSrv = http.createServer((req, res) => {
@@ -365,7 +365,8 @@ const cancelSrv = http.createServer((req, res) => {
   }
   push();
 });
-await new Promise((r) => cancelSrv.listen(18984, "127.0.0.1", r));
+await new Promise((r) => cancelSrv.listen(0, "127.0.0.1", r));
+const CURL = `http://127.0.0.1:${cancelSrv.address().port}/cancel.bin`; // 端口由系统分配，可与其它套件并行跑
 
 const shaOf = (fp) => (fs.existsSync(fp) ? crypto.createHash("sha256").update(fs.readFileSync(fp)).digest("hex") : null);
 
@@ -442,10 +443,10 @@ const flushSrv = http.createServer((req, res) => {
   };
   tick();
 });
-await new Promise((r) => flushSrv.listen(18985, "127.0.0.1", r));
+await new Promise((r) => flushSrv.listen(0, "127.0.0.1", r));
 
 {
-  const t = mgr.create({ url: "http://127.0.0.1:18985/cancel2.bin", fileName: "cancel2.bin", saveDir: SAVE_DIR });
+  const t = mgr.create({ url: `http://127.0.0.1:${flushSrv.address().port}/cancel2.bin`, fileName: "cancel2.bin", saveDir: SAVE_DIR });
   for (let i = 0; i < 4000; i++) {
     const s = mgr.snapshot(t.taskId);
     if (s && (s.received >= 6 * 1024 * 1024 || s.state !== "running")) break;

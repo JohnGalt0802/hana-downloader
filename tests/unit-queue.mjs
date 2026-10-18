@@ -11,13 +11,13 @@ import os from "node:os";
 import path from "node:path";
 import { getTaskManager } from "../engine/dlcore.js";
 
-const BASE = path.join(os.tmpdir(), "hd-queue-test");
+// 每进程唯一目录：两套测试并行跑时不会踩同一个 .part
+const BASE = fs.mkdtempSync(path.join(os.tmpdir(), "hd-queue-test-"));
 const DATA_DIR = path.join(BASE, "data");
 const SAVE_DIR = path.join(BASE, "out");
-fs.rmSync(BASE, { recursive: true, force: true });
 fs.mkdirSync(SAVE_DIR, { recursive: true });
+process.on("exit", () => { try { fs.rmSync(BASE, { recursive: true, force: true }); } catch { /* 忽略 */ } });
 
-const PORT = 18996;
 const BIG = 512 * 1024;   // 512KB，按 150ms/64KB 发 → 约 1.2 秒
 const SMALL = 64 * 1024;  // 64KB，一次性发完
 const CHUNK = 64 * 1024;
@@ -53,10 +53,10 @@ const srv = http.createServer((req, res) => {
   }
   return sendSlow(res, BIG);
 });
-await new Promise((r) => srv.listen(PORT, "127.0.0.1", r));
+await new Promise((r) => srv.listen(0, "127.0.0.1", r));
 
 const mgr = getTaskManager(DATA_DIR);
-const base = `http://127.0.0.1:${PORT}`;
+const base = `http://127.0.0.1:${srv.address().port}`;
 
 let pass = 0, fail = 0;
 function check(name, actual, expectFn) {

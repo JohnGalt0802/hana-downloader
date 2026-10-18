@@ -6,11 +6,12 @@ import path from "node:path";
 import os from "node:os";
 import { startWingetProbe } from "../engine/download-probe.js";
 
-const BASE = path.join(os.tmpdir(), "hd-probe-test");
+// 每进程唯一目录：两套测试并行跑时不会踩同一个伪造下载目录
+const BASE = fs.mkdtempSync(path.join(os.tmpdir(), "hd-probe-test-"));
 const fakeTEMP = path.join(BASE, "fake-temp");
 const dlDir = path.join(fakeTEMP, "WinGet", "test.pkg.1.0");
-fs.rmSync(BASE, { recursive: true, force: true });
 fs.mkdirSync(dlDir, { recursive: true });
+process.on("exit", () => { try { fs.rmSync(BASE, { recursive: true, force: true }); } catch { /* 忽略 */ } });
 process.env.TEMP = fakeTEMP;
 process.env.TMP = fakeTEMP;
 
@@ -25,7 +26,8 @@ const srv = http.createServer((req, res) => {
   if (req.method === "HEAD") { res.end(); return; }
   res.end(Buffer.alloc(SIZE));
 });
-await new Promise((r) => srv.listen(18998, "127.0.0.1", r));
+await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+const PORT = srv.address().port;
 
 let pass = 0, fail = 0;
 const check = (name, cond) => { if (cond) { pass++; } else { fail++; console.log("FAIL:", name); } };
@@ -36,7 +38,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const task = {
     cmd: { type: "winget-install", pkgId: "test.pkg" },
     state: "running",
-    installUrl: "http://127.0.0.1:18998/redirect",
+    installUrl: `http://127.0.0.1:${PORT}/redirect`,
     total: null, received: 0, speed: 0, unit: "steps", _lastProgressAt: 0,
   };
   const stop = startWingetProbe(task, path.join(BASE, "data"));
@@ -69,7 +71,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const task = {
     cmd: { type: "winget-install", pkgId: "no.such.pkg" },
     state: "running",
-    installUrl: "http://127.0.0.1:18998/big.bin",
+    installUrl: `http://127.0.0.1:${PORT}/big.bin`,
     total: null, received: 0, speed: 0, unit: "steps", _lastProgressAt: 0,
   };
   const stop = startWingetProbe(task, path.join(BASE, "data"));

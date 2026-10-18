@@ -14,6 +14,13 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import net from "node:net";
+
+// 端口一律向系统要（listen(0) 后取真端口），并行跑不互抢
+const freePort = () => new Promise((resolve) => {
+  const s = net.createServer();
+  s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => resolve(p)); });
+});
 
 const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -48,10 +55,10 @@ const realBin = (() => {
 console.log("真实 aria2c =", realBin || "（本机没有，仅验探测缓存）");
 
 fs.writeFileSync(path.join(DATA_DIR, "engine-config.json"), JSON.stringify({
-  aria2: { enabled: true, bin: "", port: 6884 },
+  aria2: { enabled: true, bin: "", port: await freePort() },
 }, null, 2));
 
-const PORT = 18989;
+const PORT = await freePort();
 const engine = spawn(process.execPath, [path.join(appRoot, "engine", "server.js"), DATA_DIR], {
   env: {
     ...process.env,

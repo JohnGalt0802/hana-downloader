@@ -7,10 +7,10 @@
 // stallTimeoutMs=500 → stall 在暂停 35s 内 0.5s 后触发。
 //
 // 用法：node stall-recover-server-v5.mjs <port> <totalMB> [stallFraction]
-//   默认：port=18951, totalMB=50, stallFraction=0.5（一半时 stall）
+//   默认：port=0（系统分配，起好后打印真实端口）, totalMB=50, stallFraction=0.5（一半时 stall）
 import http from "node:http";
 
-const [, , portArg = "18951", mbArg = "50", stallFractionArg = "0.5"] = process.argv;
+const [, , portArg = "0", mbArg = "50", stallFractionArg = "0.5"] = process.argv;
 const port = parseInt(portArg, 10);
 const totalBytes = parseInt(mbArg, 10) * 1024 * 1024;
 const stallFraction = parseFloat(stallFractionArg);
@@ -84,7 +84,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(port, "127.0.0.1", () => {
-  console.log(`stall-recover-server-v5 listening on http://127.0.0.1:${port}`);
+  console.log(`stall-recover-server-v5 listening on http://127.0.0.1:${server.address().port}`);
   console.log(`total=${totalBytes} bytes (${(totalBytes/1024/1024).toFixed(2)}MB)`);
   console.log(`natural download → stall at ${(stallFraction*100).toFixed(0)}% (${stallAtBytes} bytes) → wait /trigger-resume`);
 });

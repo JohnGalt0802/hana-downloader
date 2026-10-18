@@ -250,21 +250,21 @@ check("summarizeTask(null) → null", summarizeTask(null), (x) => x === null);
   const path = await import("node:path");
   const { getTaskManager } = await import("../engine/dlcore.js");
 
-  const BASE = path.join(os.tmpdir(), "hd-contract-test");
+  const BASE = fs.mkdtempSync(path.join(os.tmpdir(), "hd-contract-test-"));
   const DATA_DIR = path.join(BASE, "data");
   const SAVE_DIR = path.join(BASE, "out");
-  fs.rmSync(BASE, { recursive: true, force: true });
   fs.mkdirSync(SAVE_DIR, { recursive: true });
+  process.on("exit", () => { try { fs.rmSync(BASE, { recursive: true, force: true }); } catch { /* 忽略 */ } });
 
   const BODY = Buffer.alloc(4096, 7);
   const srv = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "application/octet-stream", "content-length": String(BODY.length) });
     res.end(BODY);
   });
-  await new Promise((r) => srv.listen(18993, "127.0.0.1", r));
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
 
   const mgr = getTaskManager(DATA_DIR);
-  const created = mgr.create({ url: "http://127.0.0.1:18993/small.bin", fileName: "small.bin", saveDir: SAVE_DIR });
+  const created = mgr.create({ url: `http://127.0.0.1:${srv.address().port}/small.bin`, fileName: "small.bin", saveDir: SAVE_DIR });
 
   // 等终态（本地回环，毫秒级；上限 20s）
   let snap = null;
@@ -309,13 +309,21 @@ check("summarizeTask(null) → null", summarizeTask(null), (x) => x === null);
   const path = await import("node:path");
   const { spawn } = await import("node:child_process");
   const { fileURLToPath } = await import("node:url");
+  const netMod = await import("node:net");
 
   const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const BASE = path.join(os.tmpdir(), "hd-cancel-contract");
+  const BASE = fs.mkdtempSync(path.join(os.tmpdir(), "hd-cancel-contract-"));
   const DATA_DIR = path.join(BASE, "data");
-  fs.rmSync(BASE, { recursive: true, force: true });
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  const PORT = 18992;
+  process.on("exit", () => { try { fs.rmSync(BASE, { recursive: true, force: true }); } catch { /* 忽略 */ } });
+  // 引擎端口也向系统要：先绑 0 拿到空端口再释放，避免并行跑时互抢固定端口
+  const PORT = await new Promise((resolve) => {
+    const probe = netMod.createServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const p = probe.address().port;
+      probe.close(() => resolve(p));
+    });
+  });
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // 慢源：发一点数据就一直拉着，给取消留窗口
@@ -326,7 +334,8 @@ check("summarizeTask(null) → null", summarizeTask(null), (x) => x === null);
     res.on("close", () => {});
   });
   quiet.on("connection", (s) => { socks.add(s); s.on("close", () => socks.delete(s)); });
-  await new Promise((r) => quiet.listen(18991, "127.0.0.1", r));
+  await new Promise((r) => quiet.listen(0, "127.0.0.1", r));
+  const SLOW_PORT = quiet.address().port;
 
   // 引擎用 stdio:ignore 起（不接管道）：管道在 kill 瞬间的撕裂是 libuv 在 Windows 上的
   // 已知断言源（`!(handle->flags & UV_HANDLE_CLOSING)`），会让测试进程带着非零码退出。
@@ -356,7 +365,7 @@ check("summarizeTask(null) → null", summarizeTask(null), (x) => x === null);
   };
 
   if (ready) {
-    const made = await api("/download", { url: "http://127.0.0.1:18991/slow.bin", fileName: "slow.bin" });
+    const made = await api("/download", { url: `http://127.0.0.1:${SLOW_PORT}/slow.bin`, fileName: "slow.bin" });
     check("下载已发起", made, (x) => x && x.ok === true && !!x.taskId);
     await sleep(300);
 

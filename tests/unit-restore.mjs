@@ -18,9 +18,10 @@ import os from "node:os";
 import path from "node:path";
 import { getTaskManager, _resetTaskManager } from "../engine/dlcore.js";
 
-const BASE = path.join(os.tmpdir(), "hd-restore-test");
+const BASE = fs.mkdtempSync(path.join(os.tmpdir(), "hd-restore-test-"));
 const DATA_DIR = path.join(BASE, "data");
 const FINISHED = path.join(DATA_DIR, "finished");
+process.on("exit", () => { try { fs.rmSync(BASE, { recursive: true, force: true }); } catch { /* 忽略 */ } });
 
 let pass = 0, fail = 0;
 function check(name, actual, expectFn) {
@@ -59,7 +60,6 @@ const baseTask = (over) => ({
   ...over,
 });
 
-fs.rmSync(BASE, { recursive: true, force: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ── 场景 1：running → interrupted，且补写终态 ──

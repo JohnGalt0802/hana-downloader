@@ -13,18 +13,25 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const appRoot = path.resolve(here, "..");
 
-const BASE = path.join(os.tmpdir(), "hd-stall-test");
+const BASE = fs.mkdtempSync(path.join(os.tmpdir(), "hd-stall-test-"));
 const DATA_DIR = path.join(BASE, "data");
-const ENGINE_PORT = 4319;   // 故意与生产引擎（4317）错开；宿主自己占着 4318，别用
+process.on("exit", () => { try { fs.rmSync(BASE, { recursive: true, force: true }); } catch { /* 忽略 */ } });
+const ENGINE_PORT = await new Promise((resolve) => {   // 向系统要空端口，不写死（可并行跑）
+  const probe = net.createServer();
+  probe.listen(0, "127.0.0.1", () => {
+    const p = probe.address().port;
+    probe.close(() => resolve(p));
+  });
+});
 const FAKE_SESSION = "C:\\fake\\sessions\\stall-test.jsonl";
 
-fs.rmSync(BASE, { recursive: true, force: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 let pass = 0, fail = 0;
@@ -37,7 +44,7 @@ function check(name, actual, expectFn) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ── 静默源：发 200 字节后不再发任何数据 ──
-const SRC_PORT = 18995;
+const SRC_PORT = 0;
 const srv = http.createServer((req, res) => {
   res.writeHead(200, { "content-type": "application/octet-stream", "content-length": "1000000" });
   res.write(Buffer.alloc(200));
@@ -45,6 +52,7 @@ const srv = http.createServer((req, res) => {
   res.on("close", () => {});
 });
 await new Promise((r) => srv.listen(SRC_PORT, "127.0.0.1", r));
+const SRC_REAL_PORT = srv.address().port;
 
 // ── 起引擎 ──
 const engine = spawn(process.execPath, [path.join(appRoot, "engine", "server.js"), DATA_DIR], {
@@ -73,7 +81,7 @@ let taskId = null;
 try {
   const t0 = Date.now();
   const r = await api("/download", {
-    url: `http://127.0.0.1:${SRC_PORT}/stall.bin`,
+    url: `http://127.0.0.1:${SRC_REAL_PORT}/stall.bin`,
     fileName: "stall-probe.bin",
     saveDir: path.join(BASE, "out"),
     sessionPath: FAKE_SESSION,

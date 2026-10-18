@@ -3,9 +3,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import net from "node:net";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { resolveAria2Bin } from "../../engine/backends/aria2.js";
+
+// 端口一律向系统要（listen(0) 后取真端口），并行跑不互抢
+const freePort = () => new Promise((resolve) => {
+  const s = net.createServer();
+  s.listen(0, "127.0.0.1", () => { const p = s.address().port; s.close(() => resolve(p)); });
+});
 
 const SIZE = 900000;
 const BODY = crypto.randomBytes(SIZE);
@@ -25,7 +32,8 @@ const src = http.createServer((req, res) => {
   res.writeHead(range ? 206 : 200, h);
   res.end(BODY.subarray(start, end + 1));
 });
-await new Promise((r) => src.listen(18973, "127.0.0.1", r));
+await new Promise((r) => src.listen(0, "127.0.0.1", r));
+const SRC_PORT = src.address().port;
 
 const BASE = path.join(os.tmpdir(), "hd-aria2-engine");
 fs.rmSync(BASE, { recursive: true, force: true });
@@ -34,10 +42,10 @@ const SAVE_DIR = path.join(BASE, "out");
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(SAVE_DIR, { recursive: true });
 fs.writeFileSync(path.join(DATA_DIR, "engine-config.json"), JSON.stringify({
-  aria2: { enabled: true, bin: resolveAria2Bin(""), port: 6851 },
+  aria2: { enabled: true, bin: resolveAria2Bin(""), port: await freePort() },
 }, null, 2));
 
-const PORT = 18988;
+const PORT = await freePort();
 const engine = spawn(process.execPath, [path.resolve("engine/server.js"), DATA_DIR], {
   env: { ...process.env, HD_ENGINE_PORT: String(PORT) },
   stdio: "ignore",
@@ -63,7 +71,7 @@ const settings = await api("/settings");
 console.log("/settings aria2 =", JSON.stringify(settings.settings?.aria2));
 
 const made = await api("/download", {
-  url: "http://127.0.0.1:18973/engine.bin", fileName: "engine.bin", saveDir: SAVE_DIR,
+  url: `http://127.0.0.1:${SRC_PORT}/engine.bin`, fileName: "engine.bin", saveDir: SAVE_DIR,
 });
 console.log("/download =", JSON.stringify(made));
 

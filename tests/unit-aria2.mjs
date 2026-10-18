@@ -12,6 +12,7 @@
 // 用法（仓库根目录）：node tests/unit-aria2.mjs
 // 退出码：全过（含 skip）为 0，有失败为 1。
 import http from "node:http";
+import net from "node:net";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -36,6 +37,33 @@ function check(name, actual, expectFn) {
   else { fail++; console.log("FAIL:", name, "=>", JSON.stringify(actual)); }
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 每进程唯一临时目录：并行跑两套测试时不互相踩（原固定名 hd-aria2-* 会互指同一份文件）
+const TMP_DIRS = [];
+const tmpDir = (prefix) => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  TMP_DIRS.push(d);
+  return d;
+};
+process.on("exit", () => {
+  for (const d of TMP_DIRS) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* 忽略 */ } }
+});
+
+// 本进程独占的 aria2 基端口：portCandidates 会从基端口往后连试 8 个，
+// 所以要求这 8 个都空着（两个进程并行跑时写死 6828 会互撞端口）。
+const A2_BASE_PORT = await (async () => {
+  const isFree = (p) => new Promise((resolve) => {
+    const s = net.createServer();
+    s.once("error", () => resolve(false));
+    s.listen(p, "127.0.0.1", () => s.close(() => resolve(true)));
+  });
+  for (let base = 20000 + (process.pid % 200) * 8; base < 60000; base += 8) {
+    let ok = true;
+    for (let i = 0; i < 8 && ok; i++) ok = await isFree(base + i);
+    if (ok) return base;
+  }
+  return 6828; // 实在找不到就回落到旧值
+})();
 
 // ════════════════════════════════════════════════════════════════
 // A. 纯函数（不需要 aria2）
@@ -127,7 +155,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check("cap: REQUIRED_CAPABILITIES 四个", REQUIRED_CAPABILITIES.length, (x) => x === 4);
 
   // capabilitiesOf 兼容同步/异步/抛错
-  const capsOf = await capabilitiesOf(aria2Backend, { dataDir: path.join(os.tmpdir(), "hd-aria2-cap") });
+  const capsOf = await capabilitiesOf(aria2Backend, { dataDir: tmpDir("hd-aria2-cap-") });
   check("capabilitiesOf: 回对象", capsOf, (x) => x && typeof x === "object" && typeof x.available === "boolean");
   const boom = await capabilitiesOf({ name: "boom", capabilities() { throw new Error("x"); }, run: async () => {} });
   check("capabilitiesOf: 抛错 → available=false 且带原因", boom, (x) => x.available === false && typeof x.reason === "string" && x.reason.length > 0);
@@ -139,9 +167,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // A6. deliverPartFile：SHA 不符绝不交付（这条就是上周事故的护栏）
 {
-  const dir = path.join(os.tmpdir(), "hd-aria2-deliver");
-  fs.rmSync(dir, { recursive: true, force: true });
-  fs.mkdirSync(dir, { recursive: true });
+  const dir = tmpDir("hd-aria2-deliver-");
   const body = crypto.randomBytes(200000);
   const sha = crypto.createHash("sha256").update(body).digest("hex");
 
@@ -200,8 +226,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const { spawnSync } = await import("node:child_process");
   const { fileURLToPath } = await import("node:url");
   const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const sandbox = path.join(os.tmpdir(), "hd-aria2-nocache");
-  fs.rmSync(sandbox, { recursive: true, force: true });
+  const sandbox = tmpDir("hd-aria2-nocache-");
   const fakeLocal = path.join(sandbox, "localappdata");
   const linksDir = path.join(fakeLocal, "Microsoft", "WinGet", "Links");
   fs.mkdirSync(linksDir, { recursive: true });
@@ -276,20 +301,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   if (!squatBin) {
     console.log("（跳过 A9：本机没有 aria2c，无法验证「非 aria2 占端口」分支）");
   } else {
-  const BASE = path.join(os.tmpdir(), "hd-aria2-squat-unit");
-  fs.rmSync(BASE, { recursive: true, force: true });
-  fs.mkdirSync(BASE, { recursive: true });
-  const SQUAT_PORT = 6877;
-
+  const BASE = tmpDir("hd-aria2-squat-unit-");
+  // 本段故意验证「端口被非 aria2 占着」——所以这里必须有一个真被占用的端口。
+  // 端口号仍向系统要（先 listen(0) 拿真端口，占着不放），不写死，并行跑不互抢。
   // mock：回一个合法 JSON，但不是 JSON-RPC 形状（aria2 的回包一定有 jsonrpc/id 字段）
   const fake = httpMod.createServer((req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
     res.end('{"hello":"i am not aria2"}');
   });
-  await new Promise((r) => fake.listen(SQUAT_PORT, "127.0.0.1", r));
+  await new Promise((r) => fake.listen(0, "127.0.0.1", r));
+  const SQUAT_PORT = fake.address().port;
 
-  // setOptions 会失效探测缓存，但 options 没变时不会 —— 抖一下端口，保证读到本轮结果
-  aria2Backend.setOptions({ bin: squatBin, port: SQUAT_PORT + 1 });
+  // setOptions 会失效探测缓存，但 options 没变时不会 —— 抖一下端口（用一个不会去探测的临时值），保证读到本轮结果
+  aria2Backend.setOptions({ bin: squatBin, port: 1 });
   aria2Backend.setOptions({ bin: squatBin, port: SQUAT_PORT });
 
   const cap = await capabilitiesOf(aria2Backend, { dataDir: BASE });
@@ -303,9 +327,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     res.writeHead(200, { "content-type": "application/json" });
     res.end('{"jsonrpc":"2.0","id":"hd","result":{"enabledFeatures":[]}}');
   });
-  await new Promise((r) => fake2.listen(SQUAT_PORT + 2, "127.0.0.1", r));
-  aria2Backend.setOptions({ bin: squatBin, port: SQUAT_PORT + 3 });
-  aria2Backend.setOptions({ bin: squatBin, port: SQUAT_PORT + 2 });
+  await new Promise((r) => fake2.listen(0, "127.0.0.1", r));
+  const SQUAT_PORT2 = fake2.address().port;
+  aria2Backend.setOptions({ bin: squatBin, port: 1 });
+  aria2Backend.setOptions({ bin: squatBin, port: SQUAT_PORT2 });
   const cap2 = await capabilitiesOf(aria2Backend, { dataDir: BASE });
   check("capabilities: JSON-RPC 外形但缺 version → available=false", cap2.available, (x) => x === false);
   check("capabilities: 缺 version 的 reason 指向 version", cap2.reason, (x) => typeof x === "string" && /version/i.test(x));
@@ -320,8 +345,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 //   不需要 aria2 本体——这条纯在 dlcore 的恢复逻辑里。
 {
   const { _resetTaskManager } = await import("../engine/dlcore.js");
-  const BASE = path.join(os.tmpdir(), "hd-aria2-restore");
-  fs.rmSync(BASE, { recursive: true, force: true });
+  const BASE = tmpDir("hd-aria2-restore-");
   const DATA = path.join(BASE, "data");
   fs.mkdirSync(DATA, { recursive: true });
   const fp = path.join(BASE, "big.bin");
@@ -422,24 +446,24 @@ async function runReal() {
     };
     tick();
   });
-  const PORT = 18996;
+  const PORT = 0;
   await new Promise((r) => srv.listen(PORT, "127.0.0.1", r));
+  const SRC_PORT = srv.address().port;
 
-  const BASE = path.join(os.tmpdir(), "hd-aria2-test");
+  const BASE = tmpDir("hd-aria2-test-");
   const DATA_DIR = path.join(BASE, "data");
   const SAVE_DIR = path.join(BASE, "out");
-  fs.rmSync(BASE, { recursive: true, force: true });
   fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.mkdirSync(SAVE_DIR, { recursive: true });
 
   // 打开配置开关（本测试独占一个 dataDir，不碰用户真实配置）
   fs.writeFileSync(path.join(DATA_DIR, "engine-config.json"), JSON.stringify({
-    aria2: { enabled: true, bin: ARIA2_BIN, port: 6828 },
+    aria2: { enabled: true, bin: ARIA2_BIN, port: A2_BASE_PORT },
   }, null, 2));
 
   // 把 backend 的选项对齐到本段要用的端口：前面 A9 把 options.port 改到过别的值，
   // capabilities 现在也走 ensureInstance（会读 state.options.port），不重置就会起在旧端口上。
-  aria2Backend.setOptions({ bin: ARIA2_BIN, port: 6828 });
+  aria2Backend.setOptions({ bin: ARIA2_BIN, port: A2_BASE_PORT });
 
   // 后端真的可用吗（端口全占等情况下 skip 而不是失败）
   const cap = await capabilitiesOf(aria2Backend, { dataDir: DATA_DIR });
@@ -468,7 +492,7 @@ async function runReal() {
     return mgr.snapshot(taskId);
   };
 
-  const URL = `http://127.0.0.1:${PORT}/file.bin`;
+  const URL = `http://127.0.0.1:${SRC_PORT}/file.bin`;
 
   // ── 场景 1：正常下载，断言 SHA 与源一致 ──
   {
@@ -549,7 +573,7 @@ async function runReal() {
 
   // ── 场景 6：取消（aria2.remove → 确认 removed）不假报完成、保留半成品 ──
   {
-    const t = mgr.create({ url: `http://127.0.0.1:${PORT}/slow-cancel.bin`, fileName: "cancel.bin", saveDir: SAVE_DIR });
+    const t = mgr.create({ url: `http://127.0.0.1:${SRC_PORT}/slow-cancel.bin`, fileName: "cancel.bin", saveDir: SAVE_DIR });
     // 等它真的开始传（received > 0）再取消，否则可能刚提交就取消
     const t0 = Date.now();
     while (Date.now() - t0 < 30000) {
@@ -570,8 +594,8 @@ async function runReal() {
   // ── 场景 7：两个 aria2 任务同时跑（dlcore 管并发，aria2 不能把它干晩着）──
   {
     mgr.applyConfig({ maxConcurrent: 2 });
-    const a = mgr.create({ url: `http://127.0.0.1:${PORT}/slow-a.bin`, fileName: "conc-a.bin", saveDir: SAVE_DIR });
-    const b = mgr.create({ url: `http://127.0.0.1:${PORT}/slow-b.bin`, fileName: "conc-b.bin", saveDir: SAVE_DIR });
+    const a = mgr.create({ url: `http://127.0.0.1:${SRC_PORT}/slow-a.bin`, fileName: "conc-a.bin", saveDir: SAVE_DIR });
+    const b = mgr.create({ url: `http://127.0.0.1:${SRC_PORT}/slow-b.bin`, fileName: "conc-b.bin", saveDir: SAVE_DIR });
     const [sa, sb] = [await waitFinal(a.taskId), await waitFinal(b.taskId)];
     check("并发: 任务 1 done", sa?.state, (x) => x === "done");
     check("并发: 任务 2 done", sb?.state, (x) => x === "done");
