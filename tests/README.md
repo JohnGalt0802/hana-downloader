@@ -30,6 +30,7 @@ node tests/run-tests.mjs
 | `unit-restore.mjs` | **重启恢复的终态补写（2026-10-18）**：`restore()` 把 running/pending 恢复成 interrupted 时必须补写 `finished/<taskId>.json`（否则 App 侧 `settleWhenDone` 空等 30 分钟报假超时）、记录是 `summarizeTask` 形状、重复 restore 幂等、历史终态不被补写、超 1 小时的孤儿终态在 restore 时回收、被消费后「读走即删」。纯离线 |
 | `unit-contract.mjs` | **契约兜底（2026-10-18）**：`/list` 摘要字段齐全且与 `snapshot` 同语义、`percent` 口径一致、非 JSON 回包结构化、`displayNameOf` 永不产出 undefined、`stateBadge(undefined)` 不渲染 undefined、`/cancel` 响应形状与消费方一致。起真引擎跑 `/cancel` 与 `/list` |
 | `unit-aria2.mjs` | **aria2 backend（2026-10-18 W2）**：backend 契约校验、aria2 状态/进度映射（`complete` 不等于 `done`）、`.part` 交付的内容级校验（SHA 不符拒交付）、`capabilities` 的可用性判定（非 aria2 占端口必须 `available:false`）、**bin 探测失败不缓存**（装完不重启即可用）；**有 aria2 时跑真链路**（本地源 → 下载 → 断言产物 SHA-256 与源一致、中断后重试仍一致）。未装 aria2 自动 skip，不算失败 |
+| `unit-platform.mjs` | **平台适配层（2026-10-20 P1-1）**：十组接口契约（`which` 找不到给 `""`、`exe` 加后缀、`spawnOpts` 带 `windowsHide`、`killTree` 对不存在的 pid 返 false 不抛、`reveal` 对不存在路径返 `{ok:false}`、`readSystemProxy` 形状、`homeDir`/`tempDir` 非空、`normalizePath` 比较键、`capabilities` 三键齐全且来自真实探测）；`createPlatform` 拒收非法平台名；**darwin/linux 骨架必须抛「尚未实现」**（不许静默返回假值）。用 `createPlatform("win32")` 注入，不依赖本机平台 |
 | `unit-aria2-ui.mjs` | **aria2 开关的三态文案（2026-10-18 W3）**：`aria2StatusText` 的四条出口（检测中 / 未启用 / 已启用·版本·端口 / 已启用但不可用：reason）、version/port 缺省不产脏话、畸形输入不抛不产 undefined，以及显示限制说明 `ARIA2_LIMIT_NOTE` |
 
 ## servers/ — 手工验证用的本地下载源

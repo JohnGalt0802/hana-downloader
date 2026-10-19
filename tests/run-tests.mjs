@@ -36,6 +36,7 @@ const SUITES = [
   ["unit-aria2-ui.mjs", "aria2 开关三态文案（未启用 / 已启用可用 / 已启用不可用 / 检测中）"],
   ["unit-aria2-persist.mjs", "aria2 进度节流落盘（运行中 ≥2s 后磁盘 received>0 / 写盘频率受控 / 不用 .part 大小当进度）"],
   ["unit-backend-switch.mjs", ".part 归属与换后端（aria2 稀疏半成品切 node-http 必须从头下，不交付带洞文件）"],
+  ["unit-platform.mjs", "平台适配层（十组接口契约 / 参数注入三平台 / 骨架显式抛未实现）"],
 ];
 
 function run(file) {
