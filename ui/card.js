@@ -126,7 +126,50 @@ var widthProbeUntil = 0;
 // 若无节流，窗口内宽度始终不对时会连发约 40 条同内容上报。这里限「探测最多每秒一次」。
 // 只约束 probing 放行的非 force 上报；force=true 完全不走这条路。
 var lastProbeSentAt = 0;
-function reportSize(force) {
+
+// ── 一次性尺寸诊断（2026-10-19，仅异常时写）──
+// 目的：钉死「卡片宿主高度停在默认值」的根因——是上报没被采纳，还是去重把纠正门锁死了。
+// 硬约束：正常情况一个字都不写；同页面生命周期最多 8 条；不新增任何定时器、不改上报行为。
+var diagHBudget = 8;
+var diagHLastKey = "";
+function diagH(why, force, h) {
+  if (diagHBudget <= 0) return;
+  try {
+    const innerH = window.innerHeight;
+    const innerW = window.innerWidth;
+    const hBad = Math.abs(innerH - h) > 20;      // 宿主实际高度 ≠ 我要报的高度
+    const wBad = Math.abs(innerW - CARD_WIDTH) > 2; // 宽也没被采纳（顺带抓）
+    if (!hBad && !wBad) return;                  // 正常：不写
+    const key = why + "|" + h + "|" + innerH + "|" + innerW;
+    if (key === diagHLastKey) return;            // 同一异常不重复刷
+    diagHLastKey = key;
+    diagHBudget -= 1;
+    const dlEl = document.querySelector(".dl");
+    const rootEl = document.getElementById("dl-root");
+    const payload = {
+      h: h,
+      innerH: innerH,
+      innerW: innerW,
+      dlH: dlEl ? dlEl.offsetHeight : -1,
+      bodyH: document.body ? document.body.offsetHeight : -1,
+      rootH: rootEl ? rootEl.offsetHeight : -1,
+      why: why || "?",
+      force: !!force,
+    };
+    try {
+      if (typeof hana.track === "function") {
+        const p = hana.track("diag-h", payload);
+        if (p && typeof p.catch === "function") p.catch(() => {}); // 不 catch 会刷 Uncaught (in promise)
+      } else {
+        console.warn("[diag-h]", JSON.stringify(payload));
+      }
+    } catch {
+      try { console.warn("[diag-h]", JSON.stringify(payload)); } catch { /* 静默 */ }
+    }
+  } catch { /* 诊断失败绝不影响上报 */ }
+}
+
+function reportSize(force, why) {
   try {
     const h = measureH();
     // 高度未变不重复上报（高频轮询下减负）。
@@ -139,6 +182,7 @@ function reportSize(force) {
     const now = Date.now();
     const widthOk = Math.abs(window.innerWidth - CARD_WIDTH) <= 2;
     const probing = now < widthProbeUntil && !widthOk && (now - lastProbeSentAt >= 1000);
+    diagH(why, force, h); // 诊断放在去重之前：被去重挡下的帧同样是证据
     if (!force && h === lastReportedH && !probing) return;
     lastReportedH = h;
     lastProbeSentAt = now;
@@ -148,7 +192,7 @@ function reportSize(force) {
 }
 
 if (typeof ResizeObserver !== "undefined") {
-  try { new ResizeObserver(() => reportSize(false)).observe(root); } catch { /* 观察失败不影响主流程 */ }
+  try { new ResizeObserver(() => reportSize(false, "ro")).observe(root); } catch { /* 观察失败不影响主流程 */ }
 }
 
 // 启动期收敛（轻量版，二稿）：不盲目补报，先做零成本自检——读 window.innerWidth 看
@@ -163,9 +207,9 @@ if (typeof ResizeObserver !== "undefined") {
     try { return Math.abs(window.innerWidth - CARD_WIDTH) <= 2; } catch { return true; }
   };
   let sent = 0; // 本轮已真实发出的强制上报次数（3.4 收兵判据之一）
-  reportSize(true); sent += 1; // 首帧立即来一次
+  reportSize(true, "first"); sent += 1; // 首帧立即来一次
   try {
-    window.addEventListener("resize", () => { if (!adopted()) reportSize(true); });
+    window.addEventListener("resize", () => { if (!adopted()) reportSize(true, "timeout"); });
   } catch { /* 事件不可用不影响主流程 */ }
   let n = 0;
   const timer = setInterval(() => {
@@ -174,7 +218,7 @@ if (typeof ResizeObserver !== "undefined") {
     // 只看 |innerWidth-400|<=2 会误判：宽度可能是宿主上一轮的残留/巧合（窄列恰好≈400），
     // 而本次上报其实没落地，一收兵就再无纠正机会。多发一次确认，代价仍在秒级。
     if (adopted() && sent >= 2) { clearInterval(timer); return; } // 宿主已采纳，停止打扰
-    reportSize(true); sent += 1;
+    reportSize(true, "timeout"); sent += 1;
     if (n >= 6) clearInterval(timer); // 兜底上限：6 次检查（约 9 秒）
   }, 1500);
 })();
@@ -189,7 +233,7 @@ function onReshow() {
     if (now - lastReshowAt < 400) return;
     lastReshowAt = now;
     widthProbeUntil = Date.now() + 12000;
-    [0, 400, 1500].forEach((d) => setTimeout(() => reportSize(true), d)); // 三个一次性定时器
+    [0, 400, 1500].forEach((d) => setTimeout(() => reportSize(true, "reshow"), d)); // 三个一次性定时器
   } catch { /* 事件不可用不影响主流程 */ }
 }
 try {
@@ -416,7 +460,7 @@ function applyExpandState() {
   if (foldBtn) foldBtn.classList.toggle("open", expanded);
   const allBtn = document.getElementById("dl-all");
   if (allBtn) allBtn.classList.toggle("open", allExpanded);
-  reportSize();
+  reportSize(false, "render");
 }
 
 function toggleFold() { expanded = !expanded; applyExpandState(); }
@@ -454,14 +498,14 @@ function render(t) {
   const terminal = FINAL_STATES[t.state] === 1;
   if (terminal && !terminalReported) {
     terminalReported = true;
-    [0, 1000, 2500].forEach((d) => setTimeout(() => reportSize(true), d));
+    [0, 1000, 2500].forEach((d) => setTimeout(() => reportSize(true, "render"), d));
   }
 
   // 折叠态 / 重试态 / 任务 id 由本模块持有（render 每次重写 DOM，状态得留在外面），
   // 经 opts 传给纯函数，使其不读任何全局状态。
   const html = renderCardHTML(t, theme, { expanded, allExpanded, retrying, taskId });
   if (root.innerHTML !== html) root.innerHTML = html;
-  reportSize();
+  reportSize(false, "render");
   // 按钮事件不在这里绑定——render 会被轮询反复调用，每次新建的箭头函数会让
   // addEventListener 在同一节点上不断累加（终态 html 稳定、DOM 不重建，最终演变为
   // 一点即触发 N 次，N 随卡片停留时间增长）。点击分发统一走下方模块级的事件委托。
@@ -488,7 +532,7 @@ root.addEventListener("click", (e) => {
 
 function renderFail(msg) {
   root.innerHTML = '<div class="dl"><div class="dl-error">' + esc(msg) + "</div></div>";
-  reportSize();
+  reportSize(false, "render");
 }
 
 function renderHint(msg) {
@@ -496,13 +540,14 @@ function renderHint(msg) {
   div.className = "dl-hint";
   div.textContent = msg;
   root.appendChild(div);
-  reportSize();
+  reportSize(false, "render");
 }
 
 // ── 启动 ──
-window.addEventListener("load", () => setTimeout(reportSize, 60));
+window.addEventListener("load", () => setTimeout(() => reportSize(false, "timeout"), 60));
 
-// 尺寸诊断已于 2026-09-25 移除。
+// 尺寸诊断已于 2026-09-25 移除（老的那条 diag，见下）。
+// 2026-10-19：另起一条一次性诊断 diag-h —— 只在「宿主高度/宽度没被采纳」时写，见 diagH()。
 // 原实现在挂载后 1.2s 调 hana.track("diag", {...}) 上报 iframe 宽度与信封尺寸，
 // 用于排查「撑满聊天流」问题（见 docs/踩坑记录.md 第 38 条）。该问题已定性，
 // 而这段代码在宿主 0.1023.1 上会报两个错：
