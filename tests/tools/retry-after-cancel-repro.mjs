@@ -21,7 +21,8 @@ import { getTaskManager } from "../../engine/dlcore.js";
 const BASE = path.join(os.tmpdir(), "hd-retry-repro");
 const DATA_DIR = path.join(BASE, "data");
 const OUT_DIR = path.join(BASE, "out");
-const SRC_PORT = 18983; // 本复现脚本专用，勿与套件端口重口（18995~18998 已分别被 stall/probe/queue/aria2 占用）
+// src 在下面 listen(0) 后回填真实端口（2026-10-20：不再写死 18983，避开开发机上其他进程）
+let SRC_PORT = 0; // 由系统分配，见下方 src.address().port
 const TOTAL = 64 * 1024 * 1024; // 64MB
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -74,7 +75,8 @@ const src = http.createServer((req, res) => {
   });
   pushBody(res, 0);
 });
-await new Promise((r) => src.listen(SRC_PORT, "127.0.0.1", r));
+await new Promise((r) => src.listen(0, "127.0.0.1", r));
+SRC_PORT = src.address().port;
 
 const mgr = getTaskManager(DATA_DIR);
 
