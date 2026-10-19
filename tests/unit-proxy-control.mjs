@@ -1,6 +1,7 @@
 // tests/unit-proxy-control.mjs — 代理控制：扫描根组装（自定义优先 / 去重 / 过滤不存在）
 // 覆盖 2026-10-07 修订：扫描根从硬编码改为「config.json 自定义优先 + 通用默认」——
 // 机器私有目录不再写进代码，改由 proxyControl.scanRoots 提供。
+import path from "node:path";
 import { buildScanRoots } from "../engine/proxy-control.js";
 
 let pass = 0;
@@ -21,8 +22,12 @@ const r1 = buildScanRoots({ home: HOME, custom: ["X:\\tools\\proxy"], isDir: ALL
 check("自定义目录在首位", r1[0], "X:\\tools\\proxy");
 check("默认根含 D:\\Downloads", r1.includes("D:\\Downloads"), true);
 check("默认根含 Program Files", r1.includes("C:\\Program Files"), true);
-check("默认根含 home 桌面", r1.includes("H:\\home\\Desktop"), true);
-check("默认根含 home Programs", r1.includes("H:\\home\\AppData\\Local\\Programs"), true);
+// 2026-10-19：buildScanRoots 内部用 path.join 拼 home 子路径，posix 上分隔符是 "/"。
+// 期望值必须也走 path.join，否则这两条在 mac/linux 上恒假（这正是三平台 CI 上
+// 该套件红的原因，跟机器快慢无关）。硬编码的 "D:\\Downloads" / "C:\\Program Files"
+// 是直接字面量返回的，不受 path.join 影响，保持原样。
+check("默认根含 home 桌面", r1.includes(path.join(HOME, "Desktop")), true);
+check("默认根含 home Programs", r1.includes(path.join(HOME, "AppData", "Local", "Programs")), true);
 
 // ② 去重：自定义与默认重复时只保留一次，且在前
 const r2 = buildScanRoots({ home: HOME, custom: ["D:\\"], isDir: ALL });
