@@ -1,24 +1,28 @@
-// tests/unit-platform.mjs — 平台适配层（P1-1，2026-10-20）
+// tests/unit-platform.mjs — 平台适配层（P1-2，2026-10-20）
 //
-// 测什么：engine/platform/ 的十组接口契约 + 「骨架是显式的」这件事本身。
+// 测什么：engine/platform/ 的十组接口契约，**三份实例跑同一套断言**。
 //
-// 三份实例，一套断言：
-//   createPlatform("win32")   真实现，逐条验契约（不假设本机是 Windows：
-//                             断言写成「找不到 → ""」「非法 pid → false 不抛」这种
-//                             对返回值的要求，而不是「在 C:\ 下能找到 node」）
-//   createPlatform("darwin")  骨架：**必须抛「尚未实现」**。这条是给 P1-2 的分界线——
-//                             如果它静默返回假值，P1-2 就分不清哪些是真做过的。
-//   createPlatform("linux")   同上，另一份骨架
+// 为什么能在 Windows 上验 darwin/linux：所有探测类接口的实现都是「spawnSync 一次命令 →
+// 看退出码 / 解析输出」，被测的是**逻辑**而不是真机。在 Windows 上跑 darwin.which("node")
+// 时 which 命令不存在 → 走的正是「命令不存在 → 返回空」这条真实路径，反而是最有价值的覆盖。
+// 纯解析逻辑（scutil plist / gsettings 值 / 代理串归一）抽成了导出函数，直接喂字符串验。
 //
-// 特别保护：spawnOpts 与 killTree 必须同一文件相邻（方案 §3.3 原则一）。
-// 这里顺带断言 win32 下 spawnOpts 带 windowsHide，杜绝「起了进程没设选项」的旧缺陷复现。
+// 分三段：
+//   共通断言        三平台同一套（找不到给空、非法入参不抛、形状正确、幂等）
+//   平台差异断言    逐条硬编码期望值（后缀 / detached / 大小写 / 能力表）
+//   纯函数参数注入  scutil 三种形态、env 代理串、gsettings 输出
+//
+// ★ 这些断言证明的是「逻辑对」，**不是「mac/linux 真机能跑」**。真机行为未验证。
 //
 // 用法（仓库根目录）：node tests/unit-platform.mjs
 // 退出码：全过 0，有失败 1。
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { createPlatform, platform } from "../engine/platform/index.mjs";
+import * as darwinImpl from "../engine/platform/darwin.mjs";
+import * as linuxImpl from "../engine/platform/linux.mjs";
 
 let pass = 0, fail = 0, skip = 0;
 function check(name, fn) {
@@ -34,9 +38,21 @@ function check(name, fn) {
 const safe = (x) => { try { return JSON.stringify(x); } catch { return String(x); } };
 const isStr = (x) => typeof x === "string";
 
+const PLATFORMS = ["win32", "darwin", "linux"];
+const P = {};
+for (const n of PLATFORMS) P[n] = createPlatform(n);
+
+// 每个平台允许的 pkgManager 取值（不许出现别家的包管理器）
+const PKG_ALLOWED = {
+  win32: ["winget"],
+  darwin: ["brew"],
+  linux: ["brew", "apt", "dnf", "pacman"],
+};
+// readSystemProxy().source 的合法取值（跨平台并集；逐平台细分在差异段）
+const ALLOWED_SOURCE = ["none", "registry", "scutil", "gsettings", "env"];
+
 // ── 0. 工厂本身的契约 ───────────────────────────────────────────────────────
 check("createPlatform 是函数", () => typeof createPlatform === "function");
-
 check("非法平台名直接抛", () => {
   let threw = false;
   try { createPlatform("freebsd"); } catch { threw = true; }
@@ -50,248 +66,398 @@ check("空名/null 直接抛", () => {
   }
   return true;
 });
-
 check("生产导出 platform 与本机平台一致", () => platform.name === process.platform);
 check("生产导出与 createPlatform(process.platform) 同源", () =>
   platform.name === createPlatform(process.platform).name);
 
-// ── 1. 十组接口齐全（缺一个就说明实现不完整）───────────────────────────────
+// ══ 一、共通断言：三份实例同一套 ════════════════════════════════════════════
 const METHODS = ["which", "exe", "spawnOpts", "killTree", "isRunning", "reveal",
   "readSystemProxy", "homeDir", "tempDir", "normalizePath"];
-for (const name of ["win32", "darwin", "linux"]) {
-  check(`${name}: 十组接口都是函数`, () => {
-    const p = createPlatform(name);
-    return METHODS.every((m) => typeof p[m] === "function");
+
+for (const n of PLATFORMS) {
+  const p = P[n];
+
+  // ── 实例形状 ──
+  check(`${n}: name 字段正确`, () => p.name === n);
+  check(`${n}: 十组接口都是函数`, () => METHODS.every((m) => typeof p[m] === "function"));
+  check(`${n}: 实例被冻结（不能就地替换方法）`, () => {
+    try { p.which = () => "hacked"; } catch { /* 严格模式抛，同样算生效 */ }
+    return p.which("这个东西不存在") === "";
   });
-  check(`${name}: name 字段正确`, () => createPlatform(name).name === name);
+
+  // ── ① which：找不到给 ""，绝不抛 ──
+  // 在 Windows 上跑 darwin/linux，这里走的正是「which 命令不存在」的真实路径。
+  check(`${n}.which: 不存在的命令 → ""（不抛）`, () => p.which("这个东西不存在") === "");
+  check(`${n}.which: 空输入 → ""`, () =>
+    p.which("") === "" && p.which(undefined) === "" && p.which(null) === "");
+  check(`${n}.which: 纯空格 → ""`, () => p.which("   ") === "");
+  check(`${n}.which: 返回值是字符串，不返回 null/undefined`, () => {
+    const r = p.which("这个东西不存在");
+    return isStr(r) && r === "";
+  });
+
+  // ── ② exe：返回值类型与「不加后缀」的共性 ──
+  check(`${n}.exe: 返回字符串`, () => isStr(p.exe("a")) && isStr(p.exe("")));
+  check(`${n}.exe: 不改动路径分隔符`, () => p.exe("dir/a").includes("dir/a"));
+
+  // ── ③ spawnOpts：返回新对象、合并 extra、不改入参 ──
+  check(`${n}.spawnOpts: 不传参也给对象`, () =>
+    typeof p.spawnOpts() === "object" && p.spawnOpts() !== null);
+  check(`${n}.spawnOpts: extra 被合并`, () => {
+    const o = p.spawnOpts({ cwd: "x", stdio: "ignore" });
+    return o.cwd === "x" && o.stdio === "ignore";
+  });
+  check(`${n}.spawnOpts: 不改入参`, () => {
+    const extra = { cwd: "x" };
+    p.spawnOpts(extra);
+    return JSON.stringify(Object.keys(extra)) === JSON.stringify(["cwd"]);
+  });
+  check(`${n}.spawnOpts: 每次返回新对象（不共享同一个 dict）`, () => p.spawnOpts() !== p.spawnOpts());
+
+  // ── ④ killTree：非法/不存在 pid → false，不抛 ──
+  check(`${n}.killTree: 不存在的 pid → false 且不抛`, () => p.killTree(2147483647) === false);
+  check(`${n}.killTree: 非法入参 → false 且不抛`, () => {
+    for (const bad of [0, -1, -12345, NaN, "abc", null, undefined, 1.5, {}]) {
+      if (p.killTree(bad) !== false) return false;
+    }
+    return true;
+  });
+  check(`${n}.killTree: 返回值严格是布尔`, () => typeof p.killTree(0) === "boolean");
+
+  // ── ⑤ isRunning：不认识的名字 → false，不抛 ──
+  check(`${n}.isRunning: 不存在的进程 → false`, () => p.isRunning("这个东西不存在") === false);
+  check(`${n}.isRunning: 空输入 → false`, () => p.isRunning("") === false && p.isRunning(null) === false);
+  check(`${n}.isRunning: 返回值严格是布尔`, () => typeof p.isRunning("nope-xyz") === "boolean");
+
+  // ── ⑥ reveal：不存在的路径 → {ok:false}，不抛、不起 GUI ──
+  check(`${n}.reveal: 不存在的路径 → {ok:false} 且带 error`, () => {
+    const r = p.reveal(path.join(os.tmpdir(), "hd-platform-绝对不存在的路径-9f3a2b"), "select");
+    return r && r.ok === false && isStr(r.error) && r.error.length > 0;
+  });
+  check(`${n}.reveal: mode=open 同样安全失败`, () => {
+    const r = p.reveal(path.join(os.tmpdir(), "hd-platform-不存在-1c7d"), "open");
+    return r && r.ok === false && isStr(r.error);
+  });
+  check(`${n}.reveal: 空路径 → {ok:false}`, () => {
+    for (const bad of ["", null, undefined]) {
+      const r = p.reveal(bad, "select");
+      if (!r || r.ok !== false) return false;
+    }
+    return true;
+  });
+  check(`${n}.reveal: 返回值形状只有 ok/error`, () => {
+    const r = p.reveal(path.join(os.tmpdir(), "hd-nope-7g"), "select");
+    return r.ok === false && Object.keys(r).every((k) => k === "ok" || k === "error");
+  });
+
+  // ── ⑦ readSystemProxy：形状与稳定性（不假设本机有没有代理）──
+  check(`${n}.readSystemProxy: 不抛且键类型正确`, () => {
+    const r = p.readSystemProxy();
+    return r && typeof r === "object"
+      && typeof r.enabled === "boolean" && isStr(r.server) && isStr(r.source);
+  });
+  check(`${n}.readSystemProxy: 键固定为 enabled/server/source`, () => {
+    const keys = Object.keys(p.readSystemProxy()).sort();
+    return JSON.stringify(keys) === JSON.stringify(["enabled", "server", "source"]);
+  });
+  check(`${n}.readSystemProxy: 启停两态自洽（enabled → server 非空；否则 server 空、source=none）`, () => {
+    const r = p.readSystemProxy();
+    if (r.enabled) return r.server.length > 0 && r.source !== "none";
+    return r.server === "" && r.source === "none";
+  });
+  check(`${n}.readSystemProxy: source 在允许集合内`, () =>
+    ALLOWED_SOURCE.includes(p.readSystemProxy().source));
+  check(`${n}.readSystemProxy: 连跑两次结果稳定`, () => {
+    const a = p.readSystemProxy(), b = p.readSystemProxy();
+    return a.enabled === b.enabled && a.server === b.server && a.source === b.source;
+  });
+
+  // ── ⑧ homeDir / tempDir：非空字符串 ──
+  check(`${n}.homeDir: 非空字符串`, () => isStr(p.homeDir()) && p.homeDir().trim().length > 0);
+  check(`${n}.tempDir: 非空字符串`, () => isStr(p.tempDir()) && p.tempDir().trim().length > 0);
+
+  // ── ⑩ normalizePath：比较键的共性 ──
+  check(`${n}.normalizePath: 反斜杠转正斜杠`, () => p.normalizePath("a\\b\\c") === "a/b/c");
+  check(`${n}.normalizePath: 去重复分隔符`, () => p.normalizePath("a\\\\b//c") === "a/b/c");
+  check(`${n}.normalizePath: 空输入 → "" 不抛`, () =>
+    p.normalizePath("") === "" && p.normalizePath(null) === "" && p.normalizePath(undefined) === "");
+  check(`${n}.normalizePath: 幂等`, () => {
+    const once = p.normalizePath("C:\\\\A\\\\B\\\\");
+    return p.normalizePath(once) === once;
+  });
+  check(`${n}.normalizePath: 去尾部斜杠（根除外）`, () =>
+    p.normalizePath("/usr/local/") === "/usr/local" && p.normalizePath("/") === "/");
+
+  // ── ⑨ capabilities：键齐全、值有约束 ──
+  check(`${n}.capabilities: 三个键齐全且无遗留占位键`, () => {
+    const keys = Object.keys(p.capabilities).sort();
+    return JSON.stringify(keys) === JSON.stringify(["pkgManager", "proxyControl", "reveal"]);
+  });
+  check(`${n}.capabilities: proxyControl 严格是布尔`, () => typeof p.capabilities.proxyControl === "boolean");
+  check(`${n}.capabilities: reveal === true`, () => p.capabilities.reveal === true);
+  check(`${n}.capabilities.pkgManager: null 或本平台允许的名字`, () => {
+    const v = p.capabilities.pkgManager;
+    return v === null || (isStr(v) && PKG_ALLOWED[n].includes(v));
+  });
+  check(`${n}.capabilities.pkgManager: 不会串到别家包管理器`, () => {
+    const v = p.capabilities.pkgManager;
+    if (v === null) return true;
+    return !["winget", "brew", "apt", "dnf", "pacman"].some((x) => x === v && !PKG_ALLOWED[n].includes(x));
+  });
+  check(`${n}.capabilities: 冻结保护（改键不生效）`, () => {
+    const before = p.capabilities.proxyControl;
+    try { p.capabilities.proxyControl = !before; } catch { /* 严格模式抛，同样算保护生效 */ }
+    return p.capabilities.proxyControl === before;
+  });
 }
 
-// ══ win32 真实现 ════════════════════════════════════════════════════════════
-const W = createPlatform("win32");
+// ══ 二、平台差异断言：逐条硬编码期望 ════════════════════════════════════════
 
-// ── ① which：找不到给 ""，不抛 ──
-check("win32.which: 不存在的命令 → \"\"", () => W.which("这个东西不存在") === "");
-check("win32.which: 空输入 → \"\"", () => W.which("") === "" && W.which(undefined) === "" && W.which(null) === "");
-check("win32.which: 纯空格 → \"\"", () => W.which("   ") === "");
-check("win32.which: 返回值是字符串（不返回 null/undefined）", () => {
-  const r = W.which("这个东西不存在");
-  return isStr(r) && r === "";
+// ── ② exe：Windows 加 .exe，posix 原样 ──
+check("差异·exe: win32 加 .exe", () => P.win32.exe("a") === "a.exe");
+check("差异·exe: darwin 原样不加后缀", () => P.darwin.exe("a") === "a");
+check("差异·exe: linux 原样不加后缀", () => P.linux.exe("a") === "a");
+check("差异·exe: win32 带路径也不改名，只加后缀", () => P.win32.exe("C:\\tools\\aria2c") === "C:\\tools\\aria2c.exe");
+check("差异·exe: darwin 带路径原样返回", () => P.darwin.exe("/opt/homebrew/bin/aria2c") === "/opt/homebrew/bin/aria2c");
+check("差异·exe: linux 带路径原样返回", () => P.linux.exe("/usr/bin/aria2c") === "/usr/bin/aria2c");
+check("差异·exe: posix 侧对空输入也不加东西", () => P.darwin.exe("") === "" && P.linux.exe("") === "");
+
+// ── ③ spawnOpts：win32 无 detached，posix 有 detached 且无 windowsHide ──
+check("差异·spawnOpts: win32 有 windowsHide、无 detached", () => {
+  const o = P.win32.spawnOpts();
+  return o.windowsHide === true && !("detached" in o);
 });
-// 正向用例只能在 Windows 上跑；否则 where.exe 压根不存在，测的是别的东西
+check("差异·spawnOpts: darwin 有 detached、无 windowsHide", () => {
+  const o = P.darwin.spawnOpts();
+  return o.detached === true && !("windowsHide" in o);
+});
+check("差异·spawnOpts: linux 有 detached、无 windowsHide", () => {
+  const o = P.linux.spawnOpts();
+  return o.detached === true && !("windowsHide" in o);
+});
+check("差异·spawnOpts: posix 侧 extra 可覆盖 detached", () => P.darwin.spawnOpts({ detached: false }).detached === false);
+check("差异·spawnOpts: win32 侧 extra 可覆盖 windowsHide", () => P.win32.spawnOpts({ windowsHide: false }).windowsHide === false);
+
+// ── ⑩ normalizePath：win32 小写，posix 保持大小写 ──
+check("差异·normalizePath: win32 小写化", () => P.win32.normalizePath("A/B") === "a/b");
+check("差异·normalizePath: darwin 保持大小写", () => P.darwin.normalizePath("A/B") === "A/B");
+check("差异·normalizePath: linux 保持大小写", () => P.linux.normalizePath("A/B") === "A/B");
+check("差异·normalizePath: win32 整条路径小写", () =>
+  P.win32.normalizePath("C:\\Users\\John Galt\\A.TXT") === "c:/users/john galt/a.txt");
+check("差异·normalizePath: darwin 整条路径保原样", () =>
+  P.darwin.normalizePath("C:\\Users\\John Galt\\A.TXT") === "C:/Users/John Galt/A.TXT");
+check("差异·normalizePath: linux 整条路径保原样", () =>
+  P.linux.normalizePath("/Home/John/File.TXT") === "/Home/John/File.TXT");
+check("差异·normalizePath: posix 下大小写不同的两条路径不同键（大小写敏感）", () =>
+  P.darwin.normalizePath("/A/b") !== P.darwin.normalizePath("/a/b"));
+check("差异·normalizePath: win32 下大小写不同的两条路径同键（大小写不敏感）", () =>
+  P.win32.normalizePath("C:/A/b") === P.win32.normalizePath("c:/a/B"));
+
+// ── ⑨ capabilities.proxyControl：只有 Windows 为 true ──
+check("差异·capabilities.proxyControl: win32 === true", () => P.win32.capabilities.proxyControl === true);
+check("差异·capabilities.proxyControl: darwin === false", () => P.darwin.capabilities.proxyControl === false);
+check("差异·capabilities.proxyControl: linux === false", () => P.linux.capabilities.proxyControl === false);
+check("差异·capabilities.reveal: 三平台都是 true", () =>
+  PLATFORMS.every((n) => P[n].capabilities.reveal === true));
+check("差异·capabilities.pkgManager: darwin 不许出现 winget", () => P.darwin.capabilities.pkgManager !== "winget");
+check("差异·capabilities.pkgManager: linux 不许出现 winget", () => P.linux.capabilities.pkgManager !== "winget");
+
+// ── ⑧ tempDir 优先级 ──
+check("差异·tempDir: win32 优先 TEMP", () => {
+  const t = (process.env.TEMP || "").trim();
+  return t ? P.win32.tempDir() === t : true;
+});
+check("差异·tempDir: darwin 优先 TMPDIR", () => {
+  const t = (process.env.TMPDIR || "").trim();
+  return t ? P.darwin.tempDir() === t : true;
+});
+check("差异·tempDir: linux 优先 TMPDIR", () => {
+  const t = (process.env.TMPDIR || "").trim();
+  return t ? P.linux.tempDir() === t : true;
+});
+check("差异·tempDir: linux TMPDIR 缺失时退到 TMP", () => {
+  const saved = { TMPDIR: process.env.TMPDIR, TMP: process.env.TMP };
+  try {
+    process.env.TMPDIR = "";
+    process.env.TMP = "/var/tmp/hd-probe";
+    const r = P.linux.tempDir();
+    return r === "/var/tmp/hd-probe";
+  } finally {
+    if (saved.TMPDIR === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = saved.TMPDIR;
+    if (saved.TMP === undefined) delete process.env.TMP; else process.env.TMP = saved.TMP;
+  }
+});
+
+// ══ 三、Windows 本机专属：正向/负向对照 ══════════════════════════════════════
 if (process.platform === "win32") {
   check("win32.which(\"node\") → 真实存在的绝对路径", () => {
-    const r = W.which("node");
-    return isStr(r) && r.length > 0 && fs.existsSync(r);
+    const r = P.win32.which("node");
+    return r.length > 0 && fs.existsSync(r);
   });
-  check("win32.which(\"where.exe\") 自身可达", () => W.which("where.exe").length > 0);
+  check("win32.which(\"where.exe\") 自身可达", () => P.win32.which("where.exe").length > 0);
+  check("win32.isRunning(\"node\") → true（本机有 node 在跑）", () => P.win32.isRunning("node") === true);
+  check("win32.capabilities.pkgManager 来自真实探测（本机有 winget）", () =>
+    P.win32.capabilities.pkgManager === "winget");
+  check("win32.readSystemProxy: source 只可能是 registry 或 none", () => {
+    const s = P.win32.readSystemProxy().source;
+    return s === "registry" || s === "none";
+  });
+  // ★ 验收 3 的同一件事：本机没有 which 命令，darwin/linux 的实现必须优雅返回空而不是崩
+  check("darwin.which(\"node\") 在 Windows 上 → \"\"（本机无 which 命令，不抛）", () =>
+    P.darwin.which("node") === "");
+  check("linux.which(\"node\") 在 Windows 上 → \"\"（本机无 which 命令，不抛）", () =>
+    P.linux.which("node") === "");
+  check("darwin.isRunning(\"node\") 在 Windows 上 → false（本机无 pgrep）", () =>
+    P.darwin.isRunning("node") === false);
+  check("linux.isRunning(\"node\") 在 Windows 上 → false（本机无 pgrep）", () =>
+    P.linux.isRunning("node") === false);
+  check("darwin.readSystemProxy 在 Windows 上 → source=none（本机无 scutil）", () =>
+    P.darwin.readSystemProxy().source === "none");
+  check("darwin/linux.capabilities.pkgManager 在 Windows 上 → null（本机无 brew/apt/dnf/pacman）", () =>
+    P.darwin.capabilities.pkgManager === null && P.linux.capabilities.pkgManager === null);
 } else {
   skip += 1;
-  console.log("SKIP: win32.which 正向用例（本机非 Windows，where.exe 不存在）");
+  console.log("SKIP: Windows 本机专属正向用例");
 }
 
-// ── ② exe：只加后缀，不动路径、不查存在 ──
-check("win32.exe: 加 .exe 后缀", () => W.exe("aria2c") === "aria2c.exe");
-check("win32.exe: 带路径也不改名", () => W.exe("C:\\tools\\aria2c") === "C:\\tools\\aria2c.exe");
-check("win32.exe: 空输入 → \".exe\"", () => W.exe("") === ".exe" && W.exe(undefined) === ".exe");
-check("win32.exe: 幂等性不做保证但确定加一次", () => W.exe("a.exe") === "a.exe.exe");
+// ══ 四、纯函数参数注入：解析逻辑（真机不可达，只能在 Windows 上这样验）═══════
 
-// ── ③ spawnOpts：必然含 windowsHide，extra 合并进去 ──
-check("win32.spawnOpts: 含 windowsHide === true", () => W.spawnOpts().windowsHide === true);
-check("win32.spawnOpts: 不传参也给对象", () => typeof W.spawnOpts() === "object" && W.spawnOpts() !== null);
-check("win32.spawnOpts: extra 被合并", () => {
-  const o = W.spawnOpts({ cwd: "D:\\x", stdio: "ignore" });
-  return o.windowsHide === true && o.cwd === "D:\\x" && o.stdio === "ignore";
-});
-check("win32.spawnOpts: 不改入参", () => {
-  const extra = { cwd: "D:\\x" };
-  W.spawnOpts(extra);
-  return JSON.stringify(Object.keys(extra)) === JSON.stringify(["cwd"]);
-});
-check("win32.spawnOpts: extra 可覆盖默认值", () => W.spawnOpts({ windowsHide: false }).windowsHide === false);
+// ── scutil --proxy 三种形态 ──
+const SCUTIL_ON = [
+  "<dictionary> {",
+  "  HTTPEnable : 1",
+  "  HTTPPort : 7890",
+  "  HTTPProxy : 127.0.0.1",
+  "  HTTPSEnable : 1",
+  "  HTTPSPort : 7890",
+  "  HTTPSProxy : 127.0.0.1",
+  "  ProxyAutoConfigEnable : 0",
+  "}",
+].join("\n");
+const SCUTIL_HTTPS_ONLY = "<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 1\n  HTTPSPort : 8888\n  HTTPSProxy : 10.0.0.5\n}\n";
+const SCUTIL_OFF = "<dictionary> {\n  HTTPEnable : 0\n  HTTPPort : 0\n  HTTPProxy : \n  HTTPSEnable : 0\n}\n";
 
-// ── ④ killTree：非法/不存在 pid → false，不抛 ──
-check("win32.killTree: 不存在的 pid → false 且不抛", () => W.killTree(2147483647) === false);
-check("win32.killTree: 非法入参 → false 且不抛", () => {
-  for (const bad of [0, -1, -12345, NaN, "abc", null, undefined, 1.5, {}]) {
-    if (W.killTree(bad) !== false) return false;
+check("scutil: 形态①有代理 → enabled/server/source=scutil", () => {
+  const r = darwinImpl.parseScutilProxy(SCUTIL_ON);
+  return r.enabled === true && r.server === "127.0.0.1:7890" && r.source === "scutil";
+});
+check("scutil: 形态①优先 HTTP 而不是 HTTPS", () => {
+  const r = darwinImpl.parseScutilProxy(SCUTIL_ON.replace("HTTPSPort : 7890", "HTTPSPort : 9999"));
+  return r.server === "127.0.0.1:7890";
+});
+check("scutil: HTTP 关、HTTPS 开 → 用 HTTPS", () => {
+  const r = darwinImpl.parseScutilProxy(SCUTIL_HTTPS_ONLY);
+  return r.enabled === true && r.server === "10.0.0.5:8888" && r.source === "scutil";
+});
+check("scutil: 形态②HTTP 独占时也走 HTTPS 分支", () => {
+  const r = darwinImpl.parseScutilProxy("HTTPEnable : 0\nHTTPSEnable : 1\nHTTPSProxy : 1.2.3.4\nHTTPSPort : 1080");
+  return r.enabled === true && r.server === "1.2.3.4:1080";
+});
+check("scutil: 形态②全禁用 → none", () => {
+  const r = darwinImpl.parseScutilProxy(SCUTIL_OFF);
+  return r.enabled === false && r.server === "" && r.source === "none";
+});
+check("scutil: 形态③空文本 → none", () => {
+  const r = darwinImpl.parseScutilProxy("");
+  return r.enabled === false && r.server === "" && r.source === "none";
+});
+check("scutil: 形态③垃圾文本 → none", () => {
+  const r = darwinImpl.parseScutilProxy("not a plist at all\n;;;\n");
+  return r.enabled === false && r.server === "" && r.source === "none";
+});
+check("scutil: 形态③null/undefined → none 不抛", () => {
+  for (const bad of [null, undefined]) {
+    const r = darwinImpl.parseScutilProxy(bad);
+    if (r.enabled !== false || r.server !== "" || r.source !== "none") return false;
   }
   return true;
 });
-check("win32.killTree: 返回值严格是布尔", () => typeof W.killTree(0) === "boolean");
-
-// ── ⑤ isRunning：不认识的名字 → false，不抛 ──
-check("win32.isRunning: 不存在的进程 → false", () => W.isRunning("这个东西不存在") === false);
-check("win32.isRunning: 空输入 → false", () => W.isRunning("") === false && W.isRunning(null) === false);
-check("win32.isRunning: 返回值严格是布尔", () => typeof W.isRunning("nope-xyz") === "boolean");
-if (process.platform === "win32") {
-  // 用自己这个 node 进程的名字探一次：tasklist 一定认得出来
-  check("win32.isRunning(\"node\") → true（本机有 node 在跑）", () => W.isRunning("node") === true);
-} else {
-  skip += 1;
-  console.log("SKIP: win32.isRunning 正向用例（本机非 Windows）");
-}
-
-// ── ⑥ reveal：不存在的路径 → {ok:false}，不抛、不弹窗 ──
-check("win32.reveal: 不存在的路径 → {ok:false} 且带 error", () => {
-  const r = W.reveal(path.join(os.tmpdir(), "hd-platform-绝对不存在的路径-9f3a2b"), "select");
-  return r && r.ok === false && isStr(r.error) && r.error.length > 0;
+check("scutil: Enable=1 但缺 port → 无效（不猜默认端口）", () => {
+  const r = darwinImpl.parseScutilProxy("HTTPEnable : 1\nHTTPProxy : 127.0.0.1");
+  return r.enabled === false && r.server === "";
 });
-check("win32.reveal: mode=open 同样安全失败", () => {
-  const r = W.reveal(path.join(os.tmpdir(), "hd-platform-不存在-1c7d"), "open");
-  return r && r.ok === false && isStr(r.error);
+check("scutil: Enable=1 但缺 host → 无效", () => {
+  const r = darwinImpl.parseScutilProxy("HTTPEnable : 1\nHTTPPort : 7890");
+  return r.enabled === false && r.server === "";
 });
-check("win32.reveal: 空路径 → {ok:false}", () => {
-  for (const bad of ["", null, undefined]) {
-    const r = W.reveal(bad, "select");
-    if (!r || r.ok !== false) return false;
-  }
-  return true;
+check("scutil: 端口非数字 → 无效", () => {
+  const r = darwinImpl.parseScutilProxy("HTTPEnable : 1\nHTTPProxy : 127.0.0.1\nHTTPPort : abc");
+  return r.enabled === false && r.server === "";
 });
-check("win32.reveal: 返回值形状只有 ok/error", () => {
-  const r = W.reveal(path.join(os.tmpdir(), "hd-nope-7g"), "select");
-  return r.ok === false && Object.keys(r).every((k) => k === "ok" || k === "error");
+check("scutil: Enable 非 0/1（如 2）不当作开", () => {
+  const r = darwinImpl.parseScutilProxy("HTTPEnable : 2\nHTTPProxy : 1.1.1.1\nHTTPPort : 80");
+  return r.enabled === false;
 });
-
-// ── ⑦ readSystemProxy：拿不到时形状正确、不抛 ──
-check("win32.readSystemProxy: 不抛且键齐全", () => {
-  const r = W.readSystemProxy();
-  return r && typeof r === "object"
-    && typeof r.enabled === "boolean"
-    && isStr(r.server)
-    && isStr(r.source);
+check("scutil: 容忍 CRLF 与行首缩进", () => {
+  const r = darwinImpl.parseScutilProxy("  <dictionary> {\r\n    HTTPEnable : 1\r\n    HTTPProxy : proxy.local\r\n    HTTPPort : 3128\r\n  }\r\n");
+  return r.enabled === true && r.server === "proxy.local:3128";
 });
-check("win32.readSystemProxy: 键固定为 enabled/server/source", () => {
-  const keys = Object.keys(W.readSystemProxy()).sort();
+check("scutil: 返回对象不含多余键", () => {
+  const keys = Object.keys(darwinImpl.parseScutilProxy(SCUTIL_ON)).sort();
   return JSON.stringify(keys) === JSON.stringify(["enabled", "server", "source"]);
 });
-check("win32.readSystemProxy: 关掉时 server 为空且 source 非空", () => {
-  const r = W.readSystemProxy();
-  if (r.enabled) return true;                       // 本机确实开着代理，跳过形状细分
-  return r.server === "" && r.source.length > 0;    // "none" 或 "registry"
+
+// ── linux 环境变量代理串归一 ──
+check("env 代理串: 剥 http:// 与尾斜杠", () =>
+  linuxImpl.normalizeProxyServer("http://127.0.0.1:7890/") === "127.0.0.1:7890");
+check("env 代理串: 剥 socks5://", () =>
+  linuxImpl.normalizeProxyServer("socks5://127.0.0.1:1080") === "127.0.0.1:1080");
+check("env 代理串: 剥 user:pass@", () =>
+  linuxImpl.normalizeProxyServer("http://u:p@10.0.0.1:3128") === "10.0.0.1:3128");
+check("env 代理串: 纯 host:port 原样", () =>
+  linuxImpl.normalizeProxyServer("127.0.0.1:8080") === "127.0.0.1:8080");
+check("env 代理串: 砍掉路径与查询串", () =>
+  linuxImpl.normalizeProxyServer("http://h:1/proxy?x=1#f") === "h:1");
+check("env 代理串: 空/null → \"\" 不抛", () =>
+  linuxImpl.normalizeProxyServer("") === "" && linuxImpl.normalizeProxyServer(null) === "");
+check("env 代理串: 只给主机不猜默认端口", () =>
+  linuxImpl.normalizeProxyServer("http://proxy.local") === "proxy.local");
+
+// ── linux gsettings 输出解析 ──
+check("gsettings: 去单引号", () => linuxImpl.parseGsettingsValue("'manual'\n") === "manual");
+check("gsettings: 去双引号", () => linuxImpl.parseGsettingsValue("\"manual\"") === "manual");
+check("gsettings: 整数值原样", () => linuxImpl.parseGsettingsValue("7890\n") === "7890");
+check("gsettings: 空输出 → \"\"", () => linuxImpl.parseGsettingsValue("") === "");
+check("gsettings: @as [] 视为空", () => linuxImpl.parseGsettingsValue("@as []") === "");
+check("gsettings: 未闭合引号不抛且不吞字符", () => linuxImpl.parseGsettingsValue("'manual") === "'manual");
+check("gsettings: null/undefined → \"\" 不抛", () =>
+  linuxImpl.parseGsettingsValue(null) === "" && linuxImpl.parseGsettingsValue(undefined) === "");
+
+// ── readSystemProxy 走 env 分支（本机若设了 http_proxy，linux 实现必须认出来）──
+check("linux.readSystemProxy: env 里有 http_proxy 时 source=enabled 且与被归一", () => {
+  const v = (process.env.http_proxy || process.env.HTTP_PROXY || "").trim();
+  if (!v) return true;                  // 本机没设，走 gsettings/none 分支，不适用
+  const r = P.linux.readSystemProxy();
+  return r.enabled === true && r.source === "env"
+    && r.server === linuxImpl.normalizeProxyServer(v);
 });
-check("win32.readSystemProxy: 连跑两次结果稳定", () => {
-  const a = W.readSystemProxy(), b = W.readSystemProxy();
-  return a.enabled === b.enabled && a.server === b.server;
-});
-if (process.platform === "win32") {
-  check("win32.readSystemProxy: 有值时 source === \"registry\"", () => {
-    const r = W.readSystemProxy();
-    return r.source === "registry" || r.source === "none";
+
+// ══ 五、结构纪律：spawnOpts 与 killTree 必须相邻（方案 §3.3 原则一）═════════
+const here = path.dirname(fileURLToPath(import.meta.url));
+for (const f of ["darwin.mjs", "linux.mjs", "win32.mjs"]) {
+  check(`${f}: spawnOpts 与 killTree 之间没有别的函数`, () => {
+    const src = fs.readFileSync(path.join(here, "..", "engine", "platform", f), "utf8");
+    const a = src.indexOf("export function spawnOpts");
+    const b = src.indexOf("export function killTree");
+    if (a < 0 || b < 0 || b < a) return false;
+    const between = src.slice(a + "export function spawnOpts".length, b);
+    return !between.includes("export function") && !between.includes("export const");
+  });
+  check(`${f}: killTree 紧跟 spawnOpts（中间只隔注释/空行，行差 ≤ 20）`, () => {
+    const lines = fs.readFileSync(path.join(here, "..", "engine", "platform", f), "utf8").split(/\r?\n/);
+    const i = lines.findIndex((l) => l.startsWith("export function spawnOpts"));
+    const j = lines.findIndex((l) => l.startsWith("export function killTree"));
+    return i >= 0 && j > i && j - i <= 20;
   });
 }
 
-// ── ⑧ homeDir / tempDir：非空字符串 ──
-check("win32.homeDir: 非空字符串", () => isStr(W.homeDir()) && W.homeDir().trim().length > 0);
-check("win32.homeDir: 优先 HOMEDRIVE+HOMEPATH", () => {
-  const drive = process.env.HOMEDRIVE || "", rest = process.env.HOMEPATH || "";
-  if (!drive || !rest) return true;                 // 环境里没有这两项，走回退分支，不适用
-  return W.homeDir() === drive + rest;
-});
-check("win32.tempDir: 非空字符串", () => isStr(W.tempDir()) && W.tempDir().trim().length > 0);
-check("win32.tempDir: 优先 TEMP", () => {
-  const t = (process.env.TEMP || "").trim();
-  if (!t) return true;
-  return W.tempDir() === t;
-});
-
-// ── ⑩ normalizePath：只产出比较键 ──
-check("win32.normalizePath: 统一小写", () => W.normalizePath("C:\\Users\\John Galt\\A.TXT") === "c:/users/john galt/a.txt");
-check("win32.normalizePath: 反斜杠转正斜杠", () => W.normalizePath("a\\b\\c") === "a/b/c");
-check("win32.normalizePath: 去重复分隔符", () => W.normalizePath("a\\\\b//c") === "a/b/c");
-check("win32.normalizePath: 去尾部斜杠但保留盘根", () => {
-  return W.normalizePath("C:\\Users\\") === "c:/users"
-    && W.normalizePath("C:\\") === "c:/"
-    && W.normalizePath("D://") === "d:/";
-});
-check("win32.normalizePath: 大小写不同但同一路径 → 同键", () =>
-  W.normalizePath("C:\\Tools\\ARIA2C.EXE") === W.normalizePath("c:/tools/aria2c.exe"));
-check("win32.normalizePath: 空输入 → \"\" 不抛", () =>
-  W.normalizePath("") === "" && W.normalizePath(null) === "" && W.normalizePath(undefined) === "");
-check("win32.normalizePath: 幂等", () => {
-  const once = W.normalizePath("C:\\\\A\\\\B\\\\");
-  return W.normalizePath(once) === once;
-});
-
-// ── ⑨ capabilities：键齐全、值有约束 ──
-check("win32.capabilities: 三个键齐全", () => {
-  const keys = Object.keys(W.capabilities).sort();
-  return JSON.stringify(keys) === JSON.stringify(["pkgManager", "proxyControl", "reveal"]);
-});
-check("win32.capabilities.proxyControl === true", () => W.capabilities.proxyControl === true);
-check("win32.capabilities.reveal === true", () => W.capabilities.reveal === true);
-check("win32.capabilities.pkgManager 只可能是 \"winget\" 或 null", () =>
-  W.capabilities.pkgManager === "winget" || W.capabilities.pkgManager === null);
-if (process.platform === "win32") {
-  // 这台机器确实装了 winget（前面实测 where.exe winget 有输出），所以必须探到
-  check("win32.capabilities.pkgManager 来自真实探测（本机有 winget）", () =>
-    W.capabilities.pkgManager === "winget");
-} else {
-  skip += 1;
-  console.log("SKIP: win32.capabilities.pkgManager 正向探测（本机非 Windows）");
-}
-check("win32.capabilities: 冻结保护（改键不生效）", () => {
-  const before = W.capabilities.proxyControl;
-  try {
-    W.capabilities.proxyControl = false;
-  } catch { /* 严格模式下抛，同样算保护生效 */ }
-  return W.capabilities.proxyControl === before;
-});
-
-// ══ darwin / linux 骨架：必须显式抛「尚未实现」 ═════════════════════════════
-function expectNotImplemented(platformName) {
-  const p = createPlatform(platformName);
-  const failures = [];
-  const calls = {
-    which: () => p.which("node"),
-    exe: () => p.exe("aria2c"),
-    spawnOpts: () => p.spawnOpts({}),
-    killTree: () => p.killTree(1234),
-    isRunning: () => p.isRunning("node"),
-    reveal: () => p.reveal("C:\\x", "select"),
-    readSystemProxy: () => p.readSystemProxy(),
-    homeDir: () => p.homeDir(),
-    tempDir: () => p.tempDir(),
-    normalizePath: () => p.normalizePath("C:\\x"),
-  };
-  for (const [m, fn] of Object.entries(calls)) {
-    try {
-      fn();
-      failures.push(`${m}: 没抛（静默返回了假值）`);
-    } catch (e) {
-      const msg = String(e?.message || e);
-      if (!msg.includes("尚未实现")) failures.push(`${m}: 抛了但不是「尚未实现」→ ${msg}`);
-      if (!msg.startsWith(`${platformName}.${m}`)) failures.push(`${m}: 错误信息没带函数名前缀`);
-    }
-  }
-  return failures;
+// ── 两个骨架已不再是骨架：不许残留「尚未实现」 ──
+for (const f of ["darwin.mjs", "linux.mjs"]) {
+  check(`${f}: 不残留「尚未实现」字样`, () => {
+    const src = fs.readFileSync(path.join(here, "..", "engine", "platform", f), "utf8");
+    return !src.includes("尚未实现");
+  });
 }
 
-check("darwin: 十组接口全部抛「尚未实现」", () => expectNotImplemented("darwin"));
-check("linux: 十组接口全部抛「尚未实现」", () => expectNotImplemented("linux"));
-check("darwin.capabilities: 明示未实现（三键齐全且 implemented:false）", () => {
-  const c = createPlatform("darwin").capabilities;
-  return c && c.implemented === false
-    && c.pkgManager === null && c.proxyControl === null && c.reveal === null;
-});
-check("linux.capabilities: 明示未实现（三键齐全且 implemented:false）", () => {
-  const c = createPlatform("linux").capabilities;
-  return c && c.implemented === false
-    && c.pkgManager === null && c.proxyControl === null && c.reveal === null;
-});
-check("骨架不是「能力表看着能用」：非 Windows 平台不会被误当可用", () => {
-  for (const n of ["darwin", "linux"]) {
-    const c = createPlatform(n).capabilities;
-    if (c.proxyControl === true || c.pkgManager !== null || c.reveal === true) return false;
-  }
-  return true;
-});
-
-// ── 不可变性：拿到的实例不能被就地改坏 ──
-check("实例被冻结（不能就地替换方法）", () => {
-  const p = createPlatform("win32");
-  try { p.which = () => "hacked"; } catch { /* 严格模式抛，也算生效 */ }
-  return p.which("这个东西不存在") === "";
-});
-
-console.log(`\nunit-platform: ${pass} 通过 / ${fail} 失败${skip ? ` / ${skip} 跳过（本机非 Windows）` : ""}`);
+console.log(`\nunit-platform: ${pass} 通过 / ${fail} 失败${skip ? ` / ${skip} 跳过` : ""}`);
 process.exit(fail ? 1 : 0);
