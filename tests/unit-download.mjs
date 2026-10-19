@@ -384,8 +384,14 @@ const shaOf = (fp) => (fs.existsSync(fp) ? crypto.createHash("sha256").update(fs
   const diskSize = fs.existsSync(pp) ? fs.statSync(pp).size : -1;
   check("cancel-retry: 取消被接受", c, (x) => x?.ok === true);
   check("cancel-retry: 状态为 canceled", first?.state, (x) => x === "canceled");
-  // 缺陷现场：内存进度与磁盘进度对不上（写缓冲被丢弃）
-  check("cancel-retry: 内存 received 大于磁盘 .part", first?.received, (x) => x > Math.max(diskSize, 0));
+  // 缺陷现场：内存进度与磁盘进度对不上（写缓冲被丢弃）。
+  // 2026-10-19：断言从 `>` 改为 `>=`。原来要求「内存严格大于磁盘」，靠的是
+  // 「写缓冲还没落盘」那个时间差；mac/linux 上落盘更快，取消那一刻两者正好相等，
+  // 于是三平台 CI 上这条必挂（Windows 能过纯属写入比 mac 慢）。
+  // 真正要防的是「内存值**小于**磁盘」——那会让续传起点算错、UI 进度倒退。
+  // 等于磁盘是合法状态（缓冲区已全部落盘）。后续 retry 的断言（SHA 一致、
+  // 起点等于磁盘长度、无 .part 残留）才是这条用例的核心，不受影响。
+  check("cancel-retry: 内存 received 不少于磁盘 .part", first?.received, (x) => x >= Math.max(diskSize, 0));
 
   mgr.retry(t.taskId);
   const second = await waitFinal(t.taskId);
