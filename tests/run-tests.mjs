@@ -23,6 +23,7 @@ const SUITES = [
   ["unit-download.mjs", "下载内核端到端（落盘 / SHA-256 校验 / 限速 / 记录清理）"],
   ["unit-queue.mjs", "并发队列与重试（排队放行 / 失败重跑 / 默认限速）"],
   ["unit-stall.mjs", "卡滞快照的落盘契约（起真引擎，验 sessionPath/stalledAt 带到 App 侧）"],
+  ["unit-stall-notify.mjs", "卡滞提醒的投递通道（不建宿主任务 / triggerTurn=true / 同轮合并 / 重试仍 false）"],
   ["unit-restore.mjs", "重启恢复的终态补写（running/pending → interrupted 落 finished / 幂等 / 孤儿回收）"],
   ["unit-restore-aria2.mjs", "重启后 aria2 活实例接回（实例还在→继续跟踪到 done；实例已没→仍 interrupted；已下完→正确收尾）"],
   ["unit-atomic-final.mjs", "终态记录的原子写（写入中断不出半截 JSON / 内容与改动前一致 / 失败不留 .tmp）"],

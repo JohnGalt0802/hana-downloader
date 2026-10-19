@@ -309,13 +309,13 @@ export default defineApp(async (sdk) => {
     return id;
   }
 
-  // ── 卡滞通知任务（2026-09-20 按 APPS.md 的投递档位重做）──────────
-  // 为什么要单独弄一个甴主任务：卡滞发生在工具 execute 结束之后，那时令牌已失效，
-  // 而「能拼进下一次 API 调用」的投递（delivery: "next-step"）只在创建任务时固定。
-  // 所以令牌还在的时候先把任务建好，卡滞时后台只结算 taskId。
-  // APPS.md 原文：next-step「不打断在途模型请求...正在运行（包括等待工具）的会话会在下一次输入收集点
-  // 接收结果，空闲会话则启动后续回合」——正是要的行为。前提 minAppVersion >= 0.931.0，
-  // 能力 app/tasks.manage + app/session.start-turn（清单里都有）。
+  // ── 卡滞通知任务（2026-09-20 建，2026-10-19 停用）──────────────────
+  // 曾用「独立宿主任务 + next-step 投递」承载卡滞提醒。停用原因（2026-10-19 用户实测）：
+  // 一次下 3 个文件，聊天区冒出 6 个后台任务条目（3 个「下载 x」+ 3 个「停滞提醒：x」），
+  // 而 sdk.tasks 的 22 个成员里**没有 remove**，abort/cancel 只改状态，条目永久占着任务面
+  // （宿主已累计 109 条历史）。
+  // 现在卡滞提醒一律走 session:send-custom + triggerTurn（不占任务条目），见 scanStalls。
+  // 下面这个 createStallTask 不再被调用，保留仅为函数名/签名对照（两处调用点已去掉）。
   async function createStallTask(callToken, label) {
     if (!callToken) return null;
     // label 可能是 undefined（未传文件名/URL 的调用路径），先收口再拼，避免「停滞提醒：undefined」
@@ -363,9 +363,11 @@ export default defineApp(async (sdk) => {
   // 两者都需要「不依赖 callToken」的投递——工具 execute 早已结束，宿主任务面（sdk.tasks）用不了。
   //
   // 关键点：
-  //   triggerTurn    **必须是 false**（2026-09-20 用户确认）：这些信息重要到该知道，但没重要到
+  //   triggerTurn    默认 **false**（2026-09-20 用户确认）：这些信息重要到该知道，但没重要到
   //                  值得打断或另起一轮。「及时」的落点是**把消息拼进会话、等下一次 API 调用读到**，
   //                  不是立刻唤起模型。会话空闲时它就安静躺着，用户下次说话时进入上下文。
+  //                  唯一的例外是卡滞提醒（2026-10-19）：那时没人能替 agent 决策，必须叫醒，
+  //                  由调用方显式传 { triggerTurn: true }；重试通知等其它用途保持 false 不动。
   //   sessionId      必须给（只给 sessionPath 会被宿主拒绝，见 resolveSessionId 的注释）。
   //   scope: "all"   目标会话不属于本 App；缺省的 scope:"own" 会被宿主直接拒（校验点在
   //                  app-host 的会话归属检查里，错误文案是 does not belong to app）。
@@ -373,7 +375,7 @@ export default defineApp(async (sdk) => {
   //                  还需要 app/session.start-turn（消息会进模型上下文）。两者清单里都已声明。
   //   customType    会被宿主加前缀成 app:hana-downloader/<name>。**别用 download**——
   //                  清单里的 messageRenderers 声明着它，会把消息渲染成一张多余卡片。
-  async function notifySession(target, text, customType) {
+  async function notifySession(target, text, customType, opts = {}) {
     const sessionPath = typeof target === "string" ? target : target?.sessionPath;
     let sessionId = typeof target === "string" ? null : target?.sessionId;
     // content 是模型可见文本：入口归一成字符串，null/undefined/对象一律不直接下发
@@ -389,7 +391,8 @@ export default defineApp(async (sdk) => {
         content: body,
         customType: customType || "retry-note",
         display: false,
-        triggerTurn: false,
+        // 只有显式 opts.triggerTurn === true 才唤起一轮；其余一律 false（默认档位不变）
+        triggerTurn: opts?.triggerTurn === true,
         scope: "all",
       });
       log(`notify sent (${customType}) | ${sessionId}`);
@@ -457,7 +460,9 @@ export default defineApp(async (sdk) => {
   // 所以改成 App 侧常驻轮询引擎落的 stalled/<taskId>.json，再用 session:send-custom
   // 把「停了，你来定」投回原会话（triggerTurn:true 会直接唤起一轮）。
   //
-  // 两条路分工：卡滞叫醒决策，终态（宿主任务面）报告结果。
+  // 两条路分工：卡滞叫醒决策（sendCustom + triggerTurn，不占宿主任务条目），
+  // 终态（宿主任务面）报告结果。2026-10-19 之前卡滞也建一个宿主任务走 next-step，
+  // 结果是每次下载都在聊天区多占一条「停滞提醒：xxx」且永远删不掉（sdk.tasks 没有 remove）。
   //
   // 去重：key = taskId#stalledAt。同一个任务两次卡滞是两件事（中间恢复过），各自通知一次。
   // 启动时先静默扫一遍：stalled/ 里的存量都是历史卡滞，回放只会重复叫醒。
@@ -476,6 +481,10 @@ export default defineApp(async (sdk) => {
     const dir = path.join(dataDir, "stalled");
     let files = [];
     try { files = fs.readdirSync(dir); } catch { return; }
+    // 本轮待投的卡滞：按会话分组（一条 sendCustom 只能投一个会话），
+    // 同一会话里的多条在末尾合并成一条消息（每条一段、段间空行），只投一次。
+    // 一个会话只有一条卡滞时行为与拆分前一致。
+    const pending = new Map(); // sessionKey -> { sessionId, sessionPath, blocks[], files[] }
     for (const f of files) {
       if (!f.endsWith(".json")) continue;
       let snap = null;
@@ -501,8 +510,8 @@ export default defineApp(async (sdk) => {
       const sid = snap.sessionId;
       if (!sp && !sid) { log(`stall notify skipped | ${snap.taskId} 没有会话标识`); continue; }
       const secs = snap.stalledAt ? Math.round((Date.now() - snap.stalledAt) / 1000) : null;
-      const lines = [
-        `${RECORD_PREFIX}下载任务停滞，需要你决策（不是工具调用的结果）。`,
+      // 段落里不带总标题（合并时按条数生成），每条自己是一段完整信息
+      const block = [
         `任务：${snap.fileName || snap.taskId}`,
         `任务 ID：${snap.taskId}`,
         `已停滞：约 ${secs ?? "?"} 秒（一直没收到新数据）`,
@@ -510,25 +519,31 @@ export default defineApp(async (sdk) => {
         snap.filePath ? `目标文件：${snap.filePath}` : null,
         `可选动作：继续等（对端可能自己恢复）；取消（download-cancel ${snap.taskId}）；或者先放着。`,
         `（这条记录是当时写下的，你读到它时可能已经过时；先用 download-wait ${snap.taskId} 确认当前状态再动手。）`,
-      ].filter(Boolean);
-      // 正路：宿主任务 + next-step 投递（能拼进下一次 API 调用，见 APPS.md 的投递档位）
-      const stId = snap.stallTaskId || null;
-      if (stId) {
-        try {
-          await sdk.tasks.complete(stId, { text: asText(lines.join("\n")) });
-          consumedStallTasks.add(stId);
-          log(`stall notify sent (next-step) | ${stId}`);
-          // 通知成功：删掉这条 stalled 文件，不再只增不减（2026-10-10）
-          try { fs.unlinkSync(path.join(dir, f)); } catch { /* 忽略 */ }
-        } catch (e) {
-          err(`stall notify ERR (next-step) | ${e?.message || e}`);
-        }
-        continue;
+      ].filter(Boolean).join("\n");
+      const sessionKey = sid || sp;
+      let item = pending.get(sessionKey);
+      if (!item) { item = { sessionId: sid, sessionPath: sp, blocks: [], files: [] }; pending.set(sessionKey, item); }
+      item.blocks.push(block);
+      item.files.push(f);
+    }
+
+    // 投递：卡滞必须叫醒 agent（triggerTurn: true）——这是唯一为 true 的用途，
+    // 因为没有人能替它决策；重试通知等其他用途保持 false（见 notifySession 的注释）。
+    for (const item of pending.values()) {
+      const n = item.blocks.length;
+      const header = n === 1
+        ? `${RECORD_PREFIX}下载任务停滞，需要你决策（不是工具调用的结果）。`
+        : `${RECORD_PREFIX}有 ${n} 个下载任务停滞，需要你决策（不是工具调用的结果）。`;
+      const body = [header, ...item.blocks].join("\n\n");
+      // 只在「真的投出去」之后才删文件；投失败就留着（去重逻辑不变）
+      const delivered = await notifySession(
+        { sessionId: item.sessionId, sessionPath: item.sessionPath },
+        body, "download-stall", { triggerTurn: true },
+      );
+      if (delivered) {
+        for (const f of item.files) { try { fs.unlinkSync(path.join(dir, f)); } catch { /* 忽略 */ } }
+        log(`stall notify sent | ${n} 条 | ${item.sessionId || item.sessionPath}`);
       }
-      // 兜底：没有卡滞任务（老任务、或非工具发起）时退回自定义消息
-      // 只在「真的投出去」之后才删信，投失败就留着等下一轮（去重逻辑不变）
-      const delivered = await notifySession({ sessionId: sid, sessionPath: sp }, lines.join("\n"), "download-stall");
-      if (delivered) { try { fs.unlinkSync(path.join(dir, f)); } catch { /* 忽略 */ } }
     }
   }
 
@@ -609,8 +624,10 @@ export default defineApp(async (sdk) => {
         const sessionPath = context?.sessionPath;
         // 会话身份要在 execute 期间锁下来（晚了就没有上下文了，而卡滞/重试的通知都得靠它）
         const sessionId = await resolveSessionId(sessionPath);
-        // 卡滞提醒用独立甴主任务（next-step 投递）：令牌只在 execute 期间有效，先建好
-        const stallTaskId = await createStallTask(callToken, fileName || url);
+        // 卡滞提醒不再建宿主任务（2026-10-19）：改用 sendCustom + triggerTurn，
+        // 不再往聊天区多添一条删不掉的「停滞提醒：xxx」。stallTaskId 保留为 null，
+        // 好让 settleWhenDone / 引擎侧的签名不用变（引擎仍接受这个字段）。
+        const stallTaskId = null;
         log(`download-file invoked | url=${url} callToken=${typeof callToken} sessionPath=${sessionPath || "?"} sessionId=${sessionId || "-"} stallTask=${stallTaskId || "-"}`);
 
         let r;
@@ -873,7 +890,8 @@ export default defineApp(async (sdk) => {
         const callToken = context?.callToken;
         const sessionPath = context?.sessionPath;
         const sessionId = await resolveSessionId(sessionPath);
-        const stallTaskId = await createStallTask(callToken, label || pkg || kind);
+        // 卡滞提醒不再建宿主任务（2026-10-19，同 download-file）：stallTaskId 恒为 null
+        const stallTaskId = null;
         log(`download-command invoked | kind=${kind} callToken=${typeof callToken} sessionId=${sessionId || "-"}`);
 
         let r;

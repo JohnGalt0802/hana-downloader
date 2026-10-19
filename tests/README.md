@@ -26,6 +26,7 @@ node tests/run-tests.mjs
 | `unit-theme.mjs` | 声明式主题数据层：继承合并、校验拒收、DEFAULTS 填满、schema 口径与 theme.json 三腿一致 |
 | `unit-cardview.mjs` | `ui/shared/cardview.js`：minimal 主题逐字节回归、golden 冻结快照、缺省第三腿一致性、主题字段落地 |
 | `unit-stall.mjs` | 卡滞快照落盘契约（起真引擎）：sessionPath/stallTaskId/stalledAt 带到 App 侧、卡滞中的任务可取消 |
+| `unit-stall-notify.mjs` | **卡滞提醒的投递通道（2026-10-19）**：download-file 只建「下载 xxx」宿主任务、不再建「停滞提醒：xxx」；卡滞走 sendCustom 且 `triggerTurn === true`；一轮里两个卡滞只投一次并合并成一条；重试通知仍是 `triggerTurn === false`。假 SDK，不起引擎不联网 |
 | `unit-restore.mjs` | **重启恢复的终态补写（2026-10-18）**：`restore()` 把 running/pending 恢复成 interrupted 时必须补写 `finished/<taskId>.json`（否则 App 侧 `settleWhenDone` 空等 30 分钟报假超时）、记录是 `summarizeTask` 形状、重复 restore 幂等、历史终态不被补写、超 1 小时的孤儿终态在 restore 时回收、被消费后「读走即删」。纯离线 |
 | `unit-contract.mjs` | **契约兜底（2026-10-18）**：`/list` 摘要字段齐全且与 `snapshot` 同语义、`percent` 口径一致、非 JSON 回包结构化、`displayNameOf` 永不产出 undefined、`stateBadge(undefined)` 不渲染 undefined、`/cancel` 响应形状与消费方一致。起真引擎跑 `/cancel` 与 `/list` |
 | `unit-aria2.mjs` | **aria2 backend（2026-10-18 W2）**：backend 契约校验、aria2 状态/进度映射（`complete` 不等于 `done`）、`.part` 交付的内容级校验（SHA 不符拒交付）、`capabilities` 的可用性判定（非 aria2 占端口必须 `available:false`）、**bin 探测失败不缓存**（装完不重启即可用）；**有 aria2 时跑真链路**（本地源 → 下载 → 断言产物 SHA-256 与源一致、中断后重试仍一致）。未装 aria2 自动 skip，不算失败 |
