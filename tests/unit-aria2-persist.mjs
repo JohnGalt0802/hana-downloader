@@ -72,9 +72,20 @@ if (!ARIA2_BIN) {
 }
 
 async function runReal() {
-  // 慢速源：让下载稳定持续 8 秒以上，足够观察 ≥2 秒的落盘窗口
+  // 慢速源：用「全局令牌」限速，保证整份文件无论客户端开几个连接、机器多快，
+  // 都要花 DURATION_MS 左右才下完——这是本套件时序假设的地基。
+  //
+  // 为什么不能按「每连接 chunk + sleep」限速：aria2 默认 max-connection-per-server=5，
+  // 每连接各限一份速率，总吞吐就是 5 倍，回环越快就越早下完。曾经的写法（40000B/80ms）
+  // 在 Windows 上 6MB 要 2.5 秒（采样末端才到 97%，靠运气过），在 mac/linux 上不到 0.7 秒
+  // 就下完、磁盘写出正确终态 done，采样末端读到 done，被误报成「提前写终态」。
+  // 全局令牌把所有连接共享同一个整体速率，总时长与客户端性能、并发度都无关。
   const SIZE = 6_000_000;
   const BODY = crypto.randomBytes(SIZE);
+  const DURATION_MS = 9000;         // 整份文件的目标下发时长（4 秒采样窗口的 2.25 倍）
+  const RATE = SIZE / DURATION_MS;  // 字节/毫秒，所有连接共享
+  const T0 = Date.now();
+  let served = 0;
 
   const srv = http.createServer((req, res) => {
     const range = req.headers.range;
@@ -96,11 +107,18 @@ async function runReal() {
 
     let off = start;
     const tick = () => {
+      // aria2 会先发一个不带 Range 的探测请求再 abort；已断开就别再喂，
+      // 否则空转的定时器会虚增 served，把限速拖慢。
+      if (res.destroyed || res.writableEnded) return;
       if (off > end) return res.end();
       const n = Math.min(40000, end - off + 1);
       res.write(BODY.subarray(off, off + n));
       off += n;
-      setTimeout(tick, 80);
+      served += n;
+      // 睡到「按全局速率这点字节早该发完」的时刻：并发连接越多，单连接反而越慢，
+      // 整体吞吐恒为 RATE。
+      const wait = T0 + served / RATE - Date.now();
+      setTimeout(tick, Math.max(0, wait));
     };
     tick();
   });
@@ -168,13 +186,16 @@ async function runReal() {
   check("落盘: 2 秒后磁盘进度不倒退（不回到 0）", after2s, (x) => x.every((v, i) => i === 0 || v >= x[i - 1]));
   check("落盘: 磁盘记录里 backend 是 aria2", samples.at(-1)?.disk?.backend, (x) => x === "aria2");
   check("落盘: 磁盘记录状态仍是 running（没提前写终态）", samples.at(-1)?.disk?.state, (x) => x === "running");
+
   // 磁盘值必须是真进度：与内存快照同量级（内存一直在涨，磁盘允许落后一个节流窗口）
   check("落盘: 磁盘 received 与内存同量级（未落后到 0）", {
     disk: samples.at(-1)?.disk?.received ?? -1, mem: memAtEnd?.received ?? -1,
   }, (x) => x.disk > 0 && x.mem > 0 && x.disk <= x.mem && x.disk >= x.mem * 0.3);
 
   // ── 断言 2：落盘频率受控 ──
-  // 数磁盘上 received 的变化次数：4 秒 / 1.5s 节流 ≈ 最多 3 次（留 1 次余量给终态前的写）
+  // 数磁盘上 received 的变化次数：4 秒 / 1.5s 节流 ≈ 最多 2 次（改限速后总时长 9 秒、
+  // 下载跨度里最多 4 次节流写，采样窗口 4 秒内只看得到 4/1.5 ≈ 2 次，留 2 次余量）。
+  // 这里盯的是「不是每轮轮询都写」，上限别为了放过宽而失去意义（100ms 采样，4 秒 = 40 次）。
   const changes = [];
   let prev = null;
   for (const s of samples) {
