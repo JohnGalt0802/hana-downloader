@@ -45,6 +45,19 @@ const listTmp = (dir) => { try { return fs.readdirSync(dir).filter((f) => f.ends
 // ══ 场景 1：写入途中并发读，目标路径只能是「不存在」或「完整 JSON」 ══
 // 探针：1ms 轮询目标路径，凡是能读到的内容都必须能 JSON.parse 且 blob 长度对得上。
 // mode=atomic 走生产代码 writeJsonAtomic；mode=plain 复刻改动前的直接写（对照组）。
+//
+// 写入窗口按**时间**驱动（WRITE_MS），不按次数。原先固定写 8 轮，窗口只有几十毫秒；
+// 并行跑测试时 CPU 争用会把探针的 sleep(1) 拉到十几毫秒，两次读全落在写完之后 →
+// 对照组「抓不到半截」→ 这条断言失去鉴别力，整轮测试假红（20/21 vs 21/21）。
+// 时间驱动的窗口是墙钟时间，与机器快慢、是否并行无关，因此有确定下限。
+const WRITE_MS = 600;
+// 探针读到**完整内容**后短暂让路。
+// 为什么：探针每 1ms 读一次 4MB 文件，readFileSync 的持有时间是十几毫秒量级；
+// 持续这么按着，“rename 时目标被别的进程打开”的重试预算（产品侧 20×5ms）会被打穿 → EPERM。
+// 实测归因（同样 600ms 窗口）：完全不读 0/8 失败、只 stat 不读 0/8、真读 2/12 ——
+// 失败来自探针自己把目标摁住，不是被测代码的问题。让路只发生在读到**完整**内容之后，
+// 半截窗口的采样密度不受影响（对照组实测仍能抓到 ~38 次半截）。轮询间隔仍是 1ms。
+const PROBE_PAD_MS = 8;
 async function probe(mode, dir) {
   const target = path.join(dir, "probe.json");
   const SIZE = 4 * 1024 * 1024;
@@ -53,13 +66,16 @@ async function probe(mode, dir) {
     ${mode === "atomic" ? `import { writeJsonAtomic } from ${JSON.stringify(new URL("file://" + ATOMIC_MOD).href)};` : ""}
     const target = ${JSON.stringify(target)};
     const payload = JSON.stringify({ taskId: "probe", blob: "x".repeat(${SIZE}) });
-    for (let i = 0; i < 8; i++) {
+    // 写满 WRITE_MS 毫秒为止（每轮都是一次完整写，循环条件在两轮之间检查）
+    const until = Date.now() + ${WRITE_MS};
+    while (Date.now() < until) {
       ${mode === "atomic" ? "writeJsonAtomic(target, payload);" : 'fs.writeFileSync(target, payload, "utf8");'}
     }
   `], { stdio: ["ignore", "inherit", "inherit"] });
 
   let reads = 0, halves = 0, completed = 0;
   while (child.exitCode === null) {
+    let complete = false;
     if (fs.existsSync(target)) {
       let txt = null;
       try { txt = fs.readFileSync(target, "utf8"); } catch { txt = null; }
@@ -67,11 +83,12 @@ async function probe(mode, dir) {
         reads++;
         try {
           const j = JSON.parse(txt);
-          if (j.blob.length === SIZE) completed++;
+          if (j.blob.length === SIZE) { completed++; complete = true; }
           else halves++;              // 解析得动但内容截断（极少见，也算半截）
         } catch { halves++; }         // 半截 JSON：改动前就是这里把等待方坑死的
       }
     }
+    if (complete) await sleep(PROBE_PAD_MS);
     await sleep(1);
   }
   return { reads, halves, completed, code: child.exitCode };
@@ -85,6 +102,9 @@ async function probe(mode, dir) {
 
   const a = await probe("atomic", dirA);
   const p = await probe("plain", dirP);
+  // 采样数留在输出里：断言失败时能直接看出是「探针没工作」还是「真的抓到半截」
+  console.log(`   探针采样（WRITE_MS=${WRITE_MS}）：plain reads=${p.reads} halves=${p.halves} completed=${p.completed}；`
+    + `atomic reads=${a.reads} halves=${a.halves} completed=${a.completed}`);
 
   check("对照组（改动前的直接写）确实能被探针抓到半截", p, (x) => x.halves > 0 && x.code === 0);
   check("原子写：子进程完整跑完（rename 未被并发读卡住）", a.code, (x) => x === 0);
