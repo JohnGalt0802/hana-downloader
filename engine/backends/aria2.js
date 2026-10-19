@@ -215,17 +215,30 @@ let binCache = { at: 0, value: null };
  * 仍是真实用户目录（实测 exists=true、其下 aria2c 可达）。故候选表首位放这条，
  * 其次才是环境变量路径（非沙箱环境仍有用），最后是系统级位置。
  *
+ * **候选表可注入（2026-10-19 加，仅供测试）**：内置候选表是硬编码的绝对路径
+ * （`/usr/bin/aria2c`、`/opt/homebrew/bin/aria2c`、`C:\ProgramData\chocolatey\bin\aria2c.exe` 等），
+ * **不受任何环境变量控制**。CI runner 预装了 aria2c，所以「改环境变量造一个空环境」的测试
+ * 在三平台都探到了真 aria2c 而失败。给 `opts.candidates` 后，测试可以彻底替换候选表，
+ * 不再依赖机器是否干净。不传 `opts` 时行为与以前完全一致。
+ *
  * @param {string} [explicit] 用户显式配置的 bin 路径
+ * @param {{candidates?: string[]|(() => string[])}} [opts] 仅测试用：覆盖内置候选表
+ *   （数组，或每次探测求值的函数）
  * @returns {string} 找到的绝对路径；没找到给 ""
  */
-export function resolveAria2Bin(explicit = "") {
+export function resolveAria2Bin(explicit = "", opts = {}) {
   if (explicit && String(explicit).trim()) {
     const p = path.resolve(String(explicit).trim());
     if (fs.existsSync(p)) return p;
     return ""; // 显式指定但不存在：视为没有，不悄悄回落到 PATH（否则「配错了」会被掩盖）
   }
+  const customCandidates = opts ? opts.candidates : undefined;
+  const hasCustom = customCandidates !== undefined && customCandidates !== null;
   const now = Date.now();
-  if (binCache.value !== null && now - binCache.at < 30000) return binCache.value;
+  // 自定义候选表**绕过缓存**：缓存是模块级单例，若先用内置表探测成功（缓存了 A），
+  // 再用自定义表探测会直接拿到 A，隔离形同虚设。自定义探测本身也不写缓存，
+  // 免得把测试用的候选路径泄漏给后续的真实探测。
+  if (!hasCustom && binCache.value !== null && now - binCache.at < 30000) return binCache.value;
   const found = (() => {
     try {
       const cmd = process.platform === "win32" ? "where.exe" : "which";
@@ -260,14 +273,17 @@ export function resolveAria2Bin(explicit = "") {
       // ④ 本 App 自己的 dataDir（沙箱下 winget 安装会落到 .runtime-tmp，见 docs）
       path.join(process.env.LOCALAPPDATA || "", "..", "..", "aria2c.exe"),
     ].filter(Boolean);
-    const guesses = process.platform === "win32"
-      ? winCandidates
-      : ["/usr/bin/aria2c", "/usr/local/bin/aria2c", "/opt/homebrew/bin/aria2c"];
+    const guesses = hasCustom
+      ? ((typeof customCandidates === "function" ? customCandidates() : customCandidates) || [])
+      : (process.platform === "win32"
+        ? winCandidates
+        : ["/usr/bin/aria2c", "/usr/local/bin/aria2c", "/opt/homebrew/bin/aria2c"]);
     for (const g of guesses) if (g && fs.existsSync(g)) return g;
     return "";
   })();
   // 只缓存成功结果：没找到（""）不写缓存，下次调用重新探测（用户装完即可用）。
-  if (found) binCache = { at: now, value: found };
+  // 自定义候选表的结果不进缓存（见上方说明）。
+  if (found && !hasCustom) binCache = { at: now, value: found };
   return found;
 }
 

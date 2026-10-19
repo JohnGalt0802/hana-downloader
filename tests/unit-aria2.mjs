@@ -232,21 +232,31 @@ const A2_BASE_PORT = await (async () => {
   fs.mkdirSync(linksDir, { recursive: true });
   const sample = resolveAria2Bin(""); // 有真 aria2 就拿它当「待安装样本」
 
-  // 子进程里：先探测（应空）→ 把 aria2c 放进 WinGet Links → 再探测（应找得到）
+  // 子进程里：先探测（应空）→ 把 aria2c 放进目标目录 → 再探测（应找得到）
   // 写成临时 .mjs 文件而不用 -e：PowerShell 下 -e 的引号会把脚本内容搞坏（实测无输出）。
+  //
+  // 2026-10-19：光改环境变量做不到真隔离。resolveAria2Bin 在 which/where 失败后会走
+  // **硬编码绝对路径候选表**（/usr/bin/aria2c、/opt/homebrew/bin/aria2c、
+  // C:\ProgramData\chocolatey\bin\aria2c.exe …），这些不受任何环境变量控制；
+  // GitHub runner 预装 aria2c，于是三平台都探到了真 aria2c。
+  // 现在：① PATH 只给一个空的沙箱目录（which/where 找不到，也连命令本身都起不来，落回候选表）；
+  //       ② candidates 只指向沙箱内的目标文件——环境干净与否都不影响结果。
   const probeFile = path.join(sandbox, "probe.mjs");
   const aria2Url = new URL(`file:///${path.join(appRoot, "engine", "backends", "aria2.js").replace(/\\/g, "/")}`).href;
+  const targetFile = path.join(linksDir, "aria2c.exe");
+  const emptyBin = path.join(sandbox, "empty-bin");
+  fs.mkdirSync(emptyBin, { recursive: true });
   fs.writeFileSync(probeFile, `
     import fs from "node:fs";
     import { resolveAria2Bin } from ${JSON.stringify(aria2Url)};
-    const links = ${JSON.stringify(linksDir.replace(/\\/g, "/"))};
+    const target = ${JSON.stringify(targetFile.replace(/\\/g, "/"))};
     const sample = ${JSON.stringify((sample || "").replace(/\\/g, "/"))};
-    const before = resolveAria2Bin("");
-    const before2 = resolveAria2Bin("");
-    fs.mkdirSync(links, { recursive: true });
-    const target = links + "/aria2c.exe";
+    const opts = { candidates: () => [target] }; // 内置候选表全部拿掉，只认沙箱内的文件
+    const before = resolveAria2Bin("", opts);
+    const before2 = resolveAria2Bin("", opts);
+    fs.mkdirSync(${JSON.stringify(linksDir.replace(/\\/g, "/"))}, { recursive: true });
     if (sample) fs.copyFileSync(sample, target); else fs.writeFileSync(target, "");
-    const after = resolveAria2Bin("");
+    const after = resolveAria2Bin("", opts);
     process.stdout.write(JSON.stringify({ before, before2, after, target }));
   `, "utf-8");
   const r = spawnSync(process.execPath, [probeFile], {
@@ -254,9 +264,8 @@ const A2_BASE_PORT = await (async () => {
     windowsHide: true,
     env: {
       ...process.env,
-      PATH: process.platform === "win32"
-        ? [path.join(process.env.SystemRoot || "C:\\Windows", "System32"), path.join(process.env.SystemRoot || "C:\\Windows")].join(path.delimiter)
-        : "/usr/bin:/bin",
+      // 空目录当 PATH：which / where 都不可能探到 aria2c（也不再受 runner 预装影响）
+      PATH: emptyBin,
       LOCALAPPDATA: fakeLocal,
       USERPROFILE: path.join(sandbox, "userprofile"),
       // 2026-10-18：探测逻辑新增了 HOMEDRIVE+HOMEPATH 优先于 LOCALAPPDATA
@@ -276,7 +285,7 @@ const A2_BASE_PORT = await (async () => {
   check("bin 缓存: 连续两次探测都为空（空值没被缓存成“有”）", out?.before2, (x) => x === "");
   // 核心：刚放进去就找得到（修复前这一步会返回 ""，因为空结果被缓存了 30s）
   check("bin 缓存: 放入后立即探测能找到（不等 30s、不重启）", out?.after, (x) => typeof x === "string" && x.length > 0);
-  check("bin 缓存: 找到的是刚放进去的那个路径", out?.after, (x) => typeof x === "string" && /aria2c\.exe$/i.test(x));
+  check("bin 缓存: 找到的是刚放进去的那个路径", out?.after, (x) => typeof x === "string" && x.toLowerCase() === String(out?.target || "").toLowerCase());
 
   fs.rmSync(sandbox, { recursive: true, force: true });
 }
