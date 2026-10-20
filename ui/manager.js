@@ -58,9 +58,11 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask, ARIA2_LIMIT_
   var search = ""; // 搜索关键词
   var expanded = null; // taskId 展开详情
   var settings = {}; // 插件设置（defaultSaveDir / agentChooses）
-// 平台能力（2026-10-20）：由引擎 /settings 回包里的 platform 填。默认按「不支持」渲染，
-// 只在确认支持时才多显示那一块 —— 宁愿少显示一阵，也不要让人点一个本来就不可用的按钮。
-var cap = { name: "", proxyControl: false };
+// 平台能力（2026-10-20）：由引擎 /settings 回包里的 platform 填。三态：null=未知 / true / false。
+// 未知时先按「有」渲染：旧引擎（没有 platform 字段）配新 UI 时若默认按不支持，Windows 用户
+// 会整场看不到入口，且看到的是「入口不见了」而不是报错。真不支持由 refreshProxyCtl 的
+// unsupported 回包兜底撤掉。
+var cap = { name: "", proxyControl: null };
 
   // ── 后端访问 ──
   // v2 App：统一走 hana.api.fetch（SDK 自动带 iframe 的 surface session 票据，
@@ -703,7 +705,14 @@ var cap = { name: "", proxyControl: false };
             if (!d || d.error) return;
             // 引擎说这个平台不支持启停梯子（能力与服务端不一致时的兜底）：
             // 不报错、不挂红字，静默把入口从菜单里去掉（与首屏的 cap 判断结果一致）。
-            if (d.unsupported) return;
+            // 用 remove() 逐个摘，不重渲染整个菜单 —— 重渲染会让设置菜单闪一下。
+            if (d.unsupported) {
+              cap.proxyControl = false;
+              [optProxyCtl, optScan, optVerify].forEach(function (b) {
+                if (b && b.parentNode) b.remove();
+              });
+              return;
+            }
             proxyCtlState.enabled = !!d.enabled;
             proxyCtlState.launcher = d.launcher || null;
             var nm = proxyCtlState.launcher ? proxyCtlState.launcher.name : "未配置梯子";
@@ -787,8 +796,8 @@ var cap = { name: "", proxyControl: false };
     menu.appendChild(opt1);
     menu.appendChild(opt2);
     menu.appendChild(optProxy);
-    // 三个梯子控制入口只在支持启停梯子的平台上出现（见上方 optProxyCtl 旁的说明）
-    if (cap.proxyControl) {
+    // 三个梯子控制入口只在确认不支持时缺席；未知（旧引擎没给 platform）先渲染（见上方 optProxyCtl 旁的说明）
+    if (cap.proxyControl !== false) {
       menu.appendChild(optProxyCtl);
       menu.appendChild(optScan);
       menu.appendChild(optVerify);

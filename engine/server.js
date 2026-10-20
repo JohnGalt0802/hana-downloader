@@ -495,7 +495,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && u.pathname === "/reveal") {
     const b = await readBody();
     const p = b.filePath || b.path;
-    if (!p) return send(400, { error: "filePath required" });
+    if (!p) return send(400, { ok: false, error: "filePath required" });
     // 2026-10-12：mode 分流。前端早就传了 mode，但引擎先前忽略它、恒走 /select，
     // 导致卡片「打开」与「文件夹」两个按钮行为完全相同（都只打开文件夹并选中文件）。
     //   open   → 用默认关联程序打开文件本身（explorer 单参数即 shell-execute）
@@ -507,17 +507,19 @@ const server = http.createServer(async (req, res) => {
       log(`reveal deduped ${mode} ${p} (${now - lastReveal.at}ms)`);
       return send(200, { ok: true, deduped: true });
     }
-    lastReveal = { path: p, mode, at: now };
     try {
       // 平台层负责三件事：选对命令（explorer / open / xdg-open）、挂 'error' 监听、
       // 不存在就提前报错。此处不再直接 spawn —— 旧写法 spawn 后没挂 error 监听，
       // 在非 Windows 上 explorer.exe 不存在，'error' 变成未捕获异常直接把引擎带走。
       const r = platform.reveal(p, mode);
-      if (!r.ok) return send(r.error && /不存在/.test(r.error) ? 404 : 500, { error: r.error || "定位失败" });
+      if (!r.ok) return send(r.error && /不存在/.test(r.error) ? 404 : 500, { ok: false, error: r.error || "定位失败" });
+      // 去重窗口只在真的成功之后才记：写在尝试之前的话，失败后 800ms 内重点一次会命中
+      // 去重分支回 { ok: true, deduped: true }，把一次失败吞成成功，人就以为打开了。
+      lastReveal = { path: p, mode, at: now };
       log(`reveal ${mode} ${p}`);
       return send(200, { ok: true });
     } catch (e) {
-      return send(500, { error: String(e?.message || e) });
+      return send(500, { ok: false, error: String(e?.message || e) });
     }
   }
 

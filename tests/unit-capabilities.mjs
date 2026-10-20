@@ -73,16 +73,25 @@ check("只影响启停梯子，不影响读系统代理（readSystemProxy 未被
   const i = dlcoreSrc.indexOf("platform.readSystemProxy()");
   return i > 0;
 });
-check("UI 只有 cap.proxyControl 为真才渲染三个入口", () => {
-  const i = managerSrc.indexOf("if (cap.proxyControl)");
+check("UI 三入口只在能力不为 false 时渲染（null=未知先显示，waiting 服务端回 unsupported 再拿掉）", () => {
+  // 2026-10-20 审查后改：原断言要求「cap.proxyControl 为真才渲染」，但那只在拿到
+  // platform 字段时成立；旧引擎配新 UI 拿不到字段时会变成 null，那时该先显示。
+  // 真正的契约是「只有确定不支持时不渲染」，不是「确定支持才渲染」。
+  const i = managerSrc.indexOf("if (cap.proxyControl !== false)");
   if (i < 0) return false;
   const seg = managerSrc.slice(i, i + 400);
   return /appendChild\(optProxyCtl\)/.test(seg)
     && /appendChild\(optScan\)/.test(seg)
     && /appendChild\(optVerify\)/.test(seg);
 });
-check("UI 默认按「不支持」渲染（不为不可用能力闪一下按钮）", () =>
-  /var cap = \{[^}]*proxyControl:\s*false/.test(managerSrc));
+check("UI 初值是三态里的 null（未知），不是 false（不支持）", () =>
+  /var cap = \{[^}]*proxyControl:\s*null/.test(managerSrc));
+check("UI 拿到 unsupported 时把三个按钮从 DOM 移除（不是整菜单重渲染）", () => {
+  const i = managerSrc.indexOf("d.unsupported");
+  if (i < 0) return false;
+  const seg = managerSrc.slice(i, i + 400);
+  return /\.remove\(\)/.test(seg) && /cap\.proxyControl = false/.test(seg);
+});
 check("UI 从 /settings 的 platform 字段取能力", () =>
   /data\.platform/.test(managerSrc) && /platform\.proxyControl/.test(managerSrc));
 

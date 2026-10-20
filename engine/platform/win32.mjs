@@ -109,6 +109,53 @@ export function reveal(p, mode) {
 // 拿不到（键不存在 / reg 不可用 / 解析不上）给 {enabled:false, server:"", source:"none"}。
 const REG_INET = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
+// 把注册表 ProxyServer 的原文归一成 host:port。**为什么必须归一**：注册表这个值
+// 有三种真实形态——单协议 `127.0.0.1:7890`、多协议（Windows 界面默认写法）
+// `http=127.0.0.1:7890;https=127.0.0.1:7890`、仅 socks `socks=127.0.0.1:1080`。
+// 下游（dlcore.js resolveProxyUrl）只在这串前面补一个 `http://` 就交给 new URL()：
+// 多协议原文会被拼成 `http://http=127.0.0.1:7890;https=...`，new URL() 直接抛
+// Invalid URL，tunnel-agent 的 catch 把错误吞成 null → **静默直连**：用户明明开着代理，
+// 下载器绕过它。所以这里只输出 `host:port`，与 darwin（parseScutilProxy 拼
+// `${host}:${port}`）、linux（`${host}:${port}` / normalizeProxyServer）保持同形。
+// 修复 2026-10-20 审查发现的问题（多协议 ProxyServer 原样下发导致代理失效）。
+//
+// 单独导出的理由与 parseScutilProxy / parseGsettingsValue 一致：只吃字符串、不碰命令，
+// 让 Windows 上也能直接喂值做单测。
+
+// 单条值 → host:port。容 raw 里混进 `scheme://` 与尾斜杠；就认「主机非空 + 端口为数字」，
+// 端口缺失一律判无效（不猜默认端口：猜错会让请求静默走错代理，比留空更坏）。IPv6 字面量
+// `[::1]:7890` 走方括号分支。
+function asHostPort(v) {
+  let s = String(v ?? "").trim();
+  if (!s) return "";
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").replace(/\/+$/, "");
+  const m = /^([^\s;=/:]+|\[[0-9a-f:.]+\]):(\d{1,5})$/.exec(s);
+  if (!m) return "";
+  const port = Number(m[2]);
+  if (!(port > 0 && port <= 65535)) return "";
+  return `${m[1]}:${m[2]}`;
+}
+
+export function parseProxyServer(raw) {
+  const src = String(raw ?? "").trim();
+  if (!src) return "";
+  // 无 `=`：单协议形态，原样（校验后）返回，不补前缀
+  if (!src.includes("=")) return asHostPort(src);
+  // 有 `=`：多协议形态，按 http → https → socks 的优先级取第一个有值的 host:port。
+  // 同协议出现多次取第一次；认不出的协议名（ftp 之类）不参与，也不当兜底——
+  // 拿错协议的代理去跑 HTTP 请求，和静默直连一样坏。
+  const best = new Map([["http", ""], ["https", ""], ["socks", ""]]);
+  for (const part of src.split(";")) {
+    const i = part.indexOf("=");
+    if (i < 0) continue;
+    const scheme = part.slice(0, i).trim().toLowerCase();
+    if (!best.has(scheme) || best.get(scheme)) continue;
+    const value = asHostPort(part.slice(i + 1));
+    if (value) best.set(scheme, value);
+  }
+  return best.get("http") || best.get("https") || best.get("socks") || "";
+}
+
 export function readSystemProxy() {
   const none = { enabled: false, server: "", source: "none" };
   try {
@@ -126,7 +173,7 @@ export function readSystemProxy() {
     // 报 enabled 却没有 server 会把请求拨到不存在的代理上，比报「没代理」更坏；
     // 报 enabled:false 却留着 server/source，又会让调用方以为有可用配置。
     const enabled = me ? parseInt(me[1], 16) === 1 : false;
-    const server = ms ? ms[1].trim() : "";
+    const server = ms ? parseProxyServer(ms[1]) : "";
     if (!enabled || !server) return none;
     return { enabled: true, server, source: "registry" };
   } catch { return none; }

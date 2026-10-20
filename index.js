@@ -54,6 +54,25 @@ const COMMAND_KINDS = HAS_WINGET
   ? ["git-clone", "pnpm-install", "pip-install", "winget-install"]
   : ["git-clone", "pnpm-install", "pip-install"];
 
+// 代理启停能力（2026-10-20）：读注册表 + 扫 .exe + tasklist/taskkill 这套东西的形态就是 Windows 的。
+//
+// 这是同一次裁剪的**第三处**，三处必须一致，少一处就等于没裁：
+//   1. engine/server.js   六个 /proxy-control/* 端点 —— 不支持时回 200 + unsupported
+//   2. ui/manager.js      设置菜单里的三个入口 —— 不支持时不渲染（不是灰掉）
+//   3. index.js（这里）   agent 工具 proxy-control —— 不支持时整块不注册
+//
+// 为什么漏了这一处最糟：前两处只管住了 UI 和服务端，模型仍然看得见这个工具，
+// 调 status 会拿到 200 + unsupported，再被工具层翻成 isError:true 的失败提示。
+// 同一件「平台没有这个能力」的事被说成三种样子，最容易被误读成「功能坏了」。
+//
+// 也不做成「注册了再在 execute 里拒绝」：模型看得见的工具就会去调，
+// 看不见才是真剪掉（与上面 winget 不列进 enum 同一个道理）。
+// 取值与本文件 HAS_WINGET 同风格：能力拿不到就当没有，宁少不错。
+const HAS_PROXY_CONTROL = (() => {
+  try { return platform.capabilities.proxyControl === true; }
+  catch { return false; }
+})();
+
 const PING_TIMEOUT_MS = 3000;
 const READY_WAIT_MS = 25000;
 const WATCHDOG_INTERVAL_MS = 30000;
@@ -829,52 +848,59 @@ export default defineApp(async (sdk) => {
   }
 
   // ── 工具：proxy-control（代理启停，默认未授权）─────────────────
-  try {
-    await sdk.tools.register({
-      name: "proxy-control",
-      description:
-        "启停本机代理（梯子）——仅当用户在设置页授权后才可用；未授权时调用会被明确拒绝。"
-        + "action=status 查状态（代理是否在运行、端口、系统代理开关），随时可用。"
-        + "action=start / stop 启停梯子（需要「设置 → 代理启停」里的开关已打开）。"
-        + "注意：日常下载「使用」代理不需要本工具——如果机器本来就起着代理，下载会自动用它（与裸 curl 一致）；"
-        + "本工具只负责「启停」这类改环境的动作。",
-      parameters: {
-        type: "object",
-        properties: {
-          action: { type: "string", enum: ["status", "start", "stop"], description: "status=查状态；start/stop=启停（需授权）" },
+  // 平台裁剪的第三处（另两处：server.js 的六端点、ui/manager.js 的三入口）。
+  // 不支持时整块不注册 —— 模型看不到这个工具，就不会拿到 unsupported 被翻成失败提示。
+  // Windows 上 HAS_PROXY_CONTROL 恒为 true，下面这段的执行与以前一模一样。
+  if (HAS_PROXY_CONTROL) {
+    try {
+      await sdk.tools.register({
+        name: "proxy-control",
+        description:
+          "启停本机代理（梯子）——仅当用户在设置页授权后才可用；未授权时调用会被明确拒绝。"
+          + "action=status 查状态（代理是否在运行、端口、系统代理开关），随时可用。"
+          + "action=start / stop 启停梯子（需要「设置 → 代理启停」里的开关已打开）。"
+          + "注意：日常下载「使用」代理不需要本工具——如果机器本来就起着代理，下载会自动用它（与裸 curl 一致）；"
+          + "本工具只负责「启停」这类改环境的动作。",
+        parameters: {
+          type: "object",
+          properties: {
+            action: { type: "string", enum: ["status", "start", "stop"], description: "status=查状态；start/stop=启停（需授权）" },
+          },
+          required: ["action"],
         },
-        required: ["action"],
-      },
-      async execute({ action }) {
-        const a = String(action || "").trim();
-        if (!["status", "start", "stop"].includes(a)) {
-          return { content: [{ type: "text", text: "action 必须是 status / start / stop 之一" }], isError: true };
-        }
-        const engPath = a === "status" ? "/proxy-control/status" : `/proxy-control/${a}`;
-        let r;
-        try {
-          r = await callEngine(engPath, { method: a === "status" ? "GET" : "POST" });
-        } catch (e) {
-          return { content: [{ type: "text", text: `代理控制请求失败：${e?.message || e}` }], isError: true };
-        }
-        if (a === "status") {
-          if (r?.ok === false && r?.error) {
-            return { content: [{ type: "text", text: `代理状态查询失败：${asText(r.error)}` }], isError: true };
+        async execute({ action }) {
+          const a = String(action || "").trim();
+          if (!["status", "start", "stop"].includes(a)) {
+            return { content: [{ type: "text", text: "action 必须是 status / start / stop 之一" }], isError: true };
           }
-          const state = r?.running ? `运行中（端口 ${r.port}）` : `未运行（端口 ${r.port ?? "?"} 不通）`;
-          const sys = r?.systemProxy?.enabled ? `系统代理已开（${r.systemProxy.server || "地址未知"}）` : "系统代理未开";
-          const launcher = r?.launcher ? `梯子配置：${r.launcher.name}（${r.launcher.exe}）` : "尚未配置梯子（去设置页扫描）";
-          const auth = r?.enabled ? "已授权启停" : "未授权启停（只读）";
-          return { content: [{ type: "text", text: `代理状态：${state}；${sys}；${launcher}；${auth}。` }], details: { proxyControl: r } };
-        }
-        const ok = r?.ok !== false;
-        const text = ok ? String(r?.message || "完成。") : `未执行：${r?.message || r?.error || "未知原因"}`;
-        return { content: [{ type: "text", text }], isError: !ok, details: { proxyControl: r } };
-      },
-    });
-    log("tool registered | proxy-control");
-  } catch (e) {
-    err(`proxy-control register ERR | ${e?.message || e}`);
+          const engPath = a === "status" ? "/proxy-control/status" : `/proxy-control/${a}`;
+          let r;
+          try {
+            r = await callEngine(engPath, { method: a === "status" ? "GET" : "POST" });
+          } catch (e) {
+            return { content: [{ type: "text", text: `代理控制请求失败：${e?.message || e}` }], isError: true };
+          }
+          if (a === "status") {
+            if (r?.ok === false && r?.error) {
+              return { content: [{ type: "text", text: `代理状态查询失败：${asText(r.error)}` }], isError: true };
+            }
+            const state = r?.running ? `运行中（端口 ${r.port}）` : `未运行（端口 ${r.port ?? "?"} 不通）`;
+            const sys = r?.systemProxy?.enabled ? `系统代理已开（${r.systemProxy.server || "地址未知"}）` : "系统代理未开";
+            const launcher = r?.launcher ? `梯子配置：${r.launcher.name}（${r.launcher.exe}）` : "尚未配置梯子（去设置页扫描）";
+            const auth = r?.enabled ? "已授权启停" : "未授权启停（只读）";
+            return { content: [{ type: "text", text: `代理状态：${state}；${sys}；${launcher}；${auth}。` }], details: { proxyControl: r } };
+          }
+          const ok = r?.ok !== false;
+          const text = ok ? String(r?.message || "完成。") : `未执行：${r?.message || r?.error || "未知原因"}`;
+          return { content: [{ type: "text", text }], isError: !ok, details: { proxyControl: r } };
+        },
+      });
+      log("tool registered | proxy-control");
+    } catch (e) {
+      err(`proxy-control register ERR | ${e?.message || e}`);
+    }
+  } else {
+    log("proxy-control skipped | 当前平台不支持代理启停控制");
   }
 
   // ── 工具：download-command（git clone / pnpm install）────────────
