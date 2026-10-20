@@ -252,6 +252,22 @@ export function processNameOf(pid) {
   } catch { return ""; }
 }
 
+// ── ⑧-b 进程树探活（killTree 的对应探活，必须成对看）─────────────────────────
+// Windows 没有进程组：killTree 走 `taskkill /T`，杀的是**进程树关系**（父 pid 反查子进程）。
+// 与 posix 的差别：父进程一死，Windows 上的树关系就断了（子进程被重挂到别的父上），
+// 所以「父死子活」这个现场拿不到可靠的树口径，退化为看父进程本身。
+// 这不是像 posix 那样的结构错 —— 在 Windows 上「父已死那么 `taskkill /T <pid>` 也没东西可杀」
+// 本就是真实情况，而 posix 上 kill(-pid) 有东西可杀。见 treeNames 的同名注释。
+export function treeAlive(pid) {
+  return pidAlive(pid);
+}
+
+// 树内还活着的进程名集合。Windows 上同样退化为「就这一个进程」。
+export function treeNames(pid) {
+  const one = processNameOf(pid);
+  return one ? [one] : [];
+}
+
 // ── ⑩ 路径规范化 ────────────────────────────────────────────────────────────
 // Windows 不区分大小写，且 `\` 与 `/` 等价。这个函数产出的是**比较键**，
 // 不是可用的实际路径 —— 别拿它去 open/read。也不解析符号链接（那要碰磁盘，

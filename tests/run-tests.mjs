@@ -38,6 +38,7 @@ const SUITES = [
   ["unit-backend-switch.mjs", ".part 归属与换后端（aria2 稀疏半成品切 node-http 必须从头下，不交付带洞文件）"],
   ["unit-platform.mjs", "平台适配层（十三组接口契约 / 参数注入三平台 / 探测类失败给空不抛）"],
   ["unit-processtree.mjs", "进程树（spawnOpts与killTree成对 / 真起进程杀孙进程 / 孤儿收尾原语 / engine 下 process.platform 归零）"],
+  ["unit-orphan-reap.mjs", "孤儿收尾（探活口径必须与杀的对象一致：pidAlive=false 但 treeAlive=true 的现场不再空转）"],
   ["unit-capabilities.mjs", "平台能力裁剪（proxyControl 非win关闭且UI不渲染 / winget不注册且硬传被拒 / PEP668 给venv出路）"],
   ["unit-platform-runtime.mjs", "平台能力在真引擎里的行为（/settings 带 platform / proxy-control unsupported / winget 守卫 / reveal 失败不带走进程）"],
 ];

@@ -239,6 +239,81 @@ export function pidAlive(pid) {
   }
 }
 
+// ── ⑧-b 进程树探活（killTree 的对应探活，必须成对看）─────────────────────────
+// 为什么不能直接用 pidAlive：spawnOpts 给了 detached，子进程自成进程组，
+// killTree 杀的是**进程组**而不是组长。组长先死、组员还活着时 pidAlive 报 false，
+// 而组仍存在 —— 拿 pidAlive 当探活口径就会跳过清理，让孤儿继续写目录。
+// 2026-10-21 真机复现过这个现场（tests/tools/orphan-posix-mechanism.mjs）：
+//   组长已退出 → pidAlive=false；组员心跳仍在增长 → kill(-pid,0) 成功。
+//
+// ★ 但也不能无条件 kill(-pid,0)：只有 pid 确实是**组长**时，这个组才是我们的。
+//   pid 活着但 pgid ≠ pid（例如它本身是被别人 spawn 的、没 detached 的子进程）时，
+//   -pid 指向的是**别人的组**，探活会探错、killTree 会误杀。
+//   所以先核一次 pgid：
+//     · pid 活着且 pgid ≠ pid → 不是组长，树就是它自己 → 退回看它本身
+//     · pid 是组长，或 pid 已死（拿不到 pgid）→ 查组
+//   后一种必须查组：组长已死、组员还在，正是要修的那个现场。
+export function treeAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  if (pidAlive(n)) {
+    const pg = pgidOf(n);
+    if (pg > 0 && pg !== n) return true; // 活着且不是组长：树就是它自己
+  }
+  try {
+    process.kill(-n, 0);
+    return true;
+  } catch (e) {
+    return e?.code === "EPERM";
+  }
+}
+
+// 树内还活着的进程名集合（小写 basename）。给收孤儿的核名用。
+// 组长死了也要能问到组员 —— 否则「核名」这一步会因拿不到组长名字而整条路失效。
+// 用 ps -A 自己按 pgid 筛，不用 `ps -g`：那家伙在 Linux 上是「会话或有效组名」，
+// 语义带歧义，跨 posix 行为不一致。
+// 口径与 treeAlive 严格一致：不是组长就只看它自己，不拿别人的组冒充自己的树。
+export function treeNames(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return [];
+  if (pidAlive(n)) {
+    const pg = pgidOf(n);
+    if (pg > 0 && pg !== n) {
+      const one = processNameOf(n);
+      return one ? [one] : [];
+    }
+  }
+  try {
+    const r = spawnSync("ps", ["-A", "-o", "pgid=,comm="], { encoding: "utf8", timeout: 5000 });
+    if (!r.error && r.status === 0) {
+      const out = [];
+      for (const line of String(r.stdout || "").split(/\r?\n/)) {
+        const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
+        if (!m) continue;
+        if (Number(m[1]) !== n) continue;
+        const base = m[2].split("/").pop().trim().toLowerCase();
+        if (base) out.push(base);
+      }
+      if (out.length) return [...new Set(out)];
+    }
+  } catch { /* 落到下面的单进程退化 */ }
+  // 组查不到时退化（例：组已散但进程本身还活着）
+  const one = processNameOf(n);
+  return one ? [one] : [];
+}
+
+// 读一个 pid 的 pgid。拿不到给 -1（进程已退出 / ps 不可用）。
+function pgidOf(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return -1;
+  try {
+    const r = spawnSync("ps", ["-o", "pgid=", "-p", String(n)], { encoding: "utf8", timeout: 5000 });
+    if (r.error || r.status !== 0) return -1;
+    const v = Number(String(r.stdout || "").trim());
+    return Number.isInteger(v) && v > 0 ? v : -1;
+  } catch { return -1; }
+}
+
 // pid 对应的命令名（basename，小写）。拿不到给 ""。
 // 用途：restore 收孤儿命令时先核名，避开 PID 复用导致的误杀。
 export function processNameOf(pid) {

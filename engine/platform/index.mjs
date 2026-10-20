@@ -31,6 +31,8 @@ const METHODS = [
   "nullDevice",   // ⑧ → 丢弃输出的设备名（curl -o / 重定向用）
   "pidAlive",     // ⑧ → pid → boolean（只探活，不发信号）
   "processNameOf",// ⑧ → pid → 进程名（拿不到给 ""）
+  "treeAlive",    // ⑧-b → pid → boolean（**进程树**探活，killTree 的对应口径）
+  "treeNames",    // ⑧-b → pid → 树内进程名数组（收孤儿的核名依据）
   "normalizePath",// ⑩ path → 比较键
 ];
 

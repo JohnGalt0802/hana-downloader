@@ -902,15 +902,25 @@ class TaskManager {
   //   B：实例已没了 / 握手失败 / 任务不在它队列里
   //      → 保持原有语义：interrupted + 补写终态
   /**
-   * 收孤儿命令进程（2026-10-20，配 detached 的收尾）。
+   * 收孤儿命令进程（2026-10-20，配 detached 的收尾；2026-10-21 真机修正探活口径）。
    *
    * 为什么需要：posix 下命令型子进程带 detached（自成进程组），这是 killTree 能杀掉
    * 整棵树的前提，代价是**引擎被 SIGKILL 时子进程不会跟着死**。引擎重启后，任务已经被
    * 标成「已中断」，而 uv/pip/git 还在后台写同一个目录 —— 用户看到的与磁盘上发生的完全是两回事。
    *
-   * 安全阀：只杀「记录里的 pid 还活着、且镜像名对得上」的进程。
+   * ★ 探活口径必须是「进程树」而不是「组长」（2026-10-21 真机修正）：
+   *   旧写法用 pidAlive(pid) 探活、却用 killTree(pid) → kill(-pid) 杀组，**两者不是同一个对象**。
+   *   组长先死、组员还活着的现场，pidAlive 报 false 直接 return，而 kill(-pid) 本来能把整组清掉。
+   *   WSL/Linux 实测复现（tests/tools/orphan-posix-mechanism.mjs）：
+   *     组长已退出 → pidAlive=false；组员心跳仍在增长 → kill(-pid,0) 成功 → 函数返回 false 什么也没杀。
+   *   现在两处都走 treeAlive / treeNames，探的和杀的是同一个东西。
+   *
+   * 安全阀：只杀「记录里的 pid 的进程树里、确实有该命令的镜像名」的进程。
    * 为何必须核名：PID 会被系统复用。引擎停机已一小时，那个 pid 可能已经属于别人的程序 ——
    * 不核名就杀，是拿用户的系统去赌运气。
+   * 为何要用 treeNames 而不是 processNameOf：detached 的子进程会 spawn 出自己的孙子进程，
+   * 真正的写入者（git-upload-pack / index-pack、uv 拉起的 python）都是孙子；
+   * 只看组长名字在「组长是 sh / bash 包装」的情形下会核不上。
    *
    * @private
    */
@@ -918,18 +928,20 @@ class TaskManager {
     const n = Number(pid);
     if (!Number.isInteger(n) || n <= 0) return false;
     try {
-      if (!platform.pidAlive(n)) return false;
+      // ★ 探「树」而不是「组长」——与下面 killTree 杀的对象保持一致。
+      if (!platform.treeAlive(n)) return false;
       // 期望的镜像名：git / node（pnpm 走 process.execPath）/ winget / python|uv
       const expect = cmdType === "git-clone" ? ["git"]
-        : cmdType === "pnpm-install" ? ["node", "npm", "pnpm"]
+        : cmdType === "pnpm-install" ? ["node", "npm", "pnpm", "sh", "bash"]
           : cmdType === "winget-install" ? ["winget"]
-            : ["python", "python3", "py", "uv"];
-      const actual = platform.processNameOf(n);
-      // 拿不到进程名：宁可不动。误杀的代价（用户别的程序被干掉）远大于漏杀（一个后台进程多活一阵）。
-      if (!actual) return false;
-      if (!expect.includes(actual)) return false;
+            : ["python", "python3", "py", "uv", "sh", "bash"];
+      // 树里任何一个名字对得上就算我们的 —— 组长可能已死，也可能是个 sh 包装。
+      const names = platform.treeNames(n);
+      // 拿不到任何进程名：宁可不动。误杀的代价（用户别的程序被干掉）远大于漏杀（一个后台进程多活一阵）。
+      if (!names.length) return false;
+      if (!names.some((nm) => expect.includes(nm))) return false;
       const killed = platform.killTree(n);
-      if (!killed) { try { process.kill(n, "SIGTERM"); } catch { /* 已退出 */ } }
+      if (!killed) { try { process.kill(-n, "SIGTERM"); } catch { /* 已退出 */ } }
       return true;
     } catch { return false; }
   }

@@ -205,6 +205,73 @@ export function pidAlive(pid) {
   }
 }
 
+// ── ⑧-b 进程树探活（killTree 的对应探活，必须成对看）─────────────────────────
+// 为什么不能直接用 pidAlive：spawnOpts 给了 detached，子进程自成进程组，
+// killTree 杀的是**进程组**而不是组长。组长先死、组员还活着时 pidAlive 报 false，
+// 而组仍存在 —— 拿 pidAlive 当探活口径就会跳过清理（2026-10-21 真机复现）。
+//
+// ★ 但也不能无条件 kill(-pid,0)：只有 pid 确实是**组长**时这个组才是我们的。
+//   pid 活着但 pgid ≠ pid 时，-pid 指向别人的组。先核一次 pgid 再选口径：
+//     · pid 活着且 pgid ≠ pid → 不是组长，树就是它自己
+//     · pid 是组长，或 pid 已死（拿不到 pgid）→ 查组
+export function treeAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  if (pidAlive(n)) {
+    const pg = pgidOf(n);
+    if (pg > 0 && pg !== n) return true;
+  }
+  try {
+    process.kill(-n, 0);
+    return true;
+  } catch (e) {
+    return e?.code === "EPERM";
+  }
+}
+
+// 树内还活着的进程名集合（小写 basename）。给收孤儿的核名用。
+// 组长死了也要能问到组员。用 ps -A 自己按 pgid 筛：`ps -g` 在 Linux 上是
+// 「会话或有效组名」语义，跨平台不一致。口径与 treeAlive 严格一致。
+export function treeNames(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return [];
+  if (pidAlive(n)) {
+    const pg = pgidOf(n);
+    if (pg > 0 && pg !== n) {
+      const one = processNameOf(n);
+      return one ? [one] : [];
+    }
+  }
+  try {
+    const r = spawnSync("ps", ["-A", "-o", "pgid=,comm="], { encoding: "utf8", timeout: 5000 });
+    if (!r.error && r.status === 0) {
+      const out = [];
+      for (const line of String(r.stdout || "").split(/\r?\n/)) {
+        const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
+        if (!m) continue;
+        if (Number(m[1]) !== n) continue;
+        const base = m[2].split("/").pop().trim().toLowerCase();
+        if (base) out.push(base);
+      }
+      if (out.length) return [...new Set(out)];
+    }
+  } catch { /* 落到下面的单进程退化 */ }
+  const one = processNameOf(n);
+  return one ? [one] : [];
+}
+
+// 读一个 pid 的 pgid。拿不到给 -1（进程已退出 / ps 不可用）。
+function pgidOf(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return -1;
+  try {
+    const r = spawnSync("ps", ["-o", "pgid=", "-p", String(n)], { encoding: "utf8", timeout: 5000 });
+    if (r.error || r.status !== 0) return -1;
+    const v = Number(String(r.stdout || "").trim());
+    return Number.isInteger(v) && v > 0 ? v : -1;
+  } catch { return -1; }
+}
+
 // pid 对应的命令名（basename，小写）。拿不到给 ""。
 // 用途：restore 收孤儿命令时先核名，避开 PID 复用导致的误杀。
 export function processNameOf(pid) {
