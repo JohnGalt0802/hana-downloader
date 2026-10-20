@@ -273,14 +273,14 @@ function pgidOf(pid) {
 }
 
 // 升级探活判据：5 秒后该不该发 SIGKILL（抽出来是为了能验，不让它藏在闭包里）。
-// 三种情形：进程已死→不升级；没有记录指纹→保守升级；指纹变了→**绝不升级**。
-// 「指纹变了」这条自然条件下极难触发（要 pid_max 次 fork），但复核用 ns_last_pid
-// 强制抢号时真的打死了一个无关进程。难触发但后果重的分支必须能单独验。
+// 规则只有一条：**没有身份就不动手。** 进程已死→不升级；有指纹→比指纹；没指纹→不升级。
+// 不用“退到比进程名”——加指纹的理由就是名字不可靠，再把它当退路等于只说一半的话。
+// （详见 linux.mjs 同名函数的注释。）
 export function escalationAllowed(pid, startBefore) {
   const n = Number(pid);
   if (!Number.isInteger(n) || n <= 0) return false;
   if (!pidAlive(n)) return false;
-  if (!startBefore) return true;
+  if (!startBefore) return false;
   return processStartOf(n) === startBefore;
 }
 

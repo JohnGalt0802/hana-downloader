@@ -16,21 +16,28 @@
 # 退出码：所有变异都被抓到为 0，否则为 1。
 
 set -u
+set -o pipefail
 cd "$(dirname "$0")/../.." || exit 1
+
+TOTAL=0
 
 DL="engine/dlcore.js"
 LX="engine/platform/linux.mjs"
+DW="engine/platform/darwin.mjs"
 SUITE="tests/unit-orphan-reap.mjs"
 BAK_DL=$(mktemp)
 BAK_LX=$(mktemp)
+BAK_DW=$(mktemp)
 
 cp "$DL" "$BAK_DL"
 cp "$LX" "$BAK_LX"
+cp "$DW" "$BAK_DW"
 
 cleanup() {
   cp "$BAK_DL" "$DL"
   cp "$BAK_LX" "$LX"
-  rm -f "$BAK_DL" "$BAK_LX"
+  cp "$BAK_DW" "$DW"
+  rm -f "$BAK_DL" "$BAK_LX" "$BAK_DW"
 }
 trap cleanup EXIT
 
@@ -55,6 +62,7 @@ echo
 judge() {
   local name="$1" out="$2"
   local n
+  TOTAL=$((TOTAL+1))
   n=$(count_fails "$out")
   echo "$out" | grep -E "^FAIL|passed, " | sed 's/^/   /'
   if [ "$n" -ge 1 ]; then
@@ -65,6 +73,12 @@ judge() {
   fi
 }
 
+# 每个变异都自带一道闸：python 失败（替换目标找不到）→ 整个脚本 exit 2。
+# 2026-10-21 复核实测过：没有这道闸时，python 的 assert 失败会被后续逻辑
+# 当成“这个变异没被抓到”，报告的失败原因完全是错的（说套件没牙，其实是脚本没改成功）。
+# 实现方式：每个 heredoc 里都显式 sys.exit(3) 于 assert 失败路径，
+# 外面用 `|| { echo ...; exit 2; }` 兜住。
+
 # ── M1：treeKill → killTree（还原非组长谎报）──
 echo "=== M1：_reapOrphanCommand 的 treeKill 换回 killTree ==="
 python3 - "$DL" <<'PY'
@@ -74,6 +88,7 @@ s = open(p, encoding="utf-8").read()
 s = s.replace("const killed = platform.treeKill(n);", "const killed = platform.killTree(n);")
 open(p, "w", encoding="utf-8").write(s)
 PY
+if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
 judge "M1" "$(run_suite)"
 cp "$BAK_DL" "$DL"
 echo
@@ -88,6 +103,7 @@ s = s.replace('"pnpm-install" ? ["node", "npm", "pnpm"]',
               '"pnpm-install" ? ["node", "npm", "pnpm", "sh", "bash"]')
 open(p, "w", encoding="utf-8").write(s)
 PY
+if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
 judge "M2" "$(run_suite)"
 cp "$BAK_DL" "$DL"
 echo
@@ -103,6 +119,7 @@ i = s.index(marker)
 s = s[:i + len(marker)] + "\n  return pidAlive(pid); // MUTATION" + s[i + len(marker):]
 open(p, "w", encoding="utf-8").write(s)
 PY
+if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
 judge "M3" "$(run_suite)"
 cp "$BAK_LX" "$LX"
 echo
@@ -121,6 +138,7 @@ end = s.index("\n", j) + 1
 s = s[:i] + "      return false; // MUTATION: 什么都不杀\n" + s[end:]
 open(p, "w", encoding="utf-8").write(s)
 PY
+if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
 judge "M4" "$(run_suite)"
 cp "$BAK_LX" "$LX"
 echo
@@ -135,6 +153,7 @@ s = s.replace("this._reapOrphanCommand(m.childPid, m.cmd?.type, m.childStart);",
               "this._reapOrphanCommand(m.childPid, m.cmd?.type);")
 open(p, "w", encoding="utf-8").write(s)
 PY
+if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
 judge "M5" "$(run_suite)"
 cp "$BAK_DL" "$DL"
 echo
@@ -152,6 +171,7 @@ assert old in s, "M6 的替换目标没找到（代码结构变了，需要更�
 s = s.replace(old, new)
 open(p, "w", encoding="utf-8").write(s)
 PY
+if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
 judge "M6" "$(run_suite)"
 cp "$BAK_DL" "$DL"
 echo
@@ -169,11 +189,12 @@ assert old in s, "M7 的替换目标没找到（代码结构变了，需要更�
 s = s.replace(old, new)
 open(p, "w", encoding="utf-8").write(s)
 PY
+if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
 judge "M7" "$(run_suite)"
 cp "$BAK_LX" "$LX"
 echo
 
-# ── M8：escalationAllowed 不再比指纹（只看到进程在不在）──
+# ── M8：escalationAllowed 不再比对指纹（只看到进程在不在）──
 # 比 M7 更细：即使 treeKill 还调 escalationAllowed，判据里丢掉指纹比对也应当被抓到。
 echo "=== M8：escalationAllowed 不再比对指纹 ==="
 python3 - "$LX" <<'PY'
@@ -184,7 +205,7 @@ old = """export function escalationAllowed(pid, startBefore) {
   const n = Number(pid);
   if (!Number.isInteger(n) || n <= 0) return false;
   if (!pidAlive(n)) return false;
-  if (!startBefore) return true;
+  if (!startBefore) return false;
   return processStartOf(n) === startBefore;
 }"""
 new = """export function escalationAllowed(pid, startBefore) {
@@ -194,8 +215,43 @@ assert old in s, "M8 的替换目标没找到（代码结构变了，需要更�
 s = s.replace(old, new)
 open(p, "w", encoding="utf-8").write(s)
 PY
+if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
 judge "M8" "$(run_suite)"
 cp "$BAK_LX" "$LX"
+echo
+
+# ── M9：没指纹时退化为“保守升级”（曾经写错过的方向）──
+echo "=== M9：escalationAllowed 没指纹时退化为保守升级 ==="
+python3 - "$LX" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+old = "  if (!startBefore) return false;"
+new = "  if (!startBefore) return true; // MUTATION: 没指纹就升级"
+assert old in s, "M9 的替换目标没找到"
+s = s.replace(old, new, 1)
+open(p, "w", encoding="utf-8").write(s)
+PY
+if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
+judge "M9" "$(run_suite)"
+cp "$BAK_LX" "$LX"
+echo
+
+# ── M10：树的大小写不能变（darwin 侧 treeKill 内联掉）──
+echo "=== M10：darwin 的 treeKill 内联掉 escalationAllowed ==="
+python3 - "$DW" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding="utf-8").read()
+old = "() => escalationAllowed(n, startBefore),"
+new = "() => { process.kill(n, 0); return true; }, // MUTATION"
+assert old in s, "M10 的替换目标没找到"
+s = s.replace(old, new)
+open(p, "w", encoding="utf-8").write(s)
+PY
+if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
+judge "M10" "$(run_suite)"
+cp "$BAK_DW" "$DW"
 echo
 
 echo "=== 还原后复核 ==="
@@ -209,7 +265,7 @@ esac
 
 echo
 if [ "$fail_count" -eq 0 ]; then
-  echo "=== 变异测试通过：8 个变异全部被抓到 ==="
+  echo "=== 变异测试通过：$TOTAL 个变异全部被抓到 ==="
   exit 0
 else
   echo "=== 变异测试失败：$fail_count 个变异没被抓到 ==="

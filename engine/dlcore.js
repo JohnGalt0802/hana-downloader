@@ -76,6 +76,11 @@ class TaskManager {
     if (this._finalCb && (s === "done" || s === "failed" || s === "canceled" || s === "interrupted")) {
       try { this._finalCb(task); } catch { /* 通知失败不影响下载 */ }
     }
+    // 终态就把启动指纹清掉（2026-10-21 复核建议）。
+    // 当前 `_persist` 靠 `state === "running"` 守卫着，不清也写不出去；但这个不变式
+    // 靠两处间接保证（守卫 + retry 清理），清一次是把它落到数据上——将来有人
+    // 放宽守卫，不会立刻变成“旧指纹配新子进程”。所有终态都走这个出口，漏不了。
+    task._childStart = null;
     // 终态腾出槽位：放行下一个排队任务（2026-09-20）
     this._pumpQueue();
   }
@@ -200,6 +205,10 @@ class TaskManager {
     t.finishedAt = null;
     t.startedAt = null;
     t.child = null;
+    // 启动指纹跟着 child 一起清（2026-10-21）：_persist 的条件是 `t.child && t._childStart`，
+    // 只留旧指纹不会被写出去（child 为 null 已先挡住），但两者不同步很容易在后人
+    // 改条件时变成隐患 —— “上一轮的指纹”配“这一轮的子进程”就是一次误判。
+    t._childStart = null;
     t.controller = null;
     t._settled = false; // 上一轮的结算闸门必须复位，否则重试后终态永远不成立
     t._spawnError = null; // 同理：上一轮的 spawn 错误不能拼进这一轮的失败文案

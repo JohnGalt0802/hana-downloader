@@ -407,6 +407,16 @@ const tkBody = tkStart >= 0 && tkEnd > tkStart ? lxSrc.slice(tkStart, tkEnd) : "
 check("treeKill 源码切片有效", tkBody.length > 200, `len=${tkBody.length}`);
 check("★ treeKill 必须调用 escalationAllowed（不准内联一份）",
   /escalationAllowed\(/.test(tkBody));
+// darwin 同构，也必须检查 —— 复核指出上一版只读 linux.mjs，
+// 把 darwin 的 treeKill 内联掉不会被抓到。
+const dwPath = path.join(process.cwd(), "engine", "platform", "darwin.mjs");
+const dwSrc = fs.readFileSync(dwPath, "utf-8");
+const dtkStart = dwSrc.indexOf("export function treeKill(pid)");
+const dtkEnd = dtkStart >= 0 ? dwSrc.indexOf("\n}", dwSrc.indexOf("return killTree(n);", dtkStart)) : -1;
+const dtkBody = dtkStart >= 0 && dtkEnd > dtkStart ? dwSrc.slice(dtkStart, dtkEnd) : "";
+check("darwin treeKill 源码切片有效", dtkBody.length > 200, `len=${dtkBody.length}`);
+check("★ darwin treeKill 也必须调用 escalationAllowed",
+  /escalationAllowed\(/.test(dtkBody));
 // 不再加「不得出现 process.kill(n, 0)」这种字符串断言：
 // 那个函数的注释里就写着这个反例（“不能只看 process.kill(n,0)”），
 // 纯文本断言无法区分「注释里的反例」与「真代码」，只会造成假红。
@@ -434,8 +444,10 @@ console.log("\n── 升级判据（escalationAllowed）──");
     check("★ 升级判据: 指纹对不上（号被抢）→ 绝不升级",
       p.escalationAllowed(live.pid, "1") === false,
       "这条挡的是「5 秒窗口里 pid 被无关进程拿走，定时器把它打死」");
-    check("升级判据: 没有记录指纹 → 保守升级（与旧行为一致）",
-      p.escalationAllowed(live.pid, "") === true);
+    // 没指纹 → 不升级（唯一规则：没有身份就不动手）
+    check("★ 升级判据: 没有记录指纹 → 不升级（不靠名字退路）",
+      p.escalationAllowed(live.pid, "") === false,
+      "名字不可靠，加指纹的理由就是它；把它当退路等于只说了一半的话");
     check("升级判据: 进程已死 → 不升级",
       p.escalationAllowed(2147483647, realStart) === false);
     check("升级判据: 非法入参 → false 且不抛", (() => {
