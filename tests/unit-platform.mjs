@@ -607,8 +607,14 @@ check("scanDirs: 同名字依目录顺序取第一个存在的", () => {
   return whichCore.scanDirs(["a"], ["/d1", "/d2"], [""], (p) => fsx.has(p)) === hit;
 });
 check("scanDirs: 后缀依次尝试（win32 的 .exe / .cmd / .bat / 空）", () => {
-  const fsx = new Set(["C:\\w\\a.cmd"]);
-  return whichCore.scanDirs(["a"], ["C:\\w"], [".exe", ".cmd", ""], (p) => fsx.has(p)) === "C:\\w\\a.cmd";
+  // 2026-10-21：期望值必须用 path.join 构造。写死字面量在 posix 上必假
+  // （path.join 产出 "C:\\w/a.cmd"，与 "C:\\w\\a.cmd" 不等）——
+  // 三平台 CI 上就这么红过。同一个毛病在 unit-proxy-control 的
+  // H:\\home\\Desktop 上犯过一次了。
+  const dir = "C:\\w";
+  const expect = path.join(dir, "a.cmd");
+  const fsx = new Set([expect]);
+  return whichCore.scanDirs(["a"], [dir], [".exe", ".cmd", ""], (p) => fsx.has(p)) === expect;
 });
 check("scanDirs: 全不命中 → 空串，accept 抛也不传染", () =>
   whichCore.scanDirs(["a"], ["/d1"], [""], () => { throw new Error("x"); }) === "");

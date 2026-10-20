@@ -243,8 +243,15 @@ export function resolveAria2Bin(explicit = "", opts = {}) {
   const found = (() => {
     // 探测手段与路径归一都走 platform 层（win: where.exe + 大小写不敏感；posix: which + 大小写敏感）。
     // 这里只留「候选表」——它是 aria2 特有的，不是平台通用知识（方案 P2-3 边界）。
-    const hit = platform.which("aria2c");
-    if (hit) return hit;
+    // 自定义候选表时**跳过** platform.which：它在 posix 上会扫 /usr/bin、
+    // /opt/homebrew/bin 等兜底目录，直接把「隔离环境」破掉——测试正是靠
+    // opts.candidates 造一个空环境，来验证「用户装完立即可用」那条回归
+    // （踩坑 49）。2026-10-21：收编 platform 后这里曾把隔离绕过，
+    // 三平台 CI 上 unit-aria2 又红了三条。
+    if (!hasCustom) {
+      const hit = platform.which("aria2c");
+      if (hit) return hit;
+    }
     // 真实用户目录：platform.homeDir() 已处理 win 沙箱下 USERPROFILE 被重定向的事
     // （优先 HOMEDRIVE+HOMEPATH），边界与旧代码等价。
     const realHome = platform.homeDir();
