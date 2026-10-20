@@ -22,6 +22,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { deliverPartFile, validateContext } from "./contract.js";
+import { platform } from "../platform/index.mjs";
 
 const NAME = "aria2";
 const POLL_MS = 600;            // 轮询节拍（与 dlcore 的 SPEED_SAMPLE_MS=700 同量级）
@@ -240,24 +241,13 @@ export function resolveAria2Bin(explicit = "", opts = {}) {
   // 免得把测试用的候选路径泄漏给后续的真实探测。
   if (!hasCustom && binCache.value !== null && now - binCache.at < 30000) return binCache.value;
   const found = (() => {
-    try {
-      const cmd = process.platform === "win32" ? "where.exe" : "which";
-      const r = spawnSync(cmd, ["aria2c"], { encoding: "utf-8", windowsHide: true });
-      if (r.status === 0) {
-        for (const line of String(r.stdout || "").split(/\r?\n/)) {
-          const p = line.trim();
-          if (p && fs.existsSync(p)) return p;
-        }
-      }
-    } catch { /* 走常见位置 */ }
-    // 真实用户目录：优先 HOMEDRIVE+HOMEPATH（沙箱不会重定向这两个），
-    // 再退环境变量版本（非沙箱环境两者等价，留着不影响）。
-    const realHome = (() => {
-      const drive = process.env.HOMEDRIVE || "";
-      const rest = process.env.HOMEPATH || "";
-      if (drive && rest) return drive + rest;
-      return process.env.USERPROFILE || "";
-    })();
+    // 探测手段与路径归一都走 platform 层（win: where.exe + 大小写不敏感；posix: which + 大小写敏感）。
+    // 这里只留「候选表」——它是 aria2 特有的，不是平台通用知识（方案 P2-3 边界）。
+    const hit = platform.which("aria2c");
+    if (hit) return hit;
+    // 真实用户目录：platform.homeDir() 已处理 win 沙箱下 USERPROFILE 被重定向的事
+    // （优先 HOMEDRIVE+HOMEPATH），边界与旧代码等价。
+    const realHome = platform.homeDir();
     const envHome = process.env.USERPROFILE || "";
     const envLocal = process.env.LOCALAPPDATA || "";
     const winCandidates = [
@@ -275,7 +265,7 @@ export function resolveAria2Bin(explicit = "", opts = {}) {
     ].filter(Boolean);
     const guesses = hasCustom
       ? ((typeof customCandidates === "function" ? customCandidates() : customCandidates) || [])
-      : (process.platform === "win32"
+      : (platform.name === "win32"
         ? winCandidates
         : ["/usr/bin/aria2c", "/usr/local/bin/aria2c", "/opt/homebrew/bin/aria2c"]);
     for (const g of guesses) if (g && fs.existsSync(g)) return g;
@@ -1055,11 +1045,11 @@ export const aria2Backend = {
 // 内部：提交 / 取消 / 收尾
 // ════════════════════════════════════════════════════════════
 
-// 路径比较用的归一（Windows 大小写不敏感；盘符大小写也常不一致）
+// 路径比较用的归一（大小写与分隔符规则交给平台层）
 function normPath(p) {
   try {
     const r = path.resolve(String(p || ""));
-    return process.platform === "win32" ? r.toLowerCase() : r;
+    return platform.normalizePath(r);
   } catch { return String(p || ""); }
 }
 

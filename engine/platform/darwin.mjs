@@ -141,7 +141,7 @@ export function readSystemProxy() {
   } catch { return { ...NONE_PROXY }; }
 }
 
-// ── ⑧ 用户目录 / 临时目录 ───────────────────────────────────────────────────
+// ── ⑧ 用户目录 / 临时目录 / 丢弃设备 ─────────────────────────────────────
 // mac 上没有 win32 那套 USERPROFILE 沙箱重定向，os.homedir() 直接读 HOME，够用。
 export function homeDir() {
   try {
@@ -157,6 +157,38 @@ export function tempDir() {
   const t = (process.env.TMPDIR || "").trim();
   if (t) return t;
   return os.tmpdir();
+}
+
+// 丢弃输出去处。posix 恒为 /dev/null。
+export function nullDevice() {
+  return "/dev/null";
+}
+
+// pid 是否还活着。signal 0 只探活、不投递。EPERM 算活着（存在但不属于我们）。
+export function pidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (e) {
+    return e?.code === "EPERM";
+  }
+}
+
+// pid 对应的命令名（basename，小写）。拿不到给 ""。
+// 用途：restore 收孤儿命令时先核名，避开 PID 复用导致的误杀。
+export function processNameOf(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return "";
+  try {
+    const r = spawnSync("ps", ["-p", String(n), "-o", "comm="], { encoding: "utf8", timeout: 5000 });
+    if (r.error || r.status !== 0) return "";
+    const line = String(r.stdout || "").trim().split(/\r?\n/)[0] || "";
+    if (!line) return "";
+    // comm 给的是裸名（node / git / uv），但某些平台会给完整路径 —— 统一取 basename
+    return line.split("/").pop().trim().toLowerCase();
+  } catch { return ""; }
 }
 
 // ── ⑩ 路径规范化 ────────────────────────────────────────────────────────────

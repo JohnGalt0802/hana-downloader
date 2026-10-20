@@ -121,15 +121,18 @@ export function readSystemProxy() {
     const me = /ProxyEnable\s+REG_DWORD\s+0x([0-9a-f]+)/i.exec(out);
     const ms = /ProxyServer\s+REG_SZ\s+([^\r\n]+)/.exec(out);
     if (!me && !ms) return none;
-    return {
-      enabled: me ? parseInt(me[1], 16) === 1 : false,
-      server: ms ? ms[1].trim() : "",
-      source: "registry",
-    };
+    // 只有「ProxyEnable=1 且 ProxyServer 非空」才算真有代理；其余一律 none。
+    // 两者缺一的组合在真机上见过（历史残留：装机软件改过又删了代理），
+    // 报 enabled 却没有 server 会把请求拨到不存在的代理上，比报「没代理」更坏；
+    // 报 enabled:false 却留着 server/source，又会让调用方以为有可用配置。
+    const enabled = me ? parseInt(me[1], 16) === 1 : false;
+    const server = ms ? ms[1].trim() : "";
+    if (!enabled || !server) return none;
+    return { enabled: true, server, source: "registry" };
   } catch { return none; }
 }
 
-// ── ⑧ 用户目录 / 临时目录 ───────────────────────────────────────────────────
+// ── ⑧ 用户目录 / 临时目录 / 丢弃设备 ─────────────────────────────────────
 // 宿主沙箱会把 USERPROFILE / TEMP 重定向到影子目录（踩坑 53），而 HOMEDRIVE+HOMEPATH
 // 不被重定向 —— 所以真实用户目录优先拼这两个。实测：拼出来是 C:\Users\<name>。
 export function homeDir() {
@@ -148,6 +151,43 @@ export function tempDir() {
     if (v) return v;
   }
   return os.tmpdir();
+}
+
+// 丢弃输出去处。Windows 上是 NUL（不是 /dev/null —— curl 在 win 上认 NUL）。
+// 写成函数而不是常量，是为了与其它接口同形状、便于测试注入。
+export function nullDevice() {
+  return "NUL";
+}
+
+// pid 是否还活着。只探活不发信号（signal 0）。
+// EPERM 也算「活着」：进程存在但不属于我们——对「收孤儿命令」这个用途，
+// 报死比报活危险（报死就会跳过清理，而它还占着目录在写）。
+export function pidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (e) {
+    return e?.code === "EPERM";
+  }
+}
+
+// pid 对应的镜像名（不含 .exe，小写）。拿不到给 ""。
+// 用途：restore 收孤儿命令时先核名，避免 PID 被系统复用后误杀无关进程。
+export function processNameOf(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return "";
+  try {
+    const r = spawnSync("tasklist", ["/FI", `PID eq ${n}`, "/NH", "/FO", "CSV"], {
+      encoding: "utf8", windowsHide: true, timeout: 5000,
+    });
+    if (r.status !== 0) return "";
+    // CSV 第一行形如 "node.exe","1234","Console","1","12,345 K"
+    const m = /^"([^"]+)"/m.exec(String(r.stdout || "").trim());
+    if (!m) return "";
+    return m[1].replace(/\.exe$/i, "").toLowerCase();
+  } catch { return ""; }
 }
 
 // ── ⑩ 路径规范化 ────────────────────────────────────────────────────────────

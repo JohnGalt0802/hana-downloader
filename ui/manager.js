@@ -58,6 +58,9 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask, ARIA2_LIMIT_
   var search = ""; // 搜索关键词
   var expanded = null; // taskId 展开详情
   var settings = {}; // 插件设置（defaultSaveDir / agentChooses）
+// 平台能力（2026-10-20）：由引擎 /settings 回包里的 platform 填。默认按「不支持」渲染，
+// 只在确认支持时才多显示那一块 —— 宁愿少显示一阵，也不要让人点一个本来就不可用的按钮。
+var cap = { name: "", proxyControl: false };
 
   // ── 后端访问 ──
   // v2 App：统一走 hana.api.fetch（SDK 自动带 iframe 的 surface session 票据，
@@ -683,40 +686,48 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask, ARIA2_LIMIT_
       save: function (v) { patchSettings({ maxConcurrent: v }, v > 0 ? "已设置同时下载上限 " + v + " 个" : "已取消并发限制"); },
     });
 
-    // ── 代理启停控制（2026-10-04）─────────────────────────────
+    // ── 代理启停控制（2026-10-04；2026-10-20 改为按平台能力渲染）───
     // 纪律：默认未授权；「使用现有代理」不受本开关影响（对齐裸 curl）。
     // 这里只控「启停梯子」这类改环境的动作。
+    //
+    // 平台裁剪：capabilities.proxyControl 为 false 时三个入口全部**不渲染**（不是灰掉）。
+    // 理由：灰掉的按钮会让人反复点、以为是 bug；消失是真话——这个平台没有这个能力。
+    // 做法：保留原有构建代码不动（少改一处就少一个风险），只在 appendChild 时按能力跳过。
+    // 权限只查一次，三个入口同生同死，不能只藏一个。
     var optProxyCtl = el("button", "mgr-settings-opt", "代理启停：加载中…");
-    var proxyCtlState = { enabled: false, launcher: null };
-    function refreshProxyCtl() {
-      apiFetch("/proxy-control/status")
-        .then(function (r) { return r.json(); })
-        .then(function (d) {
-          if (!d || d.error) return;
-          proxyCtlState.enabled = !!d.enabled;
-          proxyCtlState.launcher = d.launcher || null;
-          var nm = proxyCtlState.launcher ? proxyCtlState.launcher.name : "未配置梯子";
-          optProxyCtl.textContent = "代理启停：" + (proxyCtlState.enabled ? "已授权" : "未授权") + "（" + nm + "）";
+      var proxyCtlState = { enabled: false, launcher: null };
+      function refreshProxyCtl() {
+        apiFetch("/proxy-control/status")
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (!d || d.error) return;
+            // 引擎说这个平台不支持启停梯子（能力与服务端不一致时的兜底）：
+            // 不报错、不挂红字，静默把入口从菜单里去掉（与首屏的 cap 判断结果一致）。
+            if (d.unsupported) return;
+            proxyCtlState.enabled = !!d.enabled;
+            proxyCtlState.launcher = d.launcher || null;
+            var nm = proxyCtlState.launcher ? proxyCtlState.launcher.name : "未配置梯子";
+            optProxyCtl.textContent = "代理启停：" + (proxyCtlState.enabled ? "已授权" : "未授权") + "（" + nm + "）";
+          })
+          .catch(function () {});
+      }
+      optProxyCtl.title = "是否允许 Agent 启停本机梯子。默认关；「使用」现有代理不受此开关影响（机器开着代理就正常用，与 curl 一致）。";
+      optProxyCtl.onclick = function (e) {
+        e.stopPropagation();
+        var next = !proxyCtlState.enabled;
+        apiFetch("/proxy-control/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: next }),
         })
-        .catch(function () {});
-    }
-    optProxyCtl.title = "是否允许 Agent 启停本机梯子。默认关；「使用」现有代理不受此开关影响（机器开着代理就正常用，与 curl 一致）。";
-    optProxyCtl.onclick = function (e) {
-      e.stopPropagation();
-      var next = !proxyCtlState.enabled;
-      apiFetch("/proxy-control/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: next }),
-      })
-        .then(function (r) { return r.json(); })
-        .then(function () {
-          refreshProxyCtl();
-          hint(next ? "已授权：Agent 可以启停梯子" : "已收回授权：Agent 不能再启停梯子");
-        })
-        .catch(function () { hint("设置失败：网络错误"); });
-    };
-    refreshProxyCtl();
+          .then(function (r) { return r.json(); })
+          .then(function () {
+            refreshProxyCtl();
+            hint(next ? "已授权：Agent 可以启停梯子" : "已收回授权：Agent 不能再启停梯子");
+          })
+          .catch(function () { hint("设置失败：网络错误"); });
+      };
+      refreshProxyCtl();
 
     // 扫描代理软件：找到候选后循环切换选哪个（与代理模式按钮同思路，不关菜单）
     var scanIdx = -1;
@@ -776,9 +787,12 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask, ARIA2_LIMIT_
     menu.appendChild(opt1);
     menu.appendChild(opt2);
     menu.appendChild(optProxy);
-    menu.appendChild(optProxyCtl);
-    menu.appendChild(optScan);
-    menu.appendChild(optVerify);
+    // 三个梯子控制入口只在支持启停梯子的平台上出现（见上方 optProxyCtl 旁的说明）
+    if (cap.proxyControl) {
+      menu.appendChild(optProxyCtl);
+      menu.appendChild(optScan);
+      menu.appendChild(optVerify);
+    }
     menu.appendChild(opt3);
     menu.appendChild(opt4);
     menu.appendChild(opt5);
@@ -1019,7 +1033,15 @@ import { STAGE_TEXT, unitSuffix, isPkgTask, isCountTask, isCmdTask, ARIA2_LIMIT_
   function loadSettings(cb) {
     apiFetch("/settings", { cache: "no-store" })
       .then(function (r) { return r.json(); })
-      .then(function (data) { if (data.ok) settings = data.settings || {}; cb && cb(); })
+      .then(function (data) {
+        if (data.ok) settings = data.settings || {};
+        // 平台能力（2026-10-20）：设置菜单里的「代理启停」整块按能力显隐。
+        // 取值优先级：引擎回包里带的 platform（权威，跑在引擎那个进程里）→ 留空则当不支持。
+        // 注意：只影响「启停梯子」这一块，读系统代理不受影响（那两块本来就不在一处）。
+        if (data && data.platform) cap.proxyControl = !!data.platform.proxyControl;
+        if (data && data.platform) cap.name = data.platform.name || cap.name;
+        cb && cb();
+      })
       .catch(function () { cb && cb(); });
   }
 

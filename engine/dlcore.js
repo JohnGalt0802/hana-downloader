@@ -9,6 +9,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { startWingetProbe } from "./download-probe.js";
 import { nodeHttpBackend } from "./backends/node-http.js";
+import { platform } from "./platform/index.mjs";
 import { aria2Backend, recordedInstanceAlive } from "./backends/aria2.js";
 import { capabilitiesOf, normalizeAria2Config } from "./backends/contract.js";
 // 摘要口径全仓唯一一份（snapshot 与 /list、finished/、stalled/ 共用，见 engine/summary.js）
@@ -25,7 +26,7 @@ const RESTORE_FINISHED_MAX_AGE_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_CONCURRENT = 3; // 同时运行的任务数上限（0=不限）；管理器设置里可改
 
 let _instance = null;
-const MGR_VER = 30; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished；v27=retry 以磁盘校正 received（取消后重试不再永久失败）；v28=终态记录改原子写（临时文件+fsync+rename，不再出现半截 JSON）；v29=.part 归属后端（partOwner）+ 换后端丢弃旧半成品，修「切后端续传交付带洞文件却报 done」；v30=restore 区分「aria2 实例还活着」与「实例已没」，前者恢复运行态继续跟踪，不再误报下载失败）
+const MGR_VER = 31; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished；v27=retry 以磁盘校正 received（取消后重试不再永久失败）；v28=终态记录改原子写（临时文件+fsync+rename，不再出现半截 JSON）；v29=.part 归属后端（partOwner）+ 换后端丢弃旧半成品，修「切后端续传交付带洞文件却报 done」；v30=restore 区分「aria2 实例还活着」与「实例已没」，前者恢复运行态继续跟踪，不再误报下载失败；v31=平台适配层收编：spawnOpts/killTree 成对、命令型子进程落盘 pid、restore 收孤儿命令）
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -547,12 +548,14 @@ class TaskManager {
     }
     let child;
     try {
-      child = spawn(cmdBin, fullArgs, {
+      // ★ spawnOpts 与 platform.killTree 是一对，改这里之前先读 platform 层的注释与
+      //   方案 §3.3 原则一。posix 下必须 detached:true，否则 killTree 的 kill(-pid) 没有
+      //   「进程组」可杀（只能杀到自己，孙进程变孤儿）。旧写法正是在这里漏了 detached。
+      child = spawn(cmdBin, fullArgs, platform.spawnOpts({
         cwd: task.cmd.workdir || process.cwd(),
         stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
         env: childEnv,
-      });
+      }));
     } catch (err) {
       this._stopStallMonitor(task);
       task.state = "failed";
@@ -565,6 +568,10 @@ class TaskManager {
       return;
     }
     task.child = child;
+    // 落盘 pid（2026-10-20）：posix 下子进程带 detached，引擎被硬杀时它不会跟着死。
+    // 不把 pid 写进 tasks.json，下次 restore 就没任何依据去收这个孤儿 ——
+    // 只能眼看着一个已标「已中断」的任务在后台继续写目录。
+    this._persist();
 
     // winget 下载进度旁路探测（2026-09-18）：CLI 不给下载进度，改为观测它的落盘文件；
     // 失败静默，不影响任务本身。pip / git / pnpm 不走此路。
@@ -707,13 +714,11 @@ class TaskManager {
     t.canceledBy = source;
     t.cancelRequested = true;
     if (t.kind === "command" && t.child && t.child.pid) {
-      // Windows 杀进程树；非 Windows 信号
-      if (process.platform === "win32") {
-        try {
-          spawnSync("taskkill", ["/pid", String(t.child.pid), "/T", "/F"], { windowsHide: true });
-        } catch { try { t.child.kill(); } catch { /* 忽略 */ } }
-      } else {
-        try { process.kill(-t.child.pid, "SIGTERM"); } catch { try { t.child.kill(); } catch { /* 忽略 */ } }
+      // 杀整棵进程树：taskkill /T /F（win）或 kill(-pid)（posix）。
+      // 两者收在 platform 层且与 spawnOpts 同文件——「起进程忘了 detached」这类缺陷
+      // 从结构上不会再出现（方案 §3.3 原则一）。killTree 自己吞错，失败返回 false。
+      if (!platform.killTree(t.child.pid)) {
+        try { t.child.kill(); } catch { /* 已退出 */ }
       }
       return { ok: true };
     }
@@ -862,6 +867,39 @@ class TaskManager {
   //      → 不标 interrupted、不写终态，恢复成运行态继续跟踪（进度只取 RPC 的 completedLength）
   //   B：实例已没了 / 握手失败 / 任务不在它队列里
   //      → 保持原有语义：interrupted + 补写终态
+  /**
+   * 收孤儿命令进程（2026-10-20，配 detached 的收尾）。
+   *
+   * 为什么需要：posix 下命令型子进程带 detached（自成进程组），这是 killTree 能杀掉
+   * 整棵树的前提，代价是**引擎被 SIGKILL 时子进程不会跟着死**。引擎重启后，任务已经被
+   * 标成「已中断」，而 uv/pip/git 还在后台写同一个目录 —— 用户看到的与磁盘上发生的完全是两回事。
+   *
+   * 安全阀：只杀「记录里的 pid 还活着、且镜像名对得上」的进程。
+   * 为何必须核名：PID 会被系统复用。引擎停机已一小时，那个 pid 可能已经属于别人的程序 ——
+   * 不核名就杀，是拿用户的系统去赌运气。
+   *
+   * @private
+   */
+  _reapOrphanCommand(pid, cmdType) {
+    const n = Number(pid);
+    if (!Number.isInteger(n) || n <= 0) return false;
+    try {
+      if (!platform.pidAlive(n)) return false;
+      // 期望的镜像名：git / node（pnpm 走 process.execPath）/ winget / python|uv
+      const expect = cmdType === "git-clone" ? ["git"]
+        : cmdType === "pnpm-install" ? ["node", "npm", "pnpm"]
+          : cmdType === "winget-install" ? ["winget"]
+            : ["python", "python3", "py", "uv"];
+      const actual = platform.processNameOf(n);
+      // 拿不到进程名：宁可不动。误杀的代价（用户别的程序被干掉）远大于漏杀（一个后台进程多活一阵）。
+      if (!actual) return false;
+      if (!expect.includes(actual)) return false;
+      const killed = platform.killTree(n);
+      if (!killed) { try { process.kill(n, "SIGTERM"); } catch { /* 已退出 */ } }
+      return true;
+    } catch { return false; }
+  }
+
   restore() {
     // 先把没人等的孤儿终态收掉：见 _pruneOrphanFinished 的说明。
     this._pruneOrphanFinished();
@@ -879,6 +917,10 @@ class TaskManager {
       if (m.state === "running" || m.state === "pending") {
         const isCmd = m.kind === "command" && m.cmd?.type;
         if (isCmd) {
+          // 孤儿命令收尾（2026-10-20）：posix 下命令型子进程带 detached，引擎被硬杀
+          // 时它不会跟着死。若 pid 还在且确实是这条命令起的子进程，先杀掉再清理。
+          // 不杀就重启：uv/pip 会在后台继续写同一个目录，用户看到「已中断」+ 磁盘一直在变。
+          this._reapOrphanCommand(m.childPid, m.cmd?.type);
           // 命令型：git-clone 中断删半成品目录；pnpm-install 保留 node_modules 半成品
           if (m.cmd.type === "git-clone" && m.filePath && fs.existsSync(m.filePath)) {
             try { fs.rmSync(m.filePath, { recursive: true, force: true }); } catch { /* 忽略清理失败 */ }
@@ -1118,6 +1160,12 @@ class TaskManager {
           // 不落盘就只能按 .part 路径回找（也能找，但 gid 是更直接的证据，
           // 且能区分「实例里另一条同名任务」这种罕见情形）。
           aria2Gid: t.aria2Gid || null,
+          // 命令型任务的子进程 pid（2026-10-20，配 detached 的收尾）。
+          // 为什么要落盘：posix 下子进程带 detached（自成进程组），引擎被 SIGKILL 时
+          // 子进程不会跟着死——它会变成真正的孤儿，继续跑（uv/pip/git 写同目录），
+          // 而 App 侧已经把它标成「已中断」。落盘 pid 是让下一次 restore 能把它们收掉的
+          // 唯一依据（没有 pid 就只能眼睁睁看着）。只在 running 时写，终态时清。
+          childPid: (t.kind === "command" && t.state === "running" && t.child && t.child.pid) ? t.child.pid : null,
         })),
       };
       fs.mkdirSync(this.dataDir, { recursive: true });
@@ -1175,20 +1223,17 @@ const META_PROTECTED = new Set([
   "pendingTimer", "sessionId", "sessionPath", "kind", "cmd", "cancelRequested", "partPath",
 ]);
 
-// winget 可执行解析：where 优先，其次 WindowsApps 别名兜底（受管进程 PATH 不含用户别名时）。
+// winget 可执行解析：platform.which 优先，其次 WindowsApps 别名兜底（受管进程 PATH 不含用户别名时）。
+// 探测手段统一走 platform 层（win 用 where.exe，posix 用 which）——这层不再出现 where.exe。
 export function resolveWingetBin() {
-  try {
-    const r = spawnSync("where.exe", ["winget"], { encoding: "utf-8", windowsHide: true });
-    if (r.status === 0) {
-      for (const line of String(r.stdout || "").split(/\r?\n/)) {
-        const p = line.trim();
-        if (p && /winget\.exe$/i.test(p) && fs.existsSync(p)) return p;
-      }
-    }
-  } catch { /* 走兜底 */ }
+  const name = platform.exe("winget");
+  const hit = platform.which("winget");
+  // which 已在 Windows 上返回 .exe 完整路径；posix 上不可能有 winget，命中就照用
+  if (hit) return hit;
+  if (platform.name !== "win32") return name; // 非 Windows：只可能是 PATH 上有个同名命令
   const guess = path.join(process.env.LOCALAPPDATA || "", "Microsoft", "WindowsApps", "winget.exe");
   if (fs.existsSync(guess)) return guess;
-  return "winget"; // 退化：依赖 PATH
+  return name; // 退化：依赖 PATH
 }
 
 // winget install 参数（数组传参，无 shell）。--disable-interactivity 禁用交互提示，
@@ -1203,39 +1248,28 @@ function buildWingetArgs(cmd) {
   return args;
 }
 
-// Python 解释器解析：显式 pythonPath 优先（不存在则抛），否则 where python 第一个。
+// Python 解释器解析：显式 pythonPath 优先（不存在则抛），否则由 platform.which 找第一个。
+// 名字扩展名交给平台层（win 上是 python.exe，posix 上是 python）——这里不判平台。
 function resolvePythonBin(pythonPath) {
   if (pythonPath) {
     const p = path.resolve(String(pythonPath));
     if (!fs.existsSync(p)) throw new Error(`指定的 Python 解释器不存在：${p}`);
     return p;
   }
-  try {
-    const r = spawnSync("where.exe", ["python"], { encoding: "utf-8", windowsHide: true });
-    if (r.status === 0) {
-      for (const line of String(r.stdout || "").split(/\r?\n/)) {
-        const p = line.trim();
-        if (p && /python[\d.]*(\.exe)?$/i.test(p) && fs.existsSync(p)) return p;
-      }
-    }
-  } catch { /* 走退化 */ }
-  return "python"; // 退化：依赖 PATH
+  // win 上 python 可能是 0 字节的 App Execution Alias（应用商店重定向桩），
+  // which 会返回它、existsSync 却是 false —— 这正是 platform.which 刻意不做二次过滤的原因。
+  return platform.which("python") || platform.which("python3") || platform.exe("python");
 }
 
-// uv 可执行解析：where 优先，其次 ~/.local/bin/uv.exe（官方安装器默认位置）。
+// uv 可执行解析：platform.which 优先，其次官方安装器默认位置。
 function resolveUvBin() {
-  try {
-    const r = spawnSync("where.exe", ["uv"], { encoding: "utf-8", windowsHide: true });
-    if (r.status === 0) {
-      for (const line of String(r.stdout || "").split(/\r?\n/)) {
-        const p = line.trim();
-        if (p && /uv(\.exe)?$/i.test(p) && fs.existsSync(p)) return p;
-      }
-    }
-  } catch { /* 走兜底 */ }
-  const guess = path.join(process.env.USERPROFILE || "", ".local", "bin", "uv.exe");
+  const hit = platform.which("uv");
+  if (hit) return hit;
+  const guess = platform.name === "win32"
+    ? path.join(platform.homeDir(), ".local", "bin", "uv.exe")
+    : path.join(platform.homeDir(), ".local", "bin", "uv");
   if (fs.existsSync(guess)) return guess;
-  return "uv"; // 退化：依赖 PATH
+  return platform.exe("uv"); // 退化：依赖 PATH
 }
 
 // pip 安装命令构造（数组传参，无 shell）：
@@ -1267,25 +1301,37 @@ function buildPipCommand(cmd) {
 }
 
 function findPnpmEntry() {
-  // 1) where pnpm → .cmd shim → 读内容找 node_modules/pnpm/bin/pnpm.mjs|cjs
-  try {
-    const r = spawnSync("where.exe", ["pnpm"], { encoding: "utf-8", windowsHide: true });
-    if (r.status === 0) {
-      for (const line of String(r.stdout || "").split(/\r?\n/)) {
-        const p = line.trim();
-        if (!p || !/\.cmd$/i.test(p)) continue;
-        const content = fs.readFileSync(p, "utf-8");
-        const m = content.match(/node_modules[\\/]pnpm[\\/]bin[\\/]pnpm\.(?:mjs|cjs)/);
-        if (m) {
-          const entry = path.resolve(path.dirname(p), m[0].replace(/\//g, path.sep));
-          if (fs.existsSync(entry)) return entry;
+  // 1) 三平台通用前半：which 找到的若本身就是 JS 入口（posix 上 npm 全局装的 pnpm 是带 shebang
+  //    的脚本），直接用；若是 .cmd shim（Windows），读内容挖出真正的 pnpm.mjs|cjs。
+  //    旧实现在 posix 上恒返回 null（只认 .cmd 结尾），于是退化到 PATH 上的 pnpm —— 在
+  //    有 .cmd 逻辑的 Windows 上对，在 mac/linux 上就靠碰运气了。
+  const hit = platform.which("pnpm");
+  if (hit) {
+    if (/\.(mjs|cjs)$/i.test(hit)) return hit;
+    try {
+      const content = fs.readFileSync(hit, "utf-8");
+      // ① .cmd shim 里的相对跳转（Windows npm 全局安装）
+      const m = content.match(/node_modules[\\/]pnpm[\\/]bin[\\/]pnpm\.(?:mjs|cjs)/);
+      if (m) {
+        const entry = path.resolve(path.dirname(hit), m[0].replace(/\//g, path.sep));
+        if (fs.existsSync(entry)) return entry;
+      }
+      // ② posix 上的 shim 常写成 exec node "$basedir/../pnpm/bin/pnpm.cjs" —— 同样抓路径
+      const m2 = content.match(/(?:[^\s"']*)\/pnpm\/bin\/pnpm\.(?:mjs|cjs)/g);
+      if (m2) {
+        for (const rel of m2) {
+          const norm = rel.replace(/^"|"$/g, "");
+          const p = norm.startsWith("/")
+            ? norm
+            : path.resolve(path.dirname(hit), norm.replace(/\//g, path.sep));
+          if (fs.existsSync(p)) return p;
         }
       }
-    }
-  } catch { /* 继续探测 */ }
-  // 2) npm root -g 直拼标准结构
+    } catch { /* 读不了就往下走 */ }
+  }
+  // 2) npm root -g 直拼标准结构（三平台同一套布局）
   try {
-    const r = spawnSync("npm", ["root", "-g"], { encoding: "utf-8", windowsHide: true });
+    const r = spawnSync("npm", ["root", "-g"], { encoding: "utf-8", windowsHide: platform.name === "win32" });
     if (r.status === 0) {
       const root = String(r.stdout || "").trim();
       for (const f of ["pnpm/bin/pnpm.mjs", "pnpm/bin/pnpm.cjs"]) {
@@ -1374,7 +1420,8 @@ function friendlyError(e) {
 // 而最后两行只有 “No authorization header was set for the request.”，对用户等于没说。
 function summarizeCmdTail(tail) {
   const lines = tail.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  const errLine = lines.find((l) => /ERR_[A-Z0-9_]+|^fatal:/i.test(l)) || "";
+  // 错误行识别：pnpm 的 [ERR_XXX] / git 的 fatal: / pip 的 error:（PEP 668 就长这样）
+  const errLine = lines.find((l) => /ERR_[A-Z0-9_]+|^fatal:|^error:|^ERROR:/i.test(l)) || "";
   if (errLine) {
     const hint = cmdErrorHint(tail);
     return hint ? `${errLine}（${hint}）` : errLine;
@@ -1389,6 +1436,16 @@ function cmdErrorHint(tail) {
   if (/ERR_PNPM_(META_)?FETCH|ERR_PNPM_TARBALL/.test(tail)) return "源不可达，检查网络与代理";
   if (/ERR_PNPM_PEER_DEP_ISSUES/.test(tail)) return "peer 依赖冲突";
   if (/fatal: repository .* not found|fatal: could not read from remote/i.test(tail)) return "仓库不存在或无权访问";
+  // PEP 668（2026-10-20）：Debian/Ubuntu 24.04、Homebrew Python 等把系统 Python 标成
+  // externally-managed，pip 直接拒装。原文是「error: externally-managed-environment」+
+  // 一段链接，用户需要的是「该怎么办」。
+  // **不给 --break-system-packages**：那会把系统 Python 的包管理搞坏，而且是用户
+  // 看不见的持久损坏。正确做法是 venv 或 pipx，这里直接告诉他。
+  if (/externally-managed-environment|EXTERNALLY-MANAGED/i.test(tail)) {
+    return "系统 Python 受外部管理，禁止直接装包（PEP 668）。请改用 venv："
+      + "先建虚拟环境（python -m venv .venv），再用该环境的解释器（pythonPath 指向 .venv/bin/python）安装；"
+      + "或改用 runner=uv 走独立环境";
+  }
   return "";
 }
 
@@ -1502,7 +1559,13 @@ export function readProxyConfig(dataDir) {
   return out;
 }
 
-// 代理地址来源（按优先级）：显式参数 → config.proxy.url/字符串 → 环境变量 → Windows 注册表（只读）
+// 代理地址来源（按优先级）：显式参数 → config.proxy.url/字符串 → 环境变量 → 系统代理（只读）
+//
+// 系统代理这一步走 platform.readSystemProxy()：win 读注册表，mac 读 scutil，linux 读
+// gsettings/env。旧写法直接 spawnSync "reg query"，在 mac/linux 上恒失败且毫无提示 ——
+// 用户看着系统里明明配了代理，下载器却报「无代理」。
+//
+// 注意：只读，不写系统设置（只读纪律）。
 export function resolveProxyUrl(dataDir, explicit = "") {
   if (explicit) return explicit;
   const p = readUserConfig(dataDir).proxy;
@@ -1511,17 +1574,14 @@ export function resolveProxyUrl(dataDir, explicit = "") {
   const envP = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || "";
   if (envP) return envP;
   try {
-    const out = spawnSync(
-      "reg",
-      ["query", 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings', "/v", "ProxyServer"],
-      { encoding: "utf8", windowsHide: true, timeout: 5000 }
-    );
-    const m = /ProxyServer\s+REG_SZ\s+([^\r\n]+)/.exec(out.stdout || "");
-    if (m && m[1].trim()) {
-      const v = m[1].trim();
-      if (v.startsWith("http://") || v.startsWith("https://")) return v;
-      return "http://" + v;
-    }
+    const sp = platform.readSystemProxy();
+    if (!sp || !sp.enabled || !sp.server) return "";
+    const v = String(sp.server).trim();
+    if (!v) return "";
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) return v;
+    // 注册表/系统库里存的可能是 "127.0.0.1:7890"，也可能带协议前缀；
+    // 也可能包含 socks 协议（gsettings 的 socks host）。带协议的照原样，裸 host:port 补 http。
+    return "http://" + v;
   } catch { /* 读不到就算没有 */ }
   return "";
 }
@@ -1538,8 +1598,8 @@ export function probeDirect(host, timeoutMs = 3000) {
     const sec = String(Math.max(1, Math.round(timeoutMs / 1000)));
     const r = spawnSync(
       "curl",
-      ["-sI", "--max-time", sec, "-o", process.platform === "win32" ? "NUL" : "/dev/null", `https://${h}/`],
-      { windowsHide: true, timeout: timeoutMs + 2000 }
+      ["-sI", "--max-time", sec, "-o", platform.nullDevice(), `https://${h}/`],
+      { windowsHide: platform.name === "win32", timeout: timeoutMs + 2000 }
     );
     ok = !!(r && r.status === 0);
   } catch { ok = false; }

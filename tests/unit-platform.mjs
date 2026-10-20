@@ -72,7 +72,7 @@ check("生产导出与 createPlatform(process.platform) 同源", () =>
 
 // ══ 一、共通断言：三份实例同一套 ════════════════════════════════════════════
 const METHODS = ["which", "exe", "spawnOpts", "killTree", "isRunning", "reveal",
-  "readSystemProxy", "homeDir", "tempDir", "normalizePath"];
+  "readSystemProxy", "homeDir", "tempDir", "nullDevice", "pidAlive", "processNameOf", "normalizePath"];
 
 for (const n of PLATFORMS) {
   const p = P[n];
@@ -160,7 +160,10 @@ for (const n of PLATFORMS) {
     const keys = Object.keys(p.readSystemProxy()).sort();
     return JSON.stringify(keys) === JSON.stringify(["enabled", "server", "source"]);
   });
-  check(`${n}.readSystemProxy: 启停两态自洽（enabled → server 非空；否则 server 空、source=none）`, () => {
+  check(`${n}.readSystemProxy: 启停两态自洽（enabled → server 非空且 source 非 none；否则 server 空、source=none）`, () => {
+    // 这条在 CI runner 上真捕到过一个缺陷：reg query 回 `ProxyEnable 0x0` 但没有 ProxyServer，
+    // 旧实现报 {enabled:false, server:"", source:"registry"} —— 两态各自都"看起来合理"，
+    // 拼在一起就自相矛盾，调用方不知道该看 enabled 还是 source。现在实现改成两者缺一即 none。
     const r = p.readSystemProxy();
     if (r.enabled) return r.server.length > 0 && r.source !== "none";
     return r.server === "" && r.source === "none";
@@ -175,6 +178,31 @@ for (const n of PLATFORMS) {
   // ── ⑧ homeDir / tempDir：非空字符串 ──
   check(`${n}.homeDir: 非空字符串`, () => isStr(p.homeDir()) && p.homeDir().trim().length > 0);
   check(`${n}.tempDir: 非空字符串`, () => isStr(p.tempDir()) && p.tempDir().trim().length > 0);
+  check(`${n}.nullDevice: 非空字符串，且不以分隔符结尾`, () => {
+    // 不断言「不含分隔符」：/dev/null 本身就是一条路径。真正的契约只是「能当 -o 的实参」。
+    const d = p.nullDevice();
+    return isStr(d) && d.trim().length > 0 && !/[\\/]$/.test(d);
+  });
+
+  // ⑧ pid 探活 / 进程名：非法入参不抛
+  check(`${n}.pidAlive: 非法 pid → false 且不抛`, () => {
+    for (const bad of [0, -1, NaN, "abc", null, undefined, 1.5, {}]) {
+      if (p.pidAlive(bad) !== false) return false;
+    }
+    return true;
+  });
+  check(`${n}.pidAlive: 当前进程 → true`, () => p.pidAlive(process.pid) === true);
+  check(`${n}.pidAlive: 不存在的超大 pid → false`, () => p.pidAlive(2147483647) === false);
+  check(`${n}.processNameOf: 非法 pid → ""`, () => {
+    for (const bad of [0, -1, NaN, null, undefined, {}]) {
+      if (p.processNameOf(bad) !== "") return false;
+    }
+    return true;
+  });
+  check(`${n}.processNameOf: 返回字符串，不返回 null/undefined`, () => {
+    const r = p.processNameOf(process.pid);
+    return isStr(r);
+  });
 
   // ── ⑩ normalizePath：比较键的共性 ──
   check(`${n}.normalizePath: 反斜杠转正斜杠`, () => p.normalizePath("a\\b\\c") === "a/b/c");
@@ -217,6 +245,11 @@ for (const n of PLATFORMS) {
 check("差异·exe: win32 加 .exe", () => P.win32.exe("a") === "a.exe");
 check("差异·exe: darwin 原样不加后缀", () => P.darwin.exe("a") === "a");
 check("差异·exe: linux 原样不加后缀", () => P.linux.exe("a") === "a");
+
+// ── ⑧ nullDevice：win 是 NUL，posix 是 /dev/null ──
+check("差异·nullDevice: win32 → NUL", () => P.win32.nullDevice() === "NUL");
+check("差异·nullDevice: darwin → /dev/null", () => P.darwin.nullDevice() === "/dev/null");
+check("差异·nullDevice: linux → /dev/null", () => P.linux.nullDevice() === "/dev/null");
 check("差异·exe: win32 带路径也不改名，只加后缀", () => P.win32.exe("C:\\tools\\aria2c") === "C:\\tools\\aria2c.exe");
 check("差异·exe: darwin 带路径原样返回", () => P.darwin.exe("/opt/homebrew/bin/aria2c") === "/opt/homebrew/bin/aria2c");
 check("差异·exe: linux 带路径原样返回", () => P.linux.exe("/usr/bin/aria2c") === "/usr/bin/aria2c");
@@ -302,19 +335,38 @@ if (process.platform === "win32") {
     const s = P.win32.readSystemProxy().source;
     return s === "registry" || s === "none";
   });
-  // ★ 验收 3 的同一件事：本机没有 which 命令，darwin/linux 的实现必须优雅返回空而不是崩
-  check("darwin.which(\"node\") 在 Windows 上 → \"\"（本机无 which 命令，不抛）", () =>
-    P.darwin.which("node") === "");
-  check("linux.which(\"node\") 在 Windows 上 → \"\"（本机无 which 命令，不抛）", () =>
-    P.linux.which("node") === "");
-  check("darwin.isRunning(\"node\") 在 Windows 上 → false（本机无 pgrep）", () =>
-    P.darwin.isRunning("node") === false);
-  check("linux.isRunning(\"node\") 在 Windows 上 → false（本机无 pgrep）", () =>
-    P.linux.isRunning("node") === false);
-  check("darwin.readSystemProxy 在 Windows 上 → source=none（本机无 scutil）", () =>
-    P.darwin.readSystemProxy().source === "none");
-  check("darwin/linux.capabilities.pkgManager 在 Windows 上 → null（本机无 brew/apt/dnf/pacman）", () =>
-    P.darwin.capabilities.pkgManager === null && P.linux.capabilities.pkgManager === null);
+  // ★ 验收 3 的同一件事：本机没有 which / pgrep 时必须优雅返回空而不是崩。
+  // 不能断言"一定为空"：windows-latest runner 上 Git for Windows 会把 `which` 放上 PATH，
+  // 于是 darwin/linux.which("node") 真能拿到结果（2026-10-19 CI 实测失败）。
+  // 契约是「不抛、返回字符串、要么空要么指向真实存在的路径」，不押注机器干净。
+  check("darwin.which 在非 darwin 上：不抛，要么空要么真存在", () => {
+    const r = P.darwin.which("node");
+    return isStr(r) && (r === "" || fs.existsSync(r));
+  });
+  check("linux.which 在非 linux 上：不抛，要么空要么真存在", () => {
+    const r = P.linux.which("node");
+    return isStr(r) && (r === "" || fs.existsSync(r));
+  });
+  check("darwin.isRunning 在非 darwin 上：布尔值，不抛", () => {
+    const r = P.darwin.isRunning("node");
+    return typeof r === "boolean";
+  });
+  check("linux.isRunning 在非 linux 上：布尔值，不抛", () => {
+    const r = P.linux.isRunning("node");
+    return typeof r === "boolean";
+  });
+  check("darwin.readSystemProxy 在非 darwin 上：不抛且自洽", () => {
+    const r = P.darwin.readSystemProxy();
+    const okShape = typeof r.enabled === "boolean" && isStr(r.server) && isStr(r.source);
+    if (!okShape) return false;
+    // scutil 不存在时 source 必须是 none；有 scutil 的机器（很少）则自洽即可
+    return r.enabled ? r.server.length > 0 : (r.server === "" && r.source === "none");
+  });
+  check("darwin/linux.capabilities.pkgManager 在 Windows runner 上要么 null 要么本家", () => {
+    const a = P.darwin.capabilities.pkgManager, b = P.linux.capabilities.pkgManager;
+    return (a === null || a === "brew")
+      && (b === null || ["brew", "apt", "dnf", "pacman"].includes(b));
+  });
 } else {
   skip += 1;
   console.log("SKIP: Windows 本机专属正向用例");

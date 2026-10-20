@@ -28,6 +28,9 @@ const METHODS = [
   "readSystemProxy", // ⑦ → {enabled, server, source}
   "homeDir",      // ⑧ → string
   "tempDir",      // ⑧ → string
+  "nullDevice",   // ⑧ → 丢弃输出的设备名（curl -o / 重定向用）
+  "pidAlive",     // ⑧ → pid → boolean（只探活，不发信号）
+  "processNameOf",// ⑧ → pid → 进程名（拿不到给 ""）
   "normalizePath",// ⑩ path → 比较键
 ];
 

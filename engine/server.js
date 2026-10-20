@@ -17,6 +17,7 @@ import { aria2Backend } from "./backends/aria2.js";
 import { normalizeAria2Config } from "./backends/contract.js";
 import { parseWingetSearch } from "./progress-parsers.js";
 import { ENGINE_PORT } from "./engine-port.js";
+import { platform } from "./platform/index.mjs";
 import { summarizeTask } from "./summary.js";
 // 终态/停滞记录的原子写（2026-10-19）：等待方每 2 秒 JSON.parse 一次，半截文件会被吞成「下载超时」
 import { writeJsonAtomic, finishedPathOf } from "./atomic-write.js";
@@ -66,6 +67,23 @@ function normalizeProxyMode(p) {
   if (typeof p === "string" && p.trim()) return "always";
   if (p && typeof p === "object" && ["auto", "always", "never"].includes(p.mode)) return p.mode;
   return "auto";
+}
+
+// 平台能力快照（给 UI 用）。每次调用实时读——pkgManager 是带 5 秒负缓存的真探测，
+// 所以「用户刚装完 winget」不用重启也能反映到入口上。proxyControl 是静态能力
+// （那套东西的形态就是 Windows 的），直接用能力表里的布尔值。
+// 失败不抛：能力拿不到就当作什么都没有，UI 会少显示几块 —— 宁少不错。
+function platformInfo() {
+  try {
+    return {
+      name: platform.name,
+      proxyControl: !!platform.capabilities.proxyControl,
+      pkgManager: platform.capabilities.pkgManager || null,
+      reveal: !!platform.capabilities.reveal,
+    };
+  } catch {
+    return { name: platform.name, proxyControl: false, pkgManager: null, reveal: false };
+  }
 }
 
 const mgr = getTaskManager(DATA_DIR);
@@ -345,6 +363,18 @@ const server = http.createServer(async (req, res) => {
         unit = "packages";
         cmd = { type: "pnpm-install", args: [], workdir };
       } else if (kind === "winget-install") {
+        // 包管理器是平台能力，不是平台名判断（方案 §3.3 原则二/三）：
+        // 非 Windows 上 capabilities.pkgManager 为 null（或 brew/apt 等），这里直接拒绝，
+        // 并告诉调用方本平台可用的是什么。不把 winget 报成「命令退出码 -1」那种运行时错。
+        const pm = platform.capabilities.pkgManager;
+        if (pm !== "winget") {
+          return send(400, {
+            ok: false,
+            unsupported: true,
+            error: `当前平台（${platform.name}）没有 winget（可用包管理器：${pm || "无"}）。`
+              + "可用命令类型：git-clone / pnpm-install / pip-install。",
+          });
+        }
         const pkg = String(b.pkg || "").trim();
         if (!pkg) return send(400, { error: "winget-install 需要包名或 ID（pkg）" });
         if (pkg.startsWith("-")) return send(400, { error: "包名不能以 - 开头" });
@@ -479,9 +509,11 @@ const server = http.createServer(async (req, res) => {
     }
     lastReveal = { path: p, mode, at: now };
     try {
-      const { spawn } = await import("node:child_process");
-      const args = mode === "open" ? [p] : ["/select,", p];
-      spawn("explorer.exe", args, { detached: true, stdio: "ignore" }).unref();
+      // 平台层负责三件事：选对命令（explorer / open / xdg-open）、挂 'error' 监听、
+      // 不存在就提前报错。此处不再直接 spawn —— 旧写法 spawn 后没挂 error 监听，
+      // 在非 Windows 上 explorer.exe 不存在，'error' 变成未捕获异常直接把引擎带走。
+      const r = platform.reveal(p, mode);
+      if (!r.ok) return send(r.error && /不存在/.test(r.error) ? 404 : 500, { error: r.error || "定位失败" });
       log(`reveal ${mode} ${p}`);
       return send(200, { ok: true });
     } catch (e) {
@@ -521,7 +553,11 @@ const server = http.createServer(async (req, res) => {
       // proxyMode 由 config.json 归一而来（dlcore.js 读的是那个文件，不是 engine-config.json）
       const s = { ...loadCfg(), proxyMode: normalizeProxyMode(loadUserCfg().proxy) };
       s.aria2 = normalizeAria2Config(s);
-      return send(200, { ok: true, settings: s });
+      // platform 能力（2026-10-20）：UI 靠它决定哪些入口该出现。
+      // 放在 settings 回包里而不是单开一个端点：管理器每次开设置菜单只发一次请求，
+      // 再加一个请求就是多一次往返、多一个可能失败的环节。
+      // pkgManager 是实时探测（负结果 5 秒缓存），所以这里能反映「用户刚装完 winget」。
+      return send(200, { ok: true, settings: s, platform: platformInfo() });
     }
     if (req.method === "POST") {
       const b = await readBody();
@@ -550,7 +586,7 @@ const server = http.createServer(async (req, res) => {
         fs.writeFileSync(CFG_FILE, JSON.stringify(next, null, 2), "utf8");
         // 改设置即时生效：把新的并发上限与默认限速灌进任务管理器，不等下一次发起
         try { mgr.applyConfig(next); } catch (e2) { log(`applyConfig ERR ${e2?.message || e2}`); }
-        return send(200, { ok: true, settings: { ...next, aria2: normalizeAria2Config(next), proxyMode: normalizeProxyMode(loadUserCfg().proxy) } });
+        return send(200, { ok: true, settings: { ...next, aria2: normalizeAria2Config(next), proxyMode: normalizeProxyMode(loadUserCfg().proxy) }, platform: platformInfo() });
       } catch (e) { return send(500, { error: String(e?.message || e) }); }
     }
   }
@@ -580,17 +616,33 @@ const server = http.createServer(async (req, res) => {
   // ── 代理启停控制（2026-10-04）─────────────────────────────────
   // 纪律：扫描/状态只读；start/stop 需 config.json 里 proxyControl.enabled=true。
   // 「使用代理」不在这里管——那是 dlcore.resolveProxy 的事（对齐裸 curl 的隐式继承）。
+  //
+  // 平台裁剪（2026-10-20）：这整套东西的形态是 Windows 的（读注册表、扇描 .exe、
+  // tasklist/taskkill），其它平台的梯子生态（ClashX/mihomo/sing-box）差很远。
+  // capabilities.proxyControl 为 false 时一律回 200 + unsupported，不报错——
+  // UI 看到 unsupported 就不渲染入口，这比「灰掉一个永不可用的按钮」干净。
+  // 注意：这只影响「启停梯子」，不影响读系统代理（readSystemProxy 照常可用）。
+  const proxyCtlOff = () => send(200, {
+    ok: false, unsupported: true,
+    error: `当前平台（${platform.name}）不支持代理启停控制`,
+  });
+
   if (u.pathname === "/proxy-control/status" && req.method === "GET") {
+    if (!platform.capabilities.proxyControl) {
+      return send(200, { ok: true, unsupported: true, enabled: false, launcher: null });
+    }
     try { return send(200, { ok: true, ...(await getProxyControlStatus(DATA_DIR)) }); }
     catch (e) { return send(500, { error: String(e?.message || e) }); }
   }
 
   if (u.pathname === "/proxy-control/scan" && req.method === "GET") {
+    if (!platform.capabilities.proxyControl) return send(200, { ok: true, unsupported: true, candidates: [] });
     try { return send(200, { ok: true, candidates: scanCandidates({ dataDir: DATA_DIR }) }); }
     catch (e) { return send(500, { error: String(e?.message || e) }); }
   }
 
   if (u.pathname === "/proxy-control/config" && req.method === "POST") {
+    if (!platform.capabilities.proxyControl) return proxyCtlOff();
     const b = await readBody();
     try {
       const body = (b && typeof b === "object") ? b : {};
@@ -603,6 +655,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (u.pathname === "/proxy-control/verify" && req.method === "POST") {
+    if (!platform.capabilities.proxyControl) return proxyCtlOff();
     const b = await readBody();
     try {
       const body = (b && typeof b === "object") ? b : {};
@@ -612,11 +665,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (u.pathname === "/proxy-control/start" && req.method === "POST") {
+    if (!platform.capabilities.proxyControl) return proxyCtlOff();
     try { return send(200, { ...(await startProxy(DATA_DIR)) }); }
     catch (e) { return send(500, { error: String(e?.message || e) }); }
   }
 
   if (u.pathname === "/proxy-control/stop" && req.method === "POST") {
+    if (!platform.capabilities.proxyControl) return proxyCtlOff();
     try { return send(200, { ...(await stopProxy(DATA_DIR)) }); }
     catch (e) { return send(500, { error: String(e?.message || e) }); }
   }
@@ -649,13 +704,17 @@ function runCapture(bin, args, timeoutMs = 30000) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn(bin, args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+      child = spawn(bin, args, platform.spawnOpts({ stdio: ["ignore", "pipe", "pipe"] }));
     } catch (e) {
       resolve({ code: -1, out: "", err: String(e?.message || e), spawnError: e });
       return;
     }
     let out = "", errText = "";
-    const timer = setTimeout(() => { try { child.kill(); } catch { /* 已退出 */ } }, timeoutMs);
+    // 超时杀进程树：detached 下 child.kill() 只杀组长，孙进程（winget 拉起的子进程）会活下来
+    // 并継续写 stdout/stderr，导致 close 永不触发、Promise 永挂。
+    const timer = setTimeout(() => {
+      if (!platform.killTree(child.pid)) { try { child.kill(); } catch { /* 已退出 */ } }
+    }, timeoutMs);
     child.stdout.on("data", (c) => { out += c.toString("utf-8"); });
     child.stderr.on("data", (c) => { errText += c.toString("utf-8"); });
     child.on("error", (e) => { clearTimeout(timer); resolve({ code: -1, out, err: String(e?.message || e), spawnError: e }); });
