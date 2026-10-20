@@ -58,9 +58,13 @@ check("不支持时代理控制回 200 + unsupported（不报错、不 500）", 
   //   · 代理控制端点：平台没这个能力，是「本机就不支持」，回 200 + unsupported 让 UI 静静掤掉；
   //   · winget-install：是「你让我做一件这平台做不到的事」，回 400 并解释可用类型，更直白。
   // 两者都有 unsupported 字段，但状态码不同——这是故意的，不是不一致。
+  //
+  // 断言方式：不抠字面写法（proxyCtlOff 的签名改过一次），只看它肚子里是不是 send(200。
   if (!/unsupported:\s*true/.test(serverSrc)) return false;
-  const pcSend = (serverSrc.match(/proxyCtlOff\s*=\s*\(\)\s*=>\s*send\((\d+)/) || [])[1];
-  return pcSend === "200";
+  const i = serverSrc.indexOf("const proxyCtlOff");
+  if (i < 0) return false;
+  const seg = serverSrc.slice(i, i + 300);
+  return /send\(200/.test(seg) && !/send\(4\d\d/.test(seg);
 });
 check("不支持时的文案说清是平台原因（不是「功能坏了」）", () =>
   /不支持代理启停控制/.test(serverSrc));

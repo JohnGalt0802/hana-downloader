@@ -622,21 +622,23 @@ const server = http.createServer(async (req, res) => {
   // capabilities.proxyControl 为 false 时一律回 200 + unsupported，不报错——
   // UI 看到 unsupported 就不渲染入口，这比「灰掉一个永不可用的按钮」干净。
   // 注意：这只影响「启停梯子」，不影响读系统代理（readSystemProxy 照常可用）。
-  const proxyCtlOff = () => send(200, {
+  // 不支持时的回包形状：统一走这里 —— 六个端点形状一致，UI 只需要看一个字段。
+  // extra 是各端点自己的空壳字段（status 要 enabled/launcher，scan 要 candidates），
+  // 加上去是为了让消费方不用写「unsupported 时别读 xxx」这种分支。
+  const proxyCtlOff = (extra) => send(200, {
     ok: false, unsupported: true,
     error: `当前平台（${platform.name}）不支持代理启停控制`,
+    ...(extra || {}),
   });
 
   if (u.pathname === "/proxy-control/status" && req.method === "GET") {
-    if (!platform.capabilities.proxyControl) {
-      return send(200, { ok: true, unsupported: true, enabled: false, launcher: null });
-    }
+    if (!platform.capabilities.proxyControl) return proxyCtlOff({ enabled: false, launcher: null });
     try { return send(200, { ok: true, ...(await getProxyControlStatus(DATA_DIR)) }); }
     catch (e) { return send(500, { error: String(e?.message || e) }); }
   }
 
   if (u.pathname === "/proxy-control/scan" && req.method === "GET") {
-    if (!platform.capabilities.proxyControl) return send(200, { ok: true, unsupported: true, candidates: [] });
+    if (!platform.capabilities.proxyControl) return proxyCtlOff({ candidates: [] });
     try { return send(200, { ok: true, candidates: scanCandidates({ dataDir: DATA_DIR }) }); }
     catch (e) { return send(500, { error: String(e?.message || e) }); }
   }

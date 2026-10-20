@@ -336,16 +336,20 @@ if (process.platform === "win32") {
     return s === "registry" || s === "none";
   });
   // ★ 验收 3 的同一件事：本机没有 which / pgrep 时必须优雅返回空而不是崩。
-  // 不能断言"一定为空"：windows-latest runner 上 Git for Windows 会把 `which` 放上 PATH，
-  // 于是 darwin/linux.which("node") 真能拿到结果（2026-10-19 CI 实测失败）。
-  // 契约是「不抛、返回字符串、要么空要么指向真实存在的路径」，不押注机器干净。
-  check("darwin.which 在非 darwin 上：不抛，要么空要么真存在", () => {
+  //
+  // 断言只押「形状」不押「路径真的存在」，两个原因：
+  //   ① windows runner 上有 Git for Windows 的 which.exe，它输出 MSYS 风格路径
+  //      （/c/hostedtoolcache/...），Node 的 fs.existsSync 认不得也不应该认得；
+  //   ② 在 A 平台跑 B 平台的实现，拿到的东西本来就不该被当真。
+  // 真正重要的是「不抛、返回字符串、要么空要么像个绝对路径」。
+  const looksAbsolute = (s) => /^[A-Za-z]:[\\/]/.test(s) || /^[\\/]/.test(s);
+  check("darwin.which 在非 darwin 上：不抛，且要么空要么是绝对路径形状", () => {
     const r = P.darwin.which("node");
-    return isStr(r) && (r === "" || fs.existsSync(r));
+    return isStr(r) && (r === "" || looksAbsolute(r));
   });
-  check("linux.which 在非 linux 上：不抛，要么空要么真存在", () => {
+  check("linux.which 在非 linux 上：不抛，且要么空要么是绝对路径形状", () => {
     const r = P.linux.which("node");
-    return isStr(r) && (r === "" || fs.existsSync(r));
+    return isStr(r) && (r === "" || looksAbsolute(r));
   });
   check("darwin.isRunning 在非 darwin 上：布尔值，不抛", () => {
     const r = P.darwin.isRunning("node");
