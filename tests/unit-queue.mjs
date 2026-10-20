@@ -171,6 +171,65 @@ async function waitState(taskId, states, timeoutMs = 90000) {
   await sleep(200);
 }
 
+// ── 场景 6：命令型任务「启动失败」（spawn 异步 emit ENOENT）──
+// 为什么压在这里：spawn 返回 child 不等于进程起来了——bin 不在 PATH 时是**异步** emit
+// 'error'，_runCommand 里那圈 try/catch 只挡同步异常。历史上这条路径靠 'close' 的退出码
+// 收尾，文案写成「命令退出码 -4058」，看不出是「根本没起来」还是「跑失败了」。
+// 这里钉三件事：① 结算成 failed 而不是挂 running ② 文案说「无法启动」
+// ③ 终态只发一次（'error' 与 'close' 都会来，旧写法会结算两次）。
+// ④ 本进程不崩：下面每条断言能执行到，本身就是证据。
+{
+  mgr.applyConfig({ maxConcurrent: 0, speedLimit: 0 });   // 不限并发，避免排队干扰
+  const realPath = process.env.PATH;
+  const emptyPath = path.join(BASE, "empty-path");
+  fs.mkdirSync(emptyPath, { recursive: true });
+  const finals = [];
+  mgr.onFinal((t) => finals.push(t.taskId));
+
+  let t = null, s = null;
+  try {
+    // 把 PATH 指到一个空目录：git 不可解析 → spawn 异步 emit ENOENT
+    //（注意不能提前恢复 PATH：_runCommand 里 import 之后才 spawn，恢复早了就会真的去 clone）
+    process.env.PATH = emptyPath;
+    t = mgr.create({
+      url: null, fileName: "repo", kind: "command", unit: "objects",
+      cmd: { type: "git-clone", args: ["probe-never-cloned"] },
+      filePath: path.join(BASE, "never-cloned"),
+    });
+    s = await waitState(t.taskId, ["failed", "done", "canceled", "interrupted"], 15000);
+  } finally {
+    process.env.PATH = realPath;
+  }
+
+  check("启动失败: 结算为 failed（不挂 running）", s, (x) => x?.state === "failed");
+  check("启动失败: 文案含「无法启动」", s, (x) => typeof x?.error === "string" && x.error.includes("无法启动"));
+  check("启动失败: 文案带原始 ENOENT 信息", s, (x) => /ENOENT/.test(String(x?.error || "")));
+  check("启动失败: speed 归零", s, (x) => x?.speed === 0);
+  check("启动失败: 有 finishedAt / elapsed", s, (x) => typeof x.finishedAt === "number" && x.finishedAt > 0 && typeof x.elapsed === "number");
+
+  // 'close' 随后就到（win32 是 -4058），等一拍再数：终态必须仍然只有一次
+  await sleep(600);
+  check("**启动失败: 终态只发一次**（error 与 close 不会各结算一遍）",
+    finals.filter((id) => id === t.taskId).length, (n) => n === 1);
+  check("启动失败: 状态未被随后的 close 改写", mgr.snapshot(t.taskId), (x) => x.state === "failed" && x.error.includes("无法启动"));
+
+  // 重试：闸门必须复位，否则第二轮所有结算都被闸门吃掉 → 永远挂在 running。
+  // 重试时同样把 PATH 抽空：不真去跑 git，联网/磁盘都不碰，只验闸门。
+  let rr = null, s2 = null;
+  try {
+    process.env.PATH = emptyPath;   // 在 retry() 之前抽空：spawn 在 import 之后才发生，不能赌时序
+    rr = mgr.retry(t.taskId);
+    check("重试: 闸门已复位（_settled=false）", mgr.tasks.get(t.taskId)?._settled, (x) => x === false);
+    s2 = await waitState(t.taskId, ["failed", "done", "canceled", "interrupted"], 20000);
+  } finally {
+    process.env.PATH = realPath;
+  }
+  check("启动失败: 可重试", rr, (x) => x?.ok === true);
+  check("重试: 能再次落终态（闸门没被上一轮卡死）", s2, (x) => ["failed", "done", "canceled"].includes(x?.state));
+  check("重试: 第二轮也是「无法启动」（证明真的重新 spawn 了）", s2,
+    (x) => typeof x?.error === "string" && x.error.includes("无法启动"));
+}
+
 console.log(`\n=== queue: ${pass} passed, ${fail} failed ===`);
 srv.close();
 fs.rmSync(BASE, { recursive: true, force: true });

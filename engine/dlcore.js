@@ -26,7 +26,7 @@ const RESTORE_FINISHED_MAX_AGE_MS = 60 * 60 * 1000;
 const DEFAULT_MAX_CONCURRENT = 3; // 同时运行的任务数上限（0=不限）；管理器设置里可改
 
 let _instance = null;
-const MGR_VER = 31; // 每次修改管理器逻辑 +1：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished；v27=retry 以磁盘校正 received（取消后重试不再永久失败）；v28=终态记录改原子写（临时文件+fsync+rename，不再出现半截 JSON）；v29=.part 归属后端（partOwner）+ 换后端丢弃旧半成品，修「切后端续传交付带洞文件却报 done」；v30=restore 区分「aria2 实例还活着」与「实例已没」，前者恢复运行态继续跟踪，不再误报下载失败；v31=平台适配层收编：spawnOpts/killTree 成对、命令型子进程落盘 pid、restore 收孤儿命令）
+const MGR_VER = 32; // 每次修改管理器逻辑 +1（v32=命令型任务 spawn 的 'error' 按「启动失败」结算 + 结算幂等 _settled + retry 复位）：globalThis 单例按版本换新实例，绕开插件加载器的 lib 模块缓存（v21=加 forget 单条删除；v22=清死代码；v23=并发队列与重试；v24=percent 口径收口到 summary.percentOf；v25=接入 aria2 backend + task.backend；v26=restore 为 running/pending 补写 interrupted 终态 + 回收孤儿 finished；v27=retry 以磁盘校正 received（取消后重试不再永久失败）；v28=终态记录改原子写（临时文件+fsync+rename，不再出现半截 JSON）；v29=.part 归属后端（partOwner）+ 换后端丢弃旧半成品，修「切后端续传交付带洞文件却报 done」；v30=restore 区分「aria2 实例还活着」与「实例已没」，前者恢复运行态继续跟踪，不再误报下载失败；v31=平台适配层收编：spawnOpts/killTree 成对、命令型子进程落盘 pid、restore 收孤儿命令；v32=命令型任务 spawn 的 'error' 区分启动失败与运行中报错（'spawn' 事件为界）、结算幂等 _settled、retry 复位闸门）
 // v0.1.7: 下载核心支持断点续传（Range/If-Range/.part 半成品、206/200/416 分支、SHA-256 校验、失败保留 .part、重启恢复 received=statSync(.part).size）
 // v0.1.6: 下载核心支持 HTTP CONNECT 代理（环境变量/config.json proxy/Windows 系统代理），
 // 代理优先 + 失败自动降级直连；支持 3xx 与文本重定向（"Redirecting to <url>"，如 npmmirror）。
@@ -197,6 +197,8 @@ class TaskManager {
     t.startedAt = null;
     t.child = null;
     t.controller = null;
+    t._settled = false; // 上一轮的结算闸门必须复位，否则重试后终态永远不成立
+    t._spawnError = null; // 同理：上一轮的 spawn 错误不能拼进这一轮的失败文案
     t._samples = [];
     t._lastPersistAt = 0;
     t._lastProgressAt = Date.now();
@@ -269,6 +271,7 @@ class TaskManager {
       stage: null,
       note: null,
       child: null,
+      _settled: false, // 命令型任务的结算闸门（error 与 close 只能结算一次）
       partPath,
       etag: null,
       lastModified: null,
@@ -547,6 +550,7 @@ class TaskManager {
       childEnv.NO_PROXY = no; childEnv.no_proxy = no;
     }
     let child;
+    let stopProbe = null; // winget 落盘探测的停止句柄（仅 winget-install 会赋值）
     try {
       // ★ spawnOpts 与 platform.killTree 是一对，改这里之前先读 platform 层的注释与
       //   方案 §3.3 原则一。posix 下必须 detached:true，否则 killTree 的 kill(-pid) 没有
@@ -568,6 +572,39 @@ class TaskManager {
       return;
     }
     task.child = child;
+
+    // 结算闸门：同一任务只准结算一次。spawn 失败时 'error' 与 'close' **都会来**
+    //（win32 实测：先 error(ENOENT) 再 close(-4058)；posix 同理，退出码是 -ENOENT），
+    // 两处都写终态就会发两次终态、两次 finished/*.json。
+    const settle = (fn) => {
+      if (task._settled) return;
+      task._settled = true;
+      fn();
+    };
+
+    // spawn 返回 child 不等于进程起来了：ENOENT（bin 不在 PATH、cwd 不存在）是**异步**
+    // emit 'error'，下面那个 try/catch 只挡同步异常（参数类型错之类）。
+    // 「起来了没有」只有 'spawn' 事件能回答：**它没发才是启动失败**。
+    // 不能一律把 'error' 当启动失败：Node 的 'error' 还会在 kill 失败 / IPC 发消息失败时
+    // 发出，那时进程早就跑起来了，报「无法启动」会把人往 PATH 上引，实际该看退出码与输出。
+    let childSpawned = false;
+    child.on("spawn", () => { childSpawned = true; });
+    child.on("error", (e) => {
+      task._spawnError = e; // 保留：close 分支的文案里仍会引用（运行中报错就走那条）
+      if (childSpawned) return; // 起来了：交给 close 按退出码收口，不抢结算
+      settle(() => {
+        if (stopProbe) { try { stopProbe(); } catch { /* 忽略 */ } }
+        this._stopStallMonitor(task);
+        task.state = "failed";
+        task.error = "命令无法启动：" + (e?.message || String(e));
+        task.finishedAt = Date.now();
+        task.elapsed = task.finishedAt - (task.startedAt || task.finishedAt);
+        task.speed = 0;
+        this._persist();
+        this._fireFinal(task);
+      });
+    });
+
     // 落盘 pid（2026-10-20）：posix 下子进程带 detached，引擎被硬杀时它不会跟着死。
     // 不把 pid 写进 tasks.json，下次 restore 就没任何依据去收这个孤儿 ——
     // 只能眼看着一个已标「已中断」的任务在后台继续写目录。
@@ -575,7 +612,6 @@ class TaskManager {
 
     // winget 下载进度旁路探测（2026-09-18）：CLI 不给下载进度，改为观测它的落盘文件；
     // 失败静默，不影响任务本身。pip / git / pnpm 不走此路。
-    let stopProbe = null;
     if (task.cmd?.type === "winget-install") {
       try { stopProbe = startWingetProbe(task, this.dataDir, resolveProxy(this.dataDir)); } catch { /* 探测失败不影响任务 */ }
     }
@@ -618,9 +654,7 @@ class TaskManager {
     child.stdout.on("data", feed);
     child.stderr.on("data", feed);
 
-    child.on("error", (e) => { task._spawnError = e; });
-
-    child.on("close", (code) => {
+    child.on("close", (code) => settle(() => {
       if (stopProbe) { try { stopProbe(); } catch { /* 忽略 */ } }
       this._stopStallMonitor(task);
       const aborted = task.cancelRequested;
@@ -691,7 +725,7 @@ class TaskManager {
       task.speed = 0;
       this._persist();
       this._fireFinal(task);
-    });
+    }));
   }
 
   // ── 取消 ──
