@@ -3,6 +3,7 @@
 App ID：`hana-downloader` · 当前版本：**1.1.5**（2026-10-20）
 宿主基线：HanaAgent **0.978.0**（实测；0.970.9 需临时补丁才能出卡，见第七节）
 卡片尺寸：**400 × 25 px**——宽度由卡片上报自定，高度完全跟内容走（见第九节）
+运行平台：**Windows 完整支持**；macOS / Linux 已有平台适配层与能力裁剪，主链路未做真机端到端验证（见十二节）
 
 为 HanaAgent 提供**可观测下载**：任意 URL 下载、命令型安装（git clone / pnpm install /
 winget / pip）、聊天流内实时进度卡片、跨会话下载管理器。
@@ -296,8 +297,16 @@ cd <hana-downloader-app 目录>
 node tests/run-tests.mjs
 ```
 
-覆盖 130 项：输出解析器 46、winget 下载探测 10、展示层单一来源 32、
-下载内核端到端 17（含 SHA-256 校验与限速两条路）、并发队列与重试 25。
+覆盖 **25 套件 / 约 1550 项断言**，分五类：
+
+| 类 | 套件 | 验什么 |
+| --- | --- | --- |
+| 解析与展示 | `unit-parsers` / `unit-display` / `unit-cardview` / `unit-theme` | 输出解析、展示文案单一来源、卡片渲染与主题 |
+| 下载内核 | `unit-download` / `unit-queue` / `unit-probe` | 落盘完整性、SHA-256 校验、限速、并发队列与重试 |
+| 可靠性 | `unit-restore` / `unit-restore-aria2` / `unit-atomic-final` / `unit-stall` / `unit-stall-notify` / `unit-contract` | 重启恢复与终态补写、原子写、卡滞投递、契约兜底 |
+| aria2 | `unit-aria2` / `unit-aria2-cache` / `unit-aria2-config` / `unit-aria2-ui` / `unit-aria2-persist` / `unit-backend-switch` | backend 契约、探测缓存、配置归一、进度落盘、换后端 `.part` 归属 |
+| 跨平台（2026-10-20） | `unit-platform` / `unit-processtree` / `unit-capabilities` / `unit-platform-runtime` / `unit-proxy-control` | 十三组接口三平台注入、**真起父子孙三层进程验杀树**、能力裁剪（proxyControl / winget / PEP 668）、真引擎的 unsupported 形状、`/reveal` 失败不带走进程 |
+
 明细与新增约定见 `tests/README.md`。
 
 七象限投递能力测试（完成 / 取消 / 卡滞 × 未收束 / 已收束 + 卡滞恢复）需要宿主在场，
@@ -327,3 +336,32 @@ node tests/run-tests.mjs
 | 大文件下载慢得离谱（几百 KB/s） | 第四节「代理」：默认已按目标地址自动分流。若仍慢，先查 `config.json` 是不是被写成了始终走代理（`proxy` 为字符串），或直接写 `{"proxy": false}` 全直连 |
 | 改了代码没生效 | `docs/改动生效范围.md`：哪类文件要重启，先过那张表 |
 | 同步后校验报大批差异 | 行尾漂移：看仓库根 `.gitattributes` 与第 21 条 |
+| macOS / Linux 上点「打开文件夹」/「打开」没反应 | 平台层 `reveal`：linux 走 `xdg-open`（无「在目录里选中」语义，降级为打开父目录）；mac 走 `open -R` |
+| 非 Windows 上设置里找不到「代理启停」三个按钮 | **正常**：那套能力（读注册表 + 扫 .exe + tasklist/taskkill）是 Windows 专有的，`capabilities.proxyControl=false` 时入口不渲染。读系统代理照常可用 |
+| 非 Windows 上 `kind="winget-install"` 被拒 | **正常**：winget 不注册到该平台的 enum 里；报错文案会列出可用的 `git-clone / pnpm-install / pip-install` |
+| pip 报 `externally-managed-environment` | PEP 668：系统 Python 受外部管理。用 venv（`python -m venv .venv`）并把 `pythonPath` 指到它，或 `runner="uv"`。**不要** `--break-system-packages` |
+| 取消命令型任务后子进程还在跑 | 看 `platform.killTree`：posix 靠 `detached` + `kill(-pid)`（两者同文件成对）；win 靠 `taskkill /T /F`。若仍残留，看 `restore()` 日志里的 `_reapOrphanCommand` |
+
+---
+
+## 十二、跨平台支持现状（2026-10-20）
+
+引擎的平台相关代码已全部收进 `engine/platform/`（业务层 `process.platform` 归零，有断言盯着）。
+但「代码结构对」不等于「真机能跑」——本节把成色写清楚。
+
+| 能力 | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| URL 下载（含断点续传 / 校验 / 限速） | ✅ 实测 | ⚠️ 逻辑就绪，**未真机验证** | ⚠️ 同上 |
+| aria2 加速 | ✅ 实测 | ⚠️ 候选路径已给，未真机 | ⚠️ 同上 |
+| git clone / pnpm / pip | ✅ 实测 | ⚠️ 入口解析已适配 posix，未真机 | ⚠️ 同上 |
+| 打开 / 定位文件 | ✅ `explorer /select` | ✅ `open -R`（未真机） | ⚠️ `xdg-open` 打开父目录（无「选中」语义） |
+| 读系统代理 | ✅ 注册表 | ✅ `scutil --proxy`（未真机） | ✅ env + `gsettings`（未真机） |
+| 启停梯子 | ✅ | ❌ 能力关闭，入口不渲染 | ❌ 同上 |
+| winget | ✅ | ❌ 不注册 | ❌ 不注册 |
+| pip/uv | ✅ | ✅（PEP 668 提示） | ✅（PEP 668 提示） |
+
+**没验的是什么**：宿主在 mac 上用 `sandbox-exec`、linux 上用 `bubblewrap`，对引擎读写目录的限制
+可能与 Windows 的 `hana-win-sandbox.exe` 完全不同——若沙箱不允许写用户下载目录，整条落盘链路要重设。
+这一条只能真机撞。
+
+**macos-13（Intel）在 CI 上长期排不到**，`/usr/local` 那条候选路径零验证。

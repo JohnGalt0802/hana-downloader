@@ -17,6 +17,7 @@ import path from "node:path";
 import net from "node:net";
 import os from "node:os";
 import { spawn, spawnSync } from "node:child_process";
+import { platform } from "./platform/index.mjs";
 
 const AUDIT_MAX = 200;
 const SCAN_BUDGET_MS = 8000; // 扫描时间预算，防止深目录卡死
@@ -174,27 +175,12 @@ async function waitPortGone(port, totalMs = 8000, stepMs = 500) {
 }
 
 // ── 系统代理状态（只读，给状态卡展示用）────────────────────────────────────
+// 实现已收编到 platform.readSystemProxy()（win 读注册表、mac 读 scutil、linux 读
+// gsettings/env）。这里保留同名导出给 status 卡与旧调用方用，形状与旧返回（enabled/server）
+// 兼容且多一个 source，不破坏任何现有消费方。
 export function readSystemProxy() {
-  try {
-    const r1 = spawnSync(
-      "reg",
-      ["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "/v", "ProxyEnable"],
-      { encoding: "utf8", windowsHide: true, timeout: 5000 }
-    );
-    const m1 = /ProxyEnable\s+REG_DWORD\s+0x([0-9a-f]+)/i.exec(r1.stdout || "");
-    const r2 = spawnSync(
-      "reg",
-      ["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings", "/v", "ProxyServer"],
-      { encoding: "utf8", windowsHide: true, timeout: 5000 }
-    );
-    const m2 = /ProxyServer\s+REG_SZ\s+([^\r\n]+)/.exec(r2.stdout || "");
-    return {
-      enabled: m1 ? parseInt(m1[1], 16) === 1 : false,
-      server: m2 ? m2[1].trim() : "",
-    };
-  } catch {
-    return { enabled: false, server: "" };
-  }
+  const r = platform.readSystemProxy();
+  return { enabled: !!r.enabled, server: String(r.server || ""), source: String(r.source || "none") };
 }
 
 // ── 扫描（只读）：找已知梯子的可执行文件 ─────────────────────────────────────
@@ -203,6 +189,10 @@ const SKIP_DIR_RE = /^(node_modules|\.git|Windows|System32|SysWOW64|WinSxS|Insta
 // 默认扫描根：只放通用位置。机器私有的软件存放目录不写死在代码里——
 // 需要时在 config.json 的 proxyControl.scanRoots 里加（自定义目录优先扫描，
 // 时间预算内先命中）。
+//
+// 这些位置本身是 Windows 的（D:\ / Program Files / AppData），与 proxyControl 能力
+// 同时存在：能力为 false 时扫描入口根本不会出现在 UI 上。home 的子路径用 path.join，
+// 免得在 mac/linux 上测这个纯函数时拼出反斜杠混搭。
 function defaultScanRoots(home) {
   return [
     "D:\\Downloads",
@@ -290,20 +280,21 @@ function startByLauncher(L) {
   }
 }
 
-// 进程是否在跑：靠 tasklist 事实，不靠 taskkill 的输出文本
-//（中文 Windows 下 taskkill 的报错会因编码不匹配失效，2026-10-04 实测）
+// 进程是否在跑：交给 platform.isRunning（win: tasklist 事实；posix: pgrep -x）。
+// 旧实现直接 spawnSync tasklist 并匹配输出文本——中文 Windows 下编码不匹配会失效，
+// 且 posix 上恒 false（2026-10-04 / 2026-10-20 实测）。
 function isProcessRunning(name) {
-  try {
-    const r = spawnSync("tasklist", ["/FI", `IMAGENAME eq ${name}.exe`, "/NH"], { encoding: "utf8", windowsHide: true, timeout: 5000 });
-    const out = String(r.stdout || "").toLowerCase();
-    if (!out) return false;
-    return out.includes(`${name.toLowerCase()}.exe`);
-  } catch { return false; }
+  return platform.isRunning(String(name || "").replace(/\.exe$/i, ""));
 }
 
 async function stopByLauncher(L) {
   // 全套清理：GUI 与独立内核都试（实测 2026-10-04：只杀 GUI 时内核仍占端口；
   // 且内核常以管理员权限运行，普通权限杀不掉——那就如实报告，不假装成功、不自行提权）。
+  //
+  // 这里用 `taskkill /IM <name>` 而不是 platform.killTree(pid)：语义不同——
+  // 梯子内核常是**不是本进程拉起的**独立进程（Clash 服务模式、守护进程），
+  // 没有可用的 pid，只能按镜像名杀。这条路径仅在 capabilities.proxyControl 为 true
+  // （即 Windows）时可达，其它平台在 server 层已经 200+unsupported 拦掉了。
   const names = (Array.isArray(L.processNames) && L.processNames.length)
     ? L.processNames
     : [L.processName || path.basename(L.exe || "", ".exe")].filter(Boolean);
