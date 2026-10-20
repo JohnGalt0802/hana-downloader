@@ -49,6 +49,10 @@ export function getTaskManager(dataDir) {
 /** 主要供测试/重置 */
 export function _resetTaskManager() {
   _instance = null;
+  // ★ 必须一起清 globalThis（2026-10-21 复核指出）：getTaskManager 先看 globalThis，
+  //   只清 _instance 的话，下一次调用仍会拿到原来那个实例（带着旧 dataDir），
+  //   而调用方以为自己拿到了全新实例。这个不一致曾让本套件的接线检查假红两次。
+  try { delete globalThis.__dlTaskMgr; } catch { globalThis.__dlTaskMgr = undefined; }
 }
 
 class TaskManager {
@@ -573,6 +577,12 @@ class TaskManager {
     }
     task.child = child;
 
+    // 启动指纹只算一次，缓到任务上（2026-10-21 复核指出）：指纹对一个进程是常量，
+    // 每次 _persist 重算纯属浪费 —— 而 _persist 是全局的，只要有 URL 任务在跑
+    // （aria2 后端每 ~1.5s 调一次），就会把所有 command 任务重新 map 一遍。
+    // 放在这里算还能让 Windows 那个 170~350ms 的代价只付一次（用户主动发起的安装上）。
+    try { task._childStart = platform.processStartOf(child.pid) || null; } catch { task._childStart = null; }
+
     // 结算闸门：同一任务只准结算一次。spawn 失败时 'error' 与 'close' **都会来**
     //（win32 实测：先 error(ENOENT) 再 close(-4058)；posix 同理，退出码是 -ENOENT），
     // 两处都写终态就会发两次终态、两次 finished/*.json。
@@ -920,29 +930,49 @@ class TaskManager {
    * 不核名就杀，是拿用户的系统去赌运气。
    * 为何要用 treeNames 而不是 processNameOf：detached 的子进程会 spawn 出自己的孙子进程，
    * 真正的写入者（git-upload-pack / index-pack、uv 拉起的 python）都是孙子；
-   * 只看组长名字在「组长是 sh / bash 包装」的情形下会核不上。
+   * 只看组长名字在「组长已死」的情形下核不上。
+   *
+   * ★ shell 不得单独构成理由（2026-10-21 复核实测后收紧）：
+   *   我最初把 "sh" / "bash" 加进期望集合，理由是「组长可能是个 sh 包装」。
+   *   复核指出这个理由不成立，而且危险：
+   *     · 四条链路全是直接 spawn（git / node / winget / python|uv），全仓 shell:true 零处，
+   *       组长本来就不是 sh；真实树里 sh 只是中间层（git → sh → git-upload-pack）。
+   *     · 而 shell 恰恰是桌面上最常见的**组长**：终端作业、setsid 服务、login shell，
+   *       pgid 都等于自己的 pid。把 sh/bash 算作合法身份，等于把「任何 shell 组」都当孤儿。
+   *   实测：一个无关的 bash 组（treeNames = ["bash","sleep"]）配上 pnpm-install，
+   *   _reapOrphanCommand 返回 true 且整组被打掉；纯 sh 组配 pip-install 同理。
+   *   所以 shell 只作为**旁证**：树里得有真正干活的镜像名，shell 本身不算数。
    *
    * @private
    */
-  _reapOrphanCommand(pid, cmdType) {
+  _reapOrphanCommand(pid, cmdType, recordedStart) {
     const n = Number(pid);
     if (!Number.isInteger(n) || n <= 0) return false;
     try {
-      // ★ 探「树」而不是「组长」——与下面 killTree 杀的对象保持一致。
+      // ★ 探「树」而不是「组长」——与下面 treeKill 杀的对象保持一致。
       if (!platform.treeAlive(n)) return false;
-      // 期望的镜像名：git / node（pnpm 走 process.execPath）/ winget / python|uv
+      // ★ 启动指纹先过一道（2026-10-21 复核建议的根治做法）：
+      //   名字会被 pid 复用顶替（bash 尤其），启动时间不会。两边都有值且对不上
+      //   → 这个 pid 已经属于别人了，直接放弃。任一边拿不到就不拦（宁可保留旧行为）。
+      if (recordedStart) {
+        const nowStart = platform.processStartOf(n);
+        if (nowStart && nowStart !== recordedStart) return false;
+      }
+      // 期望的镜像名：git / node（pnpm 走 process.execPath）/ winget / python|uv。
+      // ★ 不含 sh / bash：见上面那条注释，shell 是最常见的组长，认它等于放宽到「任何 shell 组」。
+      //   dash / zsh 同理不列 —— 名字硬编码这条路两头都不稳，宁漏勿错。
       const expect = cmdType === "git-clone" ? ["git"]
-        : cmdType === "pnpm-install" ? ["node", "npm", "pnpm", "sh", "bash"]
+        : cmdType === "pnpm-install" ? ["node", "npm", "pnpm"]
           : cmdType === "winget-install" ? ["winget"]
-            : ["python", "python3", "py", "uv", "sh", "bash"];
-      // 树里任何一个名字对得上就算我们的 —— 组长可能已死，也可能是个 sh 包装。
+            : ["python", "python3", "py", "uv"];
       const names = platform.treeNames(n);
       // 拿不到任何进程名：宁可不动。误杀的代价（用户别的程序被干掉）远大于漏杀（一个后台进程多活一阵）。
       if (!names.length) return false;
       if (!names.some((nm) => expect.includes(nm))) return false;
-      const killed = platform.killTree(n);
-      if (!killed) { try { process.kill(-n, "SIGTERM"); } catch { /* 已退出 */ } }
-      return true;
+      // ★ 用 treeKill 而不是 killTree：两者在「pid 不是组长」时分叉。
+      //   killTree 恒 kill(-pid)，对非组长 pid 是别人的组（盲杀）或 ESRCH（谎报成功）。
+      const killed = platform.treeKill(n);
+      return killed;
     } catch { return false; }
   }
 
@@ -966,7 +996,8 @@ class TaskManager {
           // 孤儿命令收尾（2026-10-20）：posix 下命令型子进程带 detached，引擎被硬杀
           // 时它不会跟着死。若 pid 还在且确实是这条命令起的子进程，先杀掉再清理。
           // 不杀就重启：uv/pip 会在后台继续写同一个目录，用户看到「已中断」+ 磁盘一直在变。
-          this._reapOrphanCommand(m.childPid, m.cmd?.type);
+          // 第三个参数是启动指纹：pid 被复用后名字可能恰好对得上，指纹不会（2026-10-21）。
+          this._reapOrphanCommand(m.childPid, m.cmd?.type, m.childStart);
           // 命令型：git-clone 中断删半成品目录；pnpm-install 保留 node_modules 半成品
           if (m.cmd.type === "git-clone" && m.filePath && fs.existsSync(m.filePath)) {
             try { fs.rmSync(m.filePath, { recursive: true, force: true }); } catch { /* 忽略清理失败 */ }
@@ -1212,6 +1243,15 @@ class TaskManager {
           // 而 App 侧已经把它标成「已中断」。落盘 pid 是让下一次 restore 能把它们收掉的
           // 唯一依据（没有 pid 就只能眼睁睁看着）。只在 running 时写，终态时清。
           childPid: (t.kind === "command" && t.state === "running" && t.child && t.child.pid) ? t.child.pid : null,
+          // 子进程启动指纹（2026-10-21）：pid 会被复用，名字会被顶替，启动时间不会。
+          // ★ 读缓存，不重算：指纹是常量，而 _persist 会被 aria2 的周期落盘带得很频。
+          // ★ 挂在 task 上（_childStart），**不是**挂在 child 对象上 —— child 是 ChildProcess，
+          //   不是我们自己造的对象；把字段写进去要能读得回来，两端必须是同一个位置。
+          //   （测试 F 就是在这里抽到过一个真 bug：写入端写 task._childStart、读取端读
+          //    t.child._childStart，落盘永远是 null。这种错只有端到端接线断言能抓到。）
+          // 旧记录没有这个字段 → 读到 undefined → 不核指纹、按旧行为走（升级后第一批如此）。
+          childStart: (t.kind === "command" && t.state === "running" && t.child && t._childStart)
+            ? t._childStart : null,
         })),
       };
       fs.mkdirSync(this.dataDir, { recursive: true });

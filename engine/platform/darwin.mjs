@@ -272,6 +272,44 @@ function pgidOf(pid) {
   } catch { return -1; }
 }
 
+// 升级探活判据：5 秒后该不该发 SIGKILL（抽出来是为了能验，不让它藏在闭包里）。
+// 三种情形：进程已死→不升级；没有记录指纹→保守升级；指纹变了→**绝不升级**。
+// 「指纹变了」这条自然条件下极难触发（要 pid_max 次 fork），但复核用 ns_last_pid
+// 强制抢号时真的打死了一个无关进程。难触发但后果重的分支必须能单独验。
+export function escalationAllowed(pid, startBefore) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  if (!pidAlive(n)) return false;
+  if (!startBefore) return true;
+  return processStartOf(n) === startBefore;
+}
+
+// ── ⑧-c 杀进程树（treeAlive 的对应动作，必须与它同口径）─────────────────────
+// 为什么不直接用 killTree：killTree 恒是 kill(-pid)，只在 pid 是**组长**时才对得上
+// 「我们的那个组」。pid 活着但不是组长时，-pid 是**别人的组**，盲杀就是误杀。
+// 这里按与 treeAlive 完全相同的分支选动作，两者永远指向同一个对象。
+export function treeKill(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  if (pidAlive(n)) {
+    const pg = pgidOf(n);
+    if (pg > 0 && pg !== n) {
+      // 不是组长：只杀自己。不发 -n，那是父亲那一组。
+      // ★ 升级探活比对启动指纹，不能只看进程是否存在 —— 5 秒窗口里号可能被抢，
+      //   那时会打死无关进程（2026-10-21 复核在 Linux 上强制复现过）。
+      const startBefore = processStartOf(n);
+      try { process.kill(n, "SIGTERM"); } catch { return false; }
+      scheduleEscalation(
+        () => escalationAllowed(n, startBefore),
+        () => { process.kill(n, "SIGKILL"); },
+        KILL_TREE_ESCALATE_MS,
+      );
+      return true;
+    }
+  }
+  return killTree(n);
+}
+
 // pid 对应的命令名（basename，小写）。拿不到给 ""。
 // 用途：restore 收孤儿命令时先核名，避开 PID 复用导致的误杀。
 export function processNameOf(pid) {
@@ -284,6 +322,25 @@ export function processNameOf(pid) {
     if (!line) return "";
     // comm 给的是裸名（node / git / uv），但某些平台会给完整路径 —— 统一取 basename
     return line.split("/").pop().trim().toLowerCase();
+  } catch { return ""; }
+}
+
+// ── ⑧-d 进程启动指纹（PID 复用的真防线）─────────────────────────────────────
+// 为什么要它：所有「名字对得上就杀」的核名法都有同一个漏洞 —— pid 被复用后，
+// 新进程可能恰好也叫 git / node / python（尤其 bash，桌面上遍地都是）。
+// 而「组存活期间 pgid 不可复用」这条在 Linux 上验过，**macOS 上没有依据**。
+// 启动时间是一对 (pid, start) 里唯一不会被复用继承的一半，比名字硬得多。
+//
+// macOS 读 `ps -o lstart=`（BSD 手册页有关键字 `lstart`：``start time of the process``），
+// 拿到的是人读时间串（如 "Tue Oct 21 03:07:26 2026"），做指纹足够。
+// 拿不到给 ""（视为「没有指纹」，调用方不得据此拒绝）。
+export function processStartOf(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return "";
+  try {
+    const r = spawnSync("ps", ["-p", String(n), "-o", "lstart="], { encoding: "utf8", timeout: 5000 });
+    if (r.error || r.status !== 0) return "";
+    return String(r.stdout || "").trim().split(/\r?\n/)[0] || "";
   } catch { return ""; }
 }
 

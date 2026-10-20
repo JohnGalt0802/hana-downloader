@@ -33,6 +33,9 @@ const METHODS = [
   "processNameOf",// ⑧ → pid → 进程名（拿不到给 ""）
   "treeAlive",    // ⑧-b → pid → boolean（**进程树**探活，killTree 的对应口径）
   "treeNames",    // ⑧-b → pid → 树内进程名数组（收孤儿的核名依据）
+  "treeKill",     // ⑧-c → pid → boolean（杀 treeAlive 探到的那棵树，与它同口径）
+  "escalationAllowed", // ⑧-c → (pid, 指纹) → 5 秒后该不该升级 SIGKILL
+  "processStartOf", // ⑧-d → pid → 启动指纹字符串（PID 复用的真防线；拿不到给 ""）
   "normalizePath",// ⑩ path → 比较键
 ];
 

@@ -254,7 +254,7 @@ export function processNameOf(pid) {
 
 // ── ⑧-b 进程树探活（killTree 的对应探活，必须成对看）─────────────────────────
 // Windows 没有进程组：killTree 走 `taskkill /T`，杀的是**进程树关系**（父 pid 反查子进程）。
-// 与 posix 的差别：父进程一死，Windows 上的树关系就断了（子进程被重挂到别的父上），
+// 与 posix 的差别：父进程一死，进程树关系就断了（子进程被重挂到别的父上），
 // 所以「父死子活」这个现场拿不到可靠的树口径，退化为看父进程本身。
 // 这不是像 posix 那样的结构错 —— 在 Windows 上「父已死那么 `taskkill /T <pid>` 也没东西可杀」
 // 本就是真实情况，而 posix 上 kill(-pid) 有东西可杀。见 treeNames 的同名注释。
@@ -266,6 +266,48 @@ export function treeAlive(pid) {
 export function treeNames(pid) {
   const one = processNameOf(pid);
   return one ? [one] : [];
+}
+
+// ── ⑧-c 杀进程树（treeAlive 的对应动作，必须与它同口径）─────────────────────
+// Windows 上树就是「这个进程 + 它的子树」，正好就是 killTree 的语义（taskkill /T），
+// 不存在 posix 那种「pid 不是组长时 -pid 指向别人的组」的歧义，所以直接转交。
+export function treeKill(pid) {
+  return killTree(pid);
+}
+
+// 升级探活判据（与 posix 同形状，保持三平台接口一致）。
+// Windows 上 killTree 一步到位（taskkill /T /F），没有 SIGTERM→SIGKILL 的升级窗口，
+// 所以这个函数在这里只用来说明语义，不被 treeKill 调用。
+export function escalationAllowed(pid, _startBefore) {
+  return pidAlive(pid);
+}
+
+// ── ⑧-d 进程启动指纹（PID 复用的真防线）─────────────────────────────────────
+//
+// ★ 现状：Windows 上**没有这条防线**。写清楚，不要读成「不需要」：
+//
+//   · 树语义那部分退化是对的：Windows 没有进程组，killTree 走 taskkill /T 的树关系，
+//     父进程一死关系就断，不存在 posix 那种「组长已死、组员还在」的窗口。
+//   · 但 pid 复用跟进程组毫无关系。Windows 上真实的误杀场景是：
+//     tasks.json 里存着 childPid，引擎死了几小时，那个号被另一个 node.exe 拿走，
+//     restore 时 treeAlive=true、treeNames=["node"]、期望集合里有 node，
+//     taskkill /T /F 连它的子树一起打掉 —— **比 posix 还狠**。
+//   · 而 Windows 的 pid 复用极快：本机实测 400 次分配里 306 个不同 pid，重复 94 次，
+//     同一个号隔 113 次分配就回来了。引擎停机按小时算，这是几分钟的事。
+//
+// 为什么不补（两个都是实测数字，不是估）：
+//   · wmic 在新 Windows 已移除（本机实测不存在）；
+//   · Get-CimInstance 347 ms、Get-Process StartTime 227 ms，而 PowerShell 空转本身 172 ms 是地板；
+//   · 而这条路径每次冷启动 PowerShell 一次，只为拿一个时间戳。
+//
+// 将来的出路（按代价从低到高）：
+//   ① 不比字符串，比时间：_persist 已存 startedAt，restore 时取当前进程启动时刻转 epoch，
+//      「它比我记录的任务开始时间晚很多」就判复用。只需 restore 时调一次。
+//   ② 找不靠外部进程的做法（如 NtQueryInformationProcess 经 node-ffi）。
+//
+// 在那之前，Windows 上的安全阀只剩镜像名一层，已知道会误杀同名进程。
+export function processStartOf(pid) {
+  return "";
 }
 
 // ── ⑩ 路径规范化 ────────────────────────────────────────────────────────────

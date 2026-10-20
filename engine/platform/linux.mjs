@@ -314,6 +314,60 @@ function pgidOf(pid) {
   } catch { return -1; }
 }
 
+// 升级探活判据：5 秒后该不该发 SIGKILL（抽出来是为了能验证，不让它藏在闭包里）。
+//
+// 三种情形：
+//   · 进程已经死了 → 不该升级（已经没事可做）
+//   · 拿不到记录时的指纹 → 保守升级（与旧行为一致，不比指纹）
+//   · 指纹变了 → **绝不升级**：这个号已经不属于刚才那个进程了
+//
+// 为什么要单独验「指纹变了就不升级」：自然条件下 pid 复用到同一个号要 pid_max 次 fork
+// （本机 4194304），几乎不可能发生，所以端到端造不出来。但复核用 /proc/sys/kernel/ns_last_pid
+// 强制抢号时真的打死了一个无关进程 —— 机制是真的，只是难触发。这种「难触发但后果很重」
+// 的分支必须能单独验，否则回归了没人知道。
+export function escalationAllowed(pid, startBefore) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  if (!pidAlive(n)) return false;
+  if (!startBefore) return true;
+  return processStartOf(n) === startBefore;
+}
+
+// ── ⑧-c 杀进程树（treeAlive 的对应动作，必须与它同口径）─────────────────────
+// 为什么不直接用 killTree：killTree 恒是 kill(-pid)，只在 pid 是**组长**时才对得上
+// 「我们的那个组」。pid 活着但不是组长时，-pid 是**别人的组**（父进程的），盲杀就是误杀。
+// 2026-10-21 复核造现场实测过：把非组长的子进程地址交给收尾函数，它调用 killTree
+// 拿不到任何效果（ESRCH），却返回 true —— 谎报收掉了。
+// 这里按与 treeAlive 完全相同的分支选动作，两者永远指向同一个对象：
+//   · pid 活着且 pgid ≠ pid → 不是组长，只杀它自己（SIGTERM → 升级 SIGKILL）
+//   · pid 是组长，或 pid 已死（拿不到 pgid）→ 交给 killTree 杀整组
+export function treeKill(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  if (pidAlive(n)) {
+    const pg = pgidOf(n);
+    if (pg > 0 && pg !== n) {
+      // 不是组长：只杀自己。不发 -n，那是父亲那一组。
+      //
+      // ★ 升级探活要比对**启动指纹**，不能只看 process.kill(n,0)（2026-10-21 复核发现）：
+      //   目标在 SIGTERM 后 300ms 就死了，那个号可能在 5 秒窗口内被别的进程拿走。
+      //   那时 `kill(n,0)` 会成功，定时器就会对**无关进程**发 SIGKILL。
+      //   复核用强制抢号实际复现了这一条（无关进程被打死）。
+      //   killTree 的组版本要等「同号的新进程组出现」才误伤，单 pid 版本只要「同号被复用」
+      //   就夠 —— 门槛低一个量级，所以这一道必须有。
+      const startBefore = processStartOf(n);
+      try { process.kill(n, "SIGTERM"); } catch { return false; }
+      scheduleEscalation(
+        () => escalationAllowed(n, startBefore),
+        () => { process.kill(n, "SIGKILL"); },
+        KILL_TREE_ESCALATE_MS,
+      );
+      return true;
+    }
+  }
+  return killTree(n);
+}
+
 // pid 对应的命令名（basename，小写）。拿不到给 ""。
 // 用途：restore 收孤儿命令时先核名，避开 PID 复用导致的误杀。
 export function processNameOf(pid) {
@@ -325,6 +379,26 @@ export function processNameOf(pid) {
     const line = String(r.stdout || "").trim().split(/\r?\n/)[0] || "";
     if (!line) return "";
     return line.split("/").pop().trim().toLowerCase();
+  } catch { return ""; }
+}
+
+// ── ⑧-d 进程启动指纹（PID 复用的真防线）─────────────────────────────────────
+// 为什么要它：所有「名字对得上就杀」的核名法都有同一个漏洞 —— pid 被复用后，
+// 新进程可能恰好也叫 git / node / python（尤其 bash，桌面上遍地都是）。
+// 而「组存活期间 pgid 不可复用」这条在 Linux 上验过，**macOS 上没有依据**。
+// 启动时间是一对 (pid, start) 里唯一不会被复用继承的一半，比名字硬得多。
+// 读 /proc/<pid>/stat 第 22 字段（内核 jiffies），纯文件读，不起进程。
+// 拿不到给 ""（视为「没有指纹」，调用方不得据此拒绝）。
+export function processStartOf(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return "";
+  try {
+    const raw = fs.readFileSync(`/proc/${n}/stat`, "utf-8");
+    // comm 可含空格与括号，所以从最后一个 ')' 之后开始切，避免列错位
+    const close = raw.lastIndexOf(")");
+    if (close < 0) return "";
+    const fields = raw.slice(close + 2).split(" ");
+    return fields[19] || "";
   } catch { return ""; }
 }
 
