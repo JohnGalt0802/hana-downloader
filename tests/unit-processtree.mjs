@@ -83,6 +83,18 @@ console.log("\n── 杀进程树（真起进程，含孙子）──");
 {
   const p = spawn(process.execPath, [PARENT, CHILD, HEARTBEAT], platform.spawnOpts({ stdio: "ignore" }));
   await sleep(900);
+
+  // detached 的**直接证据**：posix 下子进程必须成为进程组组长（pgid == pid）。
+  // 这条比「心跳停了」更直接——心跳停只说明孙进程最后死了，
+  // 而 pgid == pid 说明 kill(-pid) 要杀的那个进程组从一开始就存在。
+  // 旧缺陷（dlcore.js:550 缺 detached）恰恰没有这个前提。
+  // win32 没有进程组概念（taskkill /T 靠进程树关系），跳过。
+  if (platform.name !== "win32") {
+    const r = spawnSync("ps", ["-o", "pgid=", "-p", String(p.pid)], { encoding: "utf8" });
+    const pgid = Number(String(r.stdout || "").trim()) || -1;
+    check(`posix: 子进程是进程组组长（pgid ${pgid} === pid ${p.pid}）`, () => pgid === p.pid);
+  }
+
   const grewBefore = hbSize();
   await sleep(500);
   check("心跳确实在增长（证明孙子进程活着）", () => hbSize() > grewBefore);
