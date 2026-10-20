@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { createPlatform, platform } from "../engine/platform/index.mjs";
 import * as darwinImpl from "../engine/platform/darwin.mjs";
 import * as linuxImpl from "../engine/platform/linux.mjs";
+import * as whichCore from "../engine/platform/which-core.mjs";
 
 let pass = 0, fail = 0, skip = 0;
 function check(name, fn) {
@@ -96,6 +97,42 @@ for (const n of PLATFORMS) {
     return isStr(r) && r === "";
   });
 
+  // ── ① 补充（2026-10-21，采纳 PR #1 的两条实测结论）：数组语义 + 兜底扫描 ──
+  check(`${n}.which: 数组[不存在, 存在] → 与单名同结果`, () =>
+    p.which(["hd_nonexistent_aaa", "node"]) === p.which("node"));
+  check(`${n}.which: 数组[存在, 存在] → 取第一个命中的`, () => {
+    const single = p.which("node");
+    if (!single) return true; // 非本平台实例解不到 node 时无从比较（形状断言在上方）
+    return p.which(["node", "where.exe"]) === p.which("node");
+  });
+  check(`${n}.which: 单元素数组等价于单名字`, () => p.which(["node"]) === p.which("node"));
+  check(`${n}.which: 空数组 → ""`, () => p.which([]) === "");
+  check(`${n}.which: 数组混入非字符串 → ""（整条作废，不静默跳过）`, () =>
+    p.which(["node", 123]) === "" && p.which([null]) === "" && p.which(["node", {}]) === "");
+  check(`${n}.which: 数组含空串/纯空格 → ""`, () => p.which(["node", "  "]) === "" && p.which([""]) === "");
+  check(`${n}.which: 非字符串非数组入参 → "" 不抛`, () => {
+    for (const bad of [123, {}, true, false, () => {}, Symbol("x")]) {
+      if (p.which(bad) !== "") return false;
+    }
+    return true;
+  });
+  // 真实的「兜底扫描」证据：临时目录填进 PATH，第一级（which/where）拿不到时靠目录扫描找到。
+  check(`${n}.which: 第一级拿不到时靠目录扫描找到（PATH 注入 + 真实 existsSync）`, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hd-which-"));
+    const saved = process.env.PATH;
+    try {
+      // 不带后缀与带 .exe 各写一份：posix 认前者，win32 靠 PATHEXT 认后者
+      fs.writeFileSync(path.join(dir, "hd_fake_cmd_xyz"), "");
+      fs.writeFileSync(path.join(dir, "hd_fake_cmd_xyz.exe"), "");
+      process.env.PATH = dir;
+      const r = p.which("hd_fake_cmd_xyz");
+      return r.length > 0 && path.dirname(r) === dir;
+    } finally {
+      if (saved === undefined) delete process.env.PATH; else process.env.PATH = saved;
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    }
+  });
+
   // ── ② exe：返回值类型与「不加后缀」的共性 ──
   check(`${n}.exe: 返回字符串`, () => isStr(p.exe("a")) && isStr(p.exe("")));
   check(`${n}.exe: 不改动路径分隔符`, () => p.exe("dir/a").includes("dir/a"));
@@ -123,6 +160,10 @@ for (const n of PLATFORMS) {
     return true;
   });
   check(`${n}.killTree: 返回值严格是布尔`, () => typeof p.killTree(0) === "boolean");
+  check(`${n}.killTree: 同步返回布尔（不在内部 await）`, () => {
+    const r = p.killTree(2147483647);
+    return typeof r === "boolean" && !(r && typeof r.then === "function");
+  });
 
   // ── ⑤ isRunning：不认识的名字 → false，不抛 ──
   check(`${n}.isRunning: 不存在的进程 → false`, () => p.isRunning("这个东西不存在") === false);
@@ -514,6 +555,152 @@ for (const f of ["darwin.mjs", "linux.mjs"]) {
     return !src.includes("尚未实现");
   });
 }
+
+// ══ 六、which-core 纯函数 + killTree 升级机制（2026-10-21 新增）═══════════════
+
+// ── toNameList：数组语义与非法输入（这是 which 多名字的唯一入口）──
+check("toNameList: 字符串 → 单元素数组（trim）", () =>
+  JSON.stringify(whichCore.toNameList("  node ")) === JSON.stringify(["node"]));
+check("toNameList: 字符串数组原序保留", () =>
+  JSON.stringify(whichCore.toNameList(["python3", "python"])) === JSON.stringify(["python3", "python"]));
+check("toNameList: 空串/纯空格 → 空数组", () =>
+  whichCore.toNameList("").length === 0 && whichCore.toNameList("   ").length === 0 && whichCore.toNameList([]).length === 0);
+check("toNameList: 非字符串非数组 → 空数组不抛", () => {
+  for (const bad of [null, undefined, 1, {}, true, () => {}]) {
+    if (whichCore.toNameList(bad).length !== 0) return false;
+  }
+  return true;
+});
+check("toNameList: 数组混入非字符串/空串 → 整条作废（不是跳过那一项）", () =>
+  whichCore.toNameList(["node", null]).length === 0
+  && whichCore.toNameList(["node", 5]).length === 0
+  && whichCore.toNameList(["node", ""]).length === 0);
+check("toNameList: 不修改入参数组", () => {
+  const arr = [" a ", "b"];
+  whichCore.toNameList(arr);
+  return JSON.stringify(arr) === JSON.stringify([" a ", "b"]);
+});
+
+// ── firstLine：不看退出码，只挑第一个 accept 通过的行 ──
+check("firstLine: 跳过空行，取第一个非空行", () =>
+  whichCore.firstLine("\r\n  /usr/bin/node \r\n/opt/homebrew/bin/node\r\n", () => true) === "/usr/bin/node");
+check("firstLine: accept 否掉的行被跳过，取下一个", () =>
+  whichCore.firstLine("/a\n/b\n/c", (p) => p !== "/a") === "/b");
+check("firstLine: 都不通过 → 空串", () => whichCore.firstLine("/a\n/b", () => false) === "");
+check("firstLine: accept 抛异常不传染（当否决处理）", () =>
+  whichCore.firstLine("/a\n/b", (p) => { if (p === "/a") throw new Error("x"); return true; }) === "/b");
+check("firstLine: null/undefined/空串 → 空串不抛", () =>
+  whichCore.firstLine(null, () => true) === "" && whichCore.firstLine(undefined, () => true) === ""
+  && whichCore.firstLine("", () => true) === "");
+
+// ── scanDirs：名字 × 目录 × 后缀，按名字优先的顺序找 ──
+check("scanDirs: 名字优先于目录（第一个名字的后一个目录胜过第二个名字的前一个目录）", () => {
+  // 用 path.join 造期望值：scanDirs 内部就是 path.join，Windows 上会变成反斜杠
+  const P1 = path.join("/d1", "b"), P2 = path.join("/d2", "a");
+  const fsx = new Set([P1, P2]);
+  const r = whichCore.scanDirs(["a", "b"], ["/d1", "/d2"], [""], (p) => fsx.has(p));
+  return r === P2;
+});
+check("scanDirs: 同名字依目录顺序取第一个存在的", () => {
+  const hit = path.join("/d2", "a");
+  const fsx = new Set([hit]);
+  return whichCore.scanDirs(["a"], ["/d1", "/d2"], [""], (p) => fsx.has(p)) === hit;
+});
+check("scanDirs: 后缀依次尝试（win32 的 .exe / .cmd / .bat / 空）", () => {
+  const fsx = new Set(["C:\\w\\a.cmd"]);
+  return whichCore.scanDirs(["a"], ["C:\\w"], [".exe", ".cmd", ""], (p) => fsx.has(p)) === "C:\\w\\a.cmd";
+});
+check("scanDirs: 全不命中 → 空串，accept 抛也不传染", () =>
+  whichCore.scanDirs(["a"], ["/d1"], [""], () => { throw new Error("x"); }) === "");
+check("scanDirs: 空目录/空名字 → 空串不抛", () =>
+  whichCore.scanDirs([], ["/d"], [""], () => true) === ""
+  && whichCore.scanDirs(["a"], [""], [""], () => true) === "");
+
+// ── envPathDirs：PATH 拆分与空段滤除 ──
+check("envPathDirs: 按平台分隔符拆分并丢掉空段", () => {
+  const saved = process.env.PATH;
+  try {
+    process.env.PATH = ["", "/a", "  ", "/b", ""].join(path.delimiter);
+    const r = whichCore.envPathDirs();
+    return JSON.stringify(r) === JSON.stringify(["/a", "/b"]);
+  } finally {
+    if (saved === undefined) delete process.env.PATH; else process.env.PATH = saved;
+  }
+});
+check("envPathDirs: PATH 缺失 → 空数组不抛", () => {
+  const saved = process.env.PATH;
+  try {
+    delete process.env.PATH;
+    return whichCore.envPathDirs().length === 0;
+  } finally {
+    if (saved !== undefined) process.env.PATH = saved;
+  }
+});
+
+// ── lstatsFile：win32 用 lstat 而非 existsSync（winget 别名桩的存在性判定）──
+check("lstatsFile: 真实存在的文件 → true", () => whichCore.lstatsFile(process.execPath) === true);
+check("lstatsFile: 不存在的路径 → false 不抛", () =>
+  whichCore.lstatsFile(path.join(os.tmpdir(), "hd-nope-9f3a-2b1c")) === false);
+
+// ── scheduleEscalation：SIGKILL 升级的三条关键事实 ──
+// 本机是 Windows，跑不到真的进程组 kill；所以把「延时到了才探活、探活为真才发、定时器 unref」
+// 全部抽成了可注入的纯函数，在这里直接验。
+{
+  const seen = { probed: 0, killed: 0 };
+  const t = whichCore.scheduleEscalation(
+    () => { seen.probed += 1; return true; },
+    () => { seen.killed += 1; },
+    20,
+  );
+  check("scheduleEscalation: 返回定时器对象", () => t && typeof t === "object");
+  check("scheduleEscalation: 定时器已 unref（不阻止进程退出，否则会挂住引擎）",
+    () => typeof t.hasRef === "function" && t.hasRef() === false);
+  check("scheduleEscalation: 立即返回，不阻塞调用方（还没到点不发）",
+    () => seen.probed === 0 && seen.killed === 0);
+  await new Promise((r) => setTimeout(r, 80));
+  check("scheduleEscalation: 到点探活为真 → 发一次 SIGKILL", () => seen.probed === 1 && seen.killed === 1);
+}
+{
+  const seen = { killed: 0 };
+  whichCore.scheduleEscalation(() => false, () => { seen.killed += 1; }, 10);
+  await new Promise((r) => setTimeout(r, 60));
+  check("scheduleEscalation: 探活为假（组已解散）→ 不发 SIGKILL", () => seen.killed === 0);
+}
+{
+  const seen = { killed: 0 };
+  whichCore.scheduleEscalation(() => { throw new Error("ESRCH"); }, () => { seen.killed += 1; }, 10);
+  await new Promise((r) => setTimeout(r, 60));
+  check("scheduleEscalation: 探活抛异常 → 不发、不外泄（吞掉）", () => seen.killed === 0);
+}
+check("scheduleEscalation: sendKill 抛异常不外泄", () => {
+  whichCore.scheduleEscalation(() => true, () => { throw new Error("EPERM"); }, 0);
+  return true;
+});
+
+// ── 源码级：升级真的接在 killTree 里，且 unref 了；win32 保持原样 ──
+for (const f of ["darwin.mjs", "linux.mjs"]) {
+  check(`${f}: killTree 里接入了 SIGKILL 升级（scheduleEscalation）`, () => {
+    const src = fs.readFileSync(path.join(here, "..", "engine", "platform", f), "utf8");
+    const i = src.indexOf("export function killTree");
+    const seg = src.slice(i, src.indexOf("\n}\n", i) + 3);
+    return /SIGKILL/.test(seg) && /scheduleEscalation\(/.test(seg) && /return true/.test(seg);
+  });
+  check(`${f}: killTree 里没有 await（必须同步返回）`, () => {
+    const src = fs.readFileSync(path.join(here, "..", "engine", "platform", f), "utf8");
+    const i = src.indexOf("export function killTree");
+    return !/await/.test(src.slice(i, src.indexOf("\n}\n", i) + 3));
+  });
+  check(`${f}: 升级窗口常量是 5000ms`, () => {
+    const src = fs.readFileSync(path.join(here, "..", "engine", "platform", f), "utf8");
+    return /KILL_TREE_ESCALATE_MS\s*=\s*5000/.test(src);
+  });
+}
+check("win32.mjs: killTree 保持 taskkill /T /F（不搞信号升级）", () => {
+  const src = fs.readFileSync(path.join(here, "..", "engine", "platform", "win32.mjs"), "utf8");
+  const i = src.indexOf("export function killTree");
+  const seg = src.slice(i, src.indexOf("\n}\n", i) + 3);
+  return /taskkill/.test(seg) && /\/T/.test(seg) && /\/F/.test(seg) && !/SIGKILL/.test(seg);
+});
 
 console.log(`\nunit-platform: ${pass} 通过 / ${fail} 失败${skip ? ` / ${skip} 跳过` : ""}`);
 process.exit(fail ? 1 : 0);

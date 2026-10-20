@@ -16,26 +16,45 @@
 //   **真机（macOS）行为未验证**。改动前先在真机上跑一遍 which/pgrep/scutil/open。
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { toNameList, envPathDirs, firstLine, scanDirs, existsFile, scheduleEscalation } from "./which-core.mjs";
 
 export const name = "darwin";
 
 // ── ① 查找可执行文件 ────────────────────────────────────────────────────────
-// 用系统的 /usr/bin/which。找不到 / 命令不存在 / 非零退出 → ""，不抛。
-// 刻意不拿 existsSync 二次过滤：which 自己就查过 PATH 与可执行位，返回 0 即已确认；
-// 再过滤一次只会让「明明能跑的东西」被误判（win32.mjs 里同样的坑，踩坑 53 同源）。
+// 两级：先系统 which，再兜底目录扫描。找不到 / 任何异常 → ""，不抛。
+//
+// 为什么要兜底：受管进程的 PATH 常被宿主精简，不含 Homebrew / ~/.local/bin
+// （外部贡献者 PR #1 在真 Mac 上实测）。只靠 which，`which brew` 会失败 →
+// capabilities.pkgManager 报 null →「明明装了 brew 却说没有」，与踩坑 49 同源。
+//
+// 三个刻意的决定：
+//   1. cmd 可以是 string 或 string[]，按顺序找，命中第一个即返回（which(["python3","python"])）。
+//   2. **不看 which 的退出码**：`which a b` 有一个命中就打印一个，但仍可能非 0；只解析 stdout。
+//   3. 解析出的每行都要过 existsSync —— PR #1 原实现有此校验，保留。
+const FALLBACK_DIRS = [
+  "/opt/homebrew/bin",   // Apple Silicon Homebrew
+  "/usr/local/bin",      // Intel Homebrew + 手工安装
+  path.join(os.homedir(), ".local", "bin"),
+  path.join(os.homedir(), "bin"),
+  "/usr/bin",
+  "/bin",
+];
+
 export function which(cmd) {
-  const target = String(cmd ?? "").trim();
-  if (!target) return "";
-  try {
-    const r = spawnSync("which", [target], { encoding: "utf8", timeout: 5000 });
-    if (r.error || r.status !== 0) return "";
-    for (const line of String(r.stdout || "").split(/\r?\n/)) {
-      const p = line.trim();
-      if (p) return p;
-    }
-    return "";
-  } catch { return ""; }
+  const names = toNameList(cmd);
+  if (!names.length) return "";
+  for (const target of names) {
+    try {
+      // 不用 r.error / r.status 提前返回：命令不存在或非零退出时 stdout 仍可能是有效答案
+      const r = spawnSync("which", [target], { encoding: "utf8", timeout: 5000 });
+      const hit = firstLine(r.stdout, existsFile);
+      if (hit) return hit;
+    } catch { /* 换下一个名字 */ }
+  }
+  // PATH 里的目录排在静态兜底之前：用户显式配的优先。
+  return scanDirs(names, [...envPathDirs(), ...FALLBACK_DIRS], [""], existsFile);
 }
 
 // ── ② 可执行文件名 ──────────────────────────────────────────────────────────
@@ -47,20 +66,30 @@ export function exe(n) {
 // ── ③④ 起子进程的默认选项 + 杀进程树 ★ 必须相邻 ────────────────────────────
 // detached:true 让子进程自成进程组（pgid = pid），killTree 才能一次杀掉整棵树：
 // 引擎被 SIGKILL / 崩溃时，孙子进程（解码器、shell 管道）不会留下孤儿。
+//
+// 升级窗口放在两个函数之前（不许插在它们中间，单测有结构断言）。
+const KILL_TREE_ESCALATE_MS = 5000;
+
 export function spawnOpts(extra) {
   return { detached: true, ...(extra || {}) };
 }
 
-// 杀整棵进程树：向进程组 -pid 发信号。失败（组已解散 / 权限不足 / 平台不支持
-// 负 pid）返回 false，不抛。用 SIGTERM 而非 SIGKILL：让 aria2c 有机会收尾写盘，
-// 与 win32 的 taskkill /T 语义对齐（win32 那边因为 taskkill 只有 /F 才可靠）。
+// 杀整棵进程树：先 SIGTERM 给收尾机会（aria2c 要写盘），5 秒后进程组还在就 SIGKILL。
+// 等价于 win32 的 taskkill /T /F（那边因为只有 /F 才可靠，一次到位）。
+// 返回布尔表示「SIGTERM 发出去了」，**同步返回，不在内部 await**。
+// 升级用 unref 的 setTimeout：不 unref 会挂住引擎退出（定时器算活跃句柄）。
+// 全过程不抛，任何异常都吞掉。
 export function killTree(pid) {
   const n = Number(pid);
   if (!Number.isInteger(n) || n <= 0) return false;
-  try {
-    process.kill(-n, "SIGTERM");
-    return true;
-  } catch { return false; }
+  try { process.kill(-n, "SIGTERM"); } catch { return false; }
+  // 5 秒后组还在（信号 0 只探活）就 SIGKILL。定时器内部已 unref。
+  scheduleEscalation(
+    () => { process.kill(-n, 0); return true; },
+    () => { process.kill(-n, "SIGKILL"); },
+    KILL_TREE_ESCALATE_MS,
+  );
+  return true;
 }
 
 // ── ⑤ 进程是否在跑（按名字）─────────────────────────────────────────────────
@@ -205,8 +234,9 @@ export function normalizePath(p) {
 // ── ⑨ 能力表 ────────────────────────────────────────────────────────────────
 // 键固定三个：pkgManager / proxyControl / reveal。
 // pkgManager 必须真实探测（项目铁律）：真调一次 `brew --version`，不看路径。
-// 注意这里**不做** /opt/homebrew/bin 之类的路径兜底：靠 PATH 找不到就是找不到，
-// GUI 启动的进程 PATH 可能不含 brew —— 真机上若确认这是问题，再单独加探测路径。
+// 但**先用 which 解析出绝对路径再 spawn**：GUI / 受管进程的 PATH 常不含 /opt/homebrew/bin，
+// 裸 spawn("brew") 会 ENOENT → 断成 null。which 自己有兜底目录（见 ①）。
+// 解析不到就退回裸名，尽量保持原行为。
 // 成功结果缓存；负结果 5 秒后重探（用户当场装完 brew 不必重启引擎）。
 const PKG_TTL_MS = 5000;
 let pkgProbed = false;
@@ -217,7 +247,8 @@ function probePkgManager() {
   if (pkgProbed && (pkgValue !== null || Date.now() - pkgProbedAt < PKG_TTL_MS)) return pkgValue;
   let found = null;
   try {
-    const r = spawnSync("brew", ["--version"], { encoding: "utf8", timeout: 5000 });
+    const bin = which("brew") || "brew";
+    const r = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 5000 });
     if (!r.error && r.status === 0 && String(r.stdout || "").trim()) found = "brew";
   } catch { found = null; }
   pkgValue = found;

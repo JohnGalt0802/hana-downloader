@@ -18,24 +18,45 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { toNameList, envPathDirs, firstLine, scanDirs, existsFile, scheduleEscalation } from "./which-core.mjs";
 
 export const name = "linux";
 
 // ── ① 查找可执行文件 ────────────────────────────────────────────────────────
-// 用系统的 which。找不到 / 命令不存在 / 非零退出 → ""，不抛。
-// 同样不做 existsSync 二次过滤（which 已确认可达，再过滤只会误杀，踩坑 53 同源）。
+// 两级：先系统 which，再兜底目录扫描。找不到 / 任何异常 → ""，不抛。
+//
+// 为什么要兜底：受管进程的 PATH 常被宿主精简（外部贡献者 PR #1 在真 Mac 上实测，
+// Linux 同理：systemd / 容器 / 精简 shell 都可能不含 ~/.local/bin）。只靠 which 会
+// 把「明明装了 aria2c」报成没装（踩坑 49）。
+//
+// 三个刻意的决定：
+//   1. cmd 可以是 string 或 string[]，按顺序找，命中第一个即返回。
+//   2. **不看 which 的退出码**：`which a b` 有一个命中就打印一个，但仍可能非 0；只解析 stdout。
+//   3. 解析出的每行都要过 existsSync —— PR #1 原实现有此校验，保留。
+const FALLBACK_DIRS = [
+  "/opt/homebrew/bin",           // Homebrew on Linux（极少数装这里）
+  "/usr/local/bin",              // Linuxbrew / 手工安装
+  path.join(os.homedir(), ".local", "bin"),
+  path.join(os.homedir(), "bin"),
+  "/usr/bin",
+  "/bin",
+  "/snap/bin",                   // snap 装的命令行工具
+  "/usr/local/sbin",
+];
+
 export function which(cmd) {
-  const target = String(cmd ?? "").trim();
-  if (!target) return "";
-  try {
-    const r = spawnSync("which", [target], { encoding: "utf8", timeout: 5000 });
-    if (r.error || r.status !== 0) return "";
-    for (const line of String(r.stdout || "").split(/\r?\n/)) {
-      const p = line.trim();
-      if (p) return p;
-    }
-    return "";
-  } catch { return ""; }
+  const names = toNameList(cmd);
+  if (!names.length) return "";
+  for (const target of names) {
+    try {
+      // 不用 r.error / r.status 提前返回：命令不存在或非零退出时 stdout 仍可能是有效答案
+      const r = spawnSync("which", [target], { encoding: "utf8", timeout: 5000 });
+      const hit = firstLine(r.stdout, existsFile);
+      if (hit) return hit;
+    } catch { /* 换下一个名字 */ }
+  }
+  // PATH 里的目录排在静态兜底之前：用户显式配的优先。
+  return scanDirs(names, [...envPathDirs(), ...FALLBACK_DIRS], [""], existsFile);
 }
 
 // ── ② 可执行文件名 ──────────────────────────────────────────────────────────
@@ -47,19 +68,29 @@ export function exe(n) {
 // ── ③④ 起子进程的默认选项 + 杀进程树 ★ 必须相邻 ────────────────────────────
 // detached:true 让子进程自成进程组（pgid = pid），killTree 才能一次杀掉整棵树：
 // 引擎被 SIGKILL 时，孙子进程（解码器、shell 管道）不会留下孤儿。
+//
+// 升级窗口放在两个函数之前（不许插在它们中间，单测有结构断言）。
+const KILL_TREE_ESCALATE_MS = 5000;
+
 export function spawnOpts(extra) {
   return { detached: true, ...(extra || {}) };
 }
 
-// 杀整棵进程树：向进程组 -pid 发信号。失败（组已解散 / 权限不足 / 平台不支持
-// 负 pid）返回 false，不抛。SIGTERM 而非 SIGKILL：让 aria2c 有机会收尾写盘。
+// 杀整棵进程树：先 SIGTERM 给收尾机会（aria2c 要写盘），5 秒后进程组还在就 SIGKILL。
+// 等价于 win32 的 taskkill /T /F。返回布尔表示「SIGTERM 发出去了」，
+// **同步返回，不在内部 await**。升级用 unref 的 setTimeout：不 unref 会挂住引擎退出。
+// 全过程不抛，任何异常都吞掉。
 export function killTree(pid) {
   const n = Number(pid);
   if (!Number.isInteger(n) || n <= 0) return false;
-  try {
-    process.kill(-n, "SIGTERM");
-    return true;
-  } catch { return false; }
+  try { process.kill(-n, "SIGTERM"); } catch { return false; }
+  // 5 秒后组还在（信号 0 只探活）就 SIGKILL。定时器内部已 unref。
+  scheduleEscalation(
+    () => { process.kill(-n, 0); return true; },
+    () => { process.kill(-n, "SIGKILL"); },
+    KILL_TREE_ESCALATE_MS,
+  );
+  return true;
 }
 
 // ── ⑤ 进程是否在跑（按名字）─────────────────────────────────────────────────
@@ -236,7 +267,7 @@ export function normalizePath(p) {
 // ── ⑨ 能力表 ────────────────────────────────────────────────────────────────
 // 键固定三个：pkgManager / proxyControl / reveal。
 // pkgManager 依次真实探测 brew → apt → dnf → pacman，第一个 `--version` 退出 0 的胜出；
-// 全失败给 null。不看路径上有没有文件（项目铁律）。
+// 不看路径上有没有文件（项目铁律）；但 spawn 用 which 解出的绝对路径（见下）。
 // 成功结果缓存；负结果 5 秒后重探（用户当场装完包管理器不必重启引擎）。
 const PKG_CANDIDATES = ["brew", "apt", "dnf", "pacman"];
 const PKG_TTL_MS = 5000;
@@ -249,7 +280,9 @@ function probePkgManager() {
   let found = null;
   for (const cmd of PKG_CANDIDATES) {
     try {
-      const r = spawnSync(cmd, ["--version"], { encoding: "utf8", timeout: 5000 });
+      // 先用 which 解析绝对路径（兼顶 PATH 被精简 + 兜底目录），解不到才裸名
+      const bin = which(cmd) || cmd;
+      const r = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 5000 });
       if (!r.error && r.status === 0 && String(r.stdout || "").trim()) { found = cmd; break; }
     } catch { /* 换下一个 */ }
   }

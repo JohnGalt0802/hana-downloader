@@ -15,28 +15,43 @@
 //      整个引擎进程带走（server.js:484 在 mac 上就是这样退出的）。
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
+import { toNameList, envPathDirs, firstLine, scanDirs, lstatsFile } from "./which-core.mjs";
 
 export const name = "win32";
 
 // ── ① 查找可执行文件 ────────────────────────────────────────────────────────
-// 用 where.exe（Windows 上的 which）。找不到 / 命令不存在 / 非零退出 → ""，不抛。
+// 两级：先 where.exe，再兜底目录扫描。找不到 / 任何异常 → ""，不抛。
 //
-// **不拿 existsSync 二次过滤**：where.exe 自己就会查文件系统，返回 0 即已确认可达；
-// 而 App Execution Alias（winget.exe 这类 0 字节重定向桩）existsSync 会给 false /
-// EACCES，一过滤就把「明明能跑的 winget」判死（2026-10-20 本机实测，踩坑 53 同源）。
+// cmd 可以是 string 或 string[]，按顺序找，命中第一个即返回。
+//
+// 判定用的是 **lstat**，不是 existsSync。2026-10-21 本机实测：
+//   winget 是 App Execution Alias（0 字节重定向桩）：
+//     existsSync(...\WindowsApps\winget.exe) → false；statSync → EACCES；lstatSync → 成功
+//   拿 existsSync 过滤会把「明明能跑的 winget」判死（踩坑 53 同源）。
+// 旧实现在 r.status !== 0 时直接返回 ""；现在**不看退出码**，只解析 stdout
+// （PR #1 的实测结论：where/which 部分命中时退出码仍可能非 0）。
+//
+// 兜底目录只加 WindowsApps：受管进程 PATH 不含用户别名目录时，winget 只能从这里扫到。
+const FALLBACK_DIRS = [
+  path.join(os.homedir(), "AppData", "Local", "Microsoft", "WindowsApps"),
+];
+const WHICH_EXTS = [".exe", ".cmd", ".bat", ""];
+
 export function which(cmd) {
-  const target = String(cmd ?? "").trim();
-  if (!target) return "";
+  const names = toNameList(cmd);
+  if (!names.length) return "";
+  // where.exe 可一次收多个名字：命中哪个都打印，但退出码可能非 0 —— 不能拿退出码当结论。
   try {
-    const r = spawnSync("where.exe", [target], { encoding: "utf8", windowsHide: true, timeout: 5000 });
-    if (r.status !== 0) return "";
-    for (const line of String(r.stdout || "").split(/\r?\n/)) {
-      const p = line.trim();
-      if (p) return p;
-    }
-    return "";
-  } catch { return ""; }
+    const r = spawnSync("where.exe", names, {
+      encoding: "utf8", windowsHide: true, timeout: 5000,
+    });
+    const hit = firstLine(r.stdout, lstatsFile);
+    if (hit) return hit;
+  } catch { /* 落到兜底扫描 */ }
+  // PATH 里的目录排在静态兜底之前：用户显式配的优先。
+  return scanDirs(names, [...envPathDirs(), ...FALLBACK_DIRS], WHICH_EXTS, lstatsFile);
 }
 
 // ── ② 可执行文件名 ──────────────────────────────────────────────────────────
