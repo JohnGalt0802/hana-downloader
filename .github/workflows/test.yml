@@ -17,7 +17,12 @@ jobs:
           - windows-latest
           - ubuntu-latest
           - macos-latest
-          - macos-13
+          # 2026-10-21 去掉 macos-13（Intel Mac）：
+          # ① 免费 runner 里它最稀缺，七次触发七次 queued，一次没排到；
+          # ② 更关键的是宿主官方只发 arm64 包（dmg/zip），**没有 x64**，
+          #    Intel Mac 用户拿不到包，这条分支验通了也没用户能跑。
+          # /usr/local/bin 那条路径分支仍保留在 platform/darwin.mjs 的
+          # 兜底目录里（开着开发模式自跑的用户可能用到），只是不再排队占位。
 
     steps:
       - uses: actions/checkout@v4
