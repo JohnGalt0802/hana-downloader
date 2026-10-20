@@ -85,7 +85,9 @@ python3 - "$DL" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p, encoding="utf-8").read()
-s = s.replace("const killed = platform.treeKill(n);", "const killed = platform.killTree(n);")
+old = "const killed = platform.treeKill(n);"
+assert old in s, "M1 的替换目标没找到（代码结构变了，需要更新变异脚本）"
+s = s.replace(old, "const killed = platform.killTree(n);")
 open(p, "w", encoding="utf-8").write(s)
 PY
 if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
@@ -99,8 +101,9 @@ python3 - "$DL" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p, encoding="utf-8").read()
-s = s.replace('"pnpm-install" ? ["node", "npm", "pnpm"]',
-              '"pnpm-install" ? ["node", "npm", "pnpm", "sh", "bash"]')
+old = '"pnpm-install" ? ["node", "npm", "pnpm"]'
+assert old in s, "M2 的替换目标没找到（代码结构变了，需要更新变异脚本）"
+s = s.replace(old, '"pnpm-install" ? ["node", "npm", "pnpm", "sh", "bash"]')
 open(p, "w", encoding="utf-8").write(s)
 PY
 if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi
@@ -149,8 +152,9 @@ python3 - "$DL" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p, encoding="utf-8").read()
-s = s.replace("this._reapOrphanCommand(m.childPid, m.cmd?.type, m.childStart);",
-              "this._reapOrphanCommand(m.childPid, m.cmd?.type);")
+old = "this._reapOrphanCommand(m.childPid, m.cmd?.type, m.childStart);"
+assert old in s, "M5 的替换目标没找到（代码结构变了，需要更新变异脚本）"
+s = s.replace(old, "this._reapOrphanCommand(m.childPid, m.cmd?.type);")
 open(p, "w", encoding="utf-8").write(s)
 PY
 if [ $? -ne 0 ]; then echo "   ★ 变异没应用成功（替换目标找不到），脚本该更新了"; exit 2; fi

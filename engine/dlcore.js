@@ -73,14 +73,16 @@ class TaskManager {
   _fireFinal(task) {
     if (!task) return;
     const s = task.state;
-    if (this._finalCb && (s === "done" || s === "failed" || s === "canceled" || s === "interrupted")) {
+    const isFinal = s === "done" || s === "failed" || s === "canceled" || s === "interrupted";
+    if (this._finalCb && isFinal) {
       try { this._finalCb(task); } catch { /* 通知失败不影响下载 */ }
     }
-    // 终态就把启动指纹清掉（2026-10-21 复核建议）。
+    // 终态就把启动指纹清掉（2026-10-21）。
     // 当前 `_persist` 靠 `state === "running"` 守卫着，不清也写不出去；但这个不变式
-    // 靠两处间接保证（守卫 + retry 清理），清一次是把它落到数据上——将来有人
-    // 放宽守卫，不会立刻变成“旧指纹配新子进程”。所有终态都走这个出口，漏不了。
-    task._childStart = null;
+    // 靠两处间接保证（守卫 + retry 清理），清一次是把它落到数据上。
+    // ★ 必须在 isFinal 里面：即使将来有人在运行中调 _fireFinal（今天 7 个调用点全是终态），
+    //   也不会把正在跑的子进程指纹清掉。不能写成无条件清。
+    if (isFinal) task._childStart = null;
     // 终态腾出槽位：放行下一个排队任务（2026-09-20）
     this._pumpQueue();
   }
